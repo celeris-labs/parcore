@@ -25,15 +25,15 @@ def _expand(indices: list[int], factor: int) -> list[int]:
     return [factor * v + j for v in indices for j in range(factor)]
 
 
-class IndexGeneratorTestCase(fpga_test_case.FPGATestCase):
+class DictionaryIDTestCase(fpga_test_case.FPGATestCase):
     """
-    Tests IndexGenerator: expands dictionary indices of a column's data type
+    Tests DictionaryID: expands dictionary indices of a column's data type
     into indices of the 32-bit words the dictionary stores. 32-bit types pass
     through, 64-bit types expand x2 and german strings x4. One data_type is
     consumed per page (an input segment terminated by last).
     """
 
-    alternative_vfpga_top_file = "vfpga_tops/index_generator_test.sv"
+    alternative_vfpga_top_file = "vfpga_tops/dictionary_id_test.sv"
     debug_mode = True
 
     def _run_pages(self, pages: list[tuple[int, list[int]]]):

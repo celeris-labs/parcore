@@ -7,14 +7,16 @@ import libstf::*;
 /**
     Generates dictionary indices according to the incoming data_type
 */
-module IndexGenerator #(
-    parameter type id_t,
-    parameter int   NUM_ELEMENTS
+module DictionaryID #(
+    parameter type  id_t,
+    parameter int   NUM_ELEMENTS,
+    parameter int   INDEX_PATH_COUNT = 3 // 32 + 64 + 128
 ) (
     input logic clk,
     input logic rst_n,
 
-    ready_valid_i.s data_type,    // Data type for which the dictionary indices should be generated
+    ready_valid_i.s dtype,  // Data type for which the dictionary indices should be generated
+
     ndata_i.s in,               // #(id_t, NUM_ELEMENTS)
     ndata_i.m out               // #(id_t, NUM_ELEMENTS * FACTOR)
 );
@@ -35,7 +37,11 @@ module IndexGenerator #(
 //             [ Path 1:  64-bit ]-----------------+      |
 //             [ Path 2: 128-bit ]------------------------+
 
-localparam INDEX_PATH_COUNT = 3; // 32 + 64 + 128
+typedef enum logic[1:0] { 
+    ENQUEUE_FRONT,
+    ENQUEUE_BACK
+} state_t;
+state_t state;
 
 typedef logic [$clog2(INDEX_PATH_COUNT)-1:0] sel_t;
 function automatic sel_t mux_selection (input type_t _type);
@@ -47,27 +53,65 @@ function automatic sel_t mux_selection (input type_t _type);
     endcase
 endfunction
 
-ready_valid_i #(type_t) _dtype_in (clk, rst_n);
-ready_valid_i #(type_t) dtype_in (clk, rst_n);
-ready_valid_i #(type_t) _dtype_out (clk, rst_n);
-ready_valid_i #(type_t) dtype_out (clk, rst_n);
-ready_valid_i #(sel_t) demux_in (clk, rst_n);
-ready_valid_i #(sel_t) mux_out (clk, rst_n);
+ready_valid_i #(type_t) _dtype (clk, rst_n);
+SkidBuffer #(type_t) inst_dtype_skid (
+    .clk (clk),
+    .rst_n (rst_n),
 
-// Use skid buffers as FIFOs to decouple input select with output select
-SkidBuffer #(type_t) inst_skid_dtype_in_side (
-    .clk(clk),
-    .rst_n(rst_n),
-    .in(_dtype_in),
-    .out(dtype_in)
+    .in (dtype),
+    .out (_dtype)
 );
 
-SkidBuffer #(type_t) inst_skid_dtype_out_side (
-    .clk(clk),
-    .rst_n(rst_n),
-    .in(_dtype_out),
-    .out(dtype_out)
+ready_valid_i #(select_t) select_front (clk, rst_n);
+ready_valid_i #(select_t) _select_front (clk, rst_n);
+SkidBuffer #(select_t) inst_select_front_skid (
+    .clk (clk),
+    .rst_n (rst_n),
+
+    .in (select_front),
+    .out (_select_front)
 );
+
+ready_valid_i #(select_t) select_back (clk, rst_n);
+ready_valid_i #(select_t) _select_back (clk, rst_n);
+SkidBuffer #(select_t) inst_select_back_skid (
+    .clk (clk),
+    .rst_n (rst_n),
+
+    .in (select_back),
+    .out (_select_back)
+);
+
+select_t current_selection;
+assign current_selection = _dtype.data == GERMAN_STR_T ? 1 : 0;
+
+assign select_front.data = mux_selection(_dtype.data);
+assign select_front.valid = _dtype.valid && state == ENQUEUE_FRONT;
+
+assign select_back.data = mux_selection(_dtype.data);
+assign select_back.valid = _dtype.valid && state == ENQUEUE_BACK;
+
+assign _dtype.ready = state == ENQUEUE_BACK && select_back.ready;
+
+always_ff @( posedge clk ) begin
+if (!rst_n) begin
+    state <= ENQUEUE_FRONT;
+end else begin
+    case (state)
+        ENQUEUE_FRONT: begin
+            if (_dtype.valid && select_front.ready) begin
+                state <= ENQUEUE_BACK;
+            end
+        end 
+        ENQUEUE_BACK: begin
+            if (_dtype.valid && select_back.ready) begin
+                state <= ENQUEUE_FRONT;
+            end
+        end
+        default: begin end
+    endcase
+end
+end
 
 ndata_i #(id_t, NUM_ELEMENTS) ins [INDEX_PATH_COUNT] (clk, rst_n);
 ndata_i #(id_t, NUM_ELEMENTS) outs [INDEX_PATH_COUNT] (clk, rst_n);
@@ -77,7 +121,7 @@ DataDemultiplexer #(
     .clk    (clk),
     .rst_n  (rst_n),
 
-    .select (demux_in),
+    .select (_select_front),
 
     .in     (in),
     .out    (ins)
@@ -90,28 +134,11 @@ DataMultiplexer #(
     .clk    (clk),
     .rst_n  (rst_n),
 
-    .select (mux_out),
+    .select (_select_back),
 
     .in     (outs),
     .out    (out)
 );
-
-assign demux_in.data = mux_selection(dtype_in.data);
-assign demux_in.valid = dtype_in.valid;
-
-assign mux_out.data = mux_selection(dtype_out.data);
-assign mux_out.valid = dtype_out.valid;
-
-assign dtype_in.ready = demux_in.ready;
-assign dtype_out.ready = mux_out.ready;
-
-assign data_type.ready = _dtype_in.ready && _dtype_out.ready;
-
-assign _dtype_in.valid = data_type.valid && _dtype_out.ready;
-assign _dtype_in.data = data_type.data;
-
-assign _dtype_out.valid = data_type.valid && _dtype_in.ready;
-assign _dtype_out.data = data_type.data;
 
 // -------- Path 0 (32-bit data): Forwarding  --------
 //
