@@ -66,14 +66,14 @@ AXIToNData #(data32_t, NUM_ELEMENTS) inst_axi_to_ndata (
 
 /* -- DESIGN WIRING ------------------------------------------------------ */
 ndata_i #(data32_t, NUM_ELEMENTS) out(clk, rst_n);
-IndexGenerator #(
+DictionaryID #(
     .id_t(data32_t),
     .NUM_ELEMENTS(NUM_ELEMENTS)
 ) inst_index_generator (
     .clk(clk),
     .rst_n(rst_n),
 
-    .data_type(data_type),
+    .dtype(data_type),
     .in(in),
     .out(out)
 );
