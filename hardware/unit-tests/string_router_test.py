@@ -20,14 +20,13 @@ GERMAN_STR_T = 5
 BEAT_SIZE = 64
 
 # vfpga top stream wiring
-IN_STRIPPED = 0
-IN_DICT_BODY = 1
+IN_PLAIN = 0
+IN_DICT = 1
 IN_STR_DECODER = 2
-IN_DICTIONARY = 3
 
-OUT_VALUES = 0
-OUT_STR_DECODER = 1
-OUT_DICT_BODY = 2
+OUT_TO_STR_DECODER = 0
+OUT_TO_PLAIN = 1
+OUT_TO_DICT = 2
 
 
 def _rand(rng: Random, n: int) -> bytearray:
@@ -45,25 +44,21 @@ def _page_conf(page_type: int, typ: int, num_values: int = 0, last: int = 0) -> 
 
 def plain_fixed(typ: int, values: bytearray) -> dict:
     """PLAIN page of a fixed-width type: stripped bytes go straight to out_values."""
-    return {"page_type": PAGE_TYPE_PLAIN, "typ": typ,
-            "stripped": values, "values": values}
+    return {"page_type": PAGE_TYPE_PLAIN, "typ": typ}
 
 
 def plain_string(page_bytes: bytearray, decoded: bytearray) -> dict:
     """PLAIN page of german strings: stripped bytes are handed to the string
     decoder, the decoded records come back and become the page's values."""
     return {"page_type": PAGE_TYPE_PLAIN, "typ": GERMAN_STR_T,
-            "stripped": page_bytes, "to_str_decoder": page_bytes,
-            "from_str_decoder": decoded, "values": decoded}
+            "in_from_plain": page_bytes, "out_to_str_decoder": page_bytes,
+            "in_from_str_decoder": decoded, "out_to_plain": decoded}
 
 
 def dict_string(body_bytes: bytearray, decoded: bytearray) -> dict:
-    """DICT page of german strings: the dictionary body is handed to the string
-    decoder and the decoded records are stored back into the dictionary body.
-    A dictionary page emits no values."""
     return {"page_type": PAGE_TYPE_DICT, "typ": GERMAN_STR_T,
-            "dict_body": body_bytes, "to_str_decoder": body_bytes,
-            "from_str_decoder": decoded, "to_dict_body": decoded}
+            "in_from_dict_body": body_bytes, "out_to_str_decoder": body_bytes,
+            "in_from_str_decoder": decoded, "out_to_dict_body": decoded}
 
 
 def dict_fixed(typ: int) -> dict:
@@ -75,36 +70,37 @@ def dict_fixed(typ: int) -> dict:
 def hybrid(typ: int, values: bytearray) -> dict:
     """HYBRID page: the ids were resolved by the dictionary, so the looked-up
     values are forwarded straight to out_values."""
-    return {"page_type": PAGE_TYPE_HYBRID, "typ": typ,
-            "dictionary" : values, "values": values}
+    return {"page_type": PAGE_TYPE_HYBRID, "typ": typ}
 
 
-class ValuesRouterTestCase(fpga_test_case.FPGATestCase):
+class StringRouterTestCase(fpga_test_case.FPGATestCase):
     """
-    Tests ValuesRouter (hardware/src/hdl/plain_data.sv): the byte-level crossbar
-    between StripLevels, the DictionaryBody, the PlainStringDecoder and the value
-    output path. One page_conf is consumed per page and picks the route:
+    Tests StringRouter (hardware/src/hdl/string_router.sv):
+    the byte-level crossbar between PlainRouter, DictionaryBody, and the
+    PlainStringDecoder. One page_conf is consumed per page and picks the route:
 
-      PLAIN  / fixed   in_from_stripped    -> out_values
-      PLAIN  / german  in_from_stripped    -> out_to_str_decoder
-                       in_from_str_decoder -> out_values
-      DICT   / german  in_from_dict_body   -> out_to_str_decoder
-                       in_from_str_decoder -> out_to_dict_body
-      DICT   / fixed   idle (config only)
-      HYBRID / any     none
+      ANY    / fixed   none
+      HYBRID / ANY     none
+      PLAIN  / german  in_from_plain        -> out_to_str_decoder
+                       in_from_str_decoder  -> out_to_plain
+      DICT   / german  in_from_dict_body    -> out_to_str_decoder
+                       in_from_str_decoder  -> out_to_dict_body
 
     The router never touches the bytes, so every expected output is its input
     bytes unchanged. Page boundaries are the stream `last` beats: one page_conf
     per last-terminated transfer on each active stream.
 
     vfpga top wiring:
-      recv[0] -> in_from_stripped,    recv[1] -> in_from_dict_body
-      recv[2] -> in_from_str_decoder, recv[3] -> in_from_dictionary
-      out_values -> send[0], out_to_str_decoder -> send[1],
-      out_to_dict_body -> send[2]
+      recv[0] -> in_from_plain
+      recv[1] -> in_from_dict_body
+      recv[2] -> in_from_str_decoder
+
+      out_to_str_decoder    -> send[0]
+      out_to_plain          -> send[1]
+      out_to_dict_body      -> send[2]
     """
 
-    alternative_vfpga_top_file = "vfpga_tops/values_router_test.sv"
+    alternative_vfpga_top_file = "vfpga_tops/string_router_test.sv"
     debug_mode = True
 
     def _run_pages(self, pages: list[dict]):
@@ -114,40 +110,22 @@ class ValuesRouterTestCase(fpga_test_case.FPGATestCase):
             self.write_register(fpga_register.vFPGARegister(
                 REG_PAGE_CONF, bytearray(conf.to_bytes(8, 'little'))))
 
-            for key, stream in (("stripped", IN_STRIPPED),
-                                ("dict_body", IN_DICT_BODY),
-                                ("from_str_decoder", IN_STR_DECODER),
-                                ("dictionary", IN_DICTIONARY)):
+            for key, stream in (("in_from_plain", IN_PLAIN),
+                                ("in_from_dict_body", IN_DICT),
+                                ("in_from_str_decoder", IN_STR_DECODER)):
                 if key in page:
                     self.set_stream_input(stream, page[key])
 
-            for key, stream in (("values", OUT_VALUES),
-                                ("to_str_decoder", OUT_STR_DECODER),
-                                ("to_dict_body", OUT_DICT_BODY)):
+            for key, stream in (("out_to_str_decoder", OUT_TO_STR_DECODER),
+                                ("out_to_plain", OUT_TO_PLAIN),
+                                ("out_to_dict_body", OUT_TO_DICT)):
                 if key in page:
                     self.set_expected_output(stream, page[key])
 
         self.simulate_fpga()
         self.assert_simulation_output()
 
-    # -- PLAIN / fixed: stripped -> out_values --------------------------------
-    def test_plain_fixed_partial_beat(self):
-        rng = Random(1)
-        self._run_pages([plain_fixed(INT32_T, _rand(rng, 20))])
-
-    def test_plain_fixed_exact_beat(self):
-        rng = Random(2)
-        self._run_pages([plain_fixed(BYTE_T, _rand(rng, BEAT_SIZE))])
-
-    def test_plain_fixed_multi_beat_partial_final(self):
-        rng = Random(3)
-        self._run_pages([plain_fixed(INT64_T, _rand(rng, 3 * BEAT_SIZE + 17))])
-
-    def test_plain_fixed_multi_beat_exact(self):
-        rng = Random(4)
-        self._run_pages([plain_fixed(DOUBLE_T, _rand(rng, 4 * BEAT_SIZE))])
-
-    # -- PLAIN / german: stripped -> decoder, decoded -> out_values -----------
+    # -- PLAIN / german: from_plain -> decoder, decoded -> to_plain -----------
     def test_plain_string_partial_beat(self):
         rng = Random(5)
         self._run_pages([plain_string(_rand(rng, 40), _rand(rng, 16))])
@@ -165,28 +143,23 @@ class ValuesRouterTestCase(fpga_test_case.FPGATestCase):
         rng = Random(8)
         self._run_pages([plain_string(_rand(rng, 48), _rand(rng, 3 * BEAT_SIZE))])
 
-    # -- DICT / german: body -> decoder, decoded -> dictionary body -----------
+    # -- DICT / german: from_plain -> decoder, decoded -> to_plain -----------
     def test_dict_string_partial_beat(self):
-        rng = Random(9)
-        self._run_pages([dict_string(_rand(rng, 33), _rand(rng, 12))])
+        rng = Random(5)
+        self._run_pages([dict_string(_rand(rng, 40), _rand(rng, 16))])
+
+    def test_dict_string_exact_beat(self):
+        rng = Random(6)
+        self._run_pages([dict_string(_rand(rng, BEAT_SIZE), _rand(rng, BEAT_SIZE))])
 
     def test_dict_string_multi_beat(self):
-        rng = Random(10)
-        self._run_pages([dict_string(_rand(rng, 4 * BEAT_SIZE + 9),
-                                     _rand(rng, BEAT_SIZE + 48))])
+        rng = Random(7)
+        self._run_pages([dict_string(_rand(rng, 5 * BEAT_SIZE + 3),
+                                      _rand(rng, 2 * BEAT_SIZE + 32))])
 
-    # -- HYBRID: dictionary lookup -> out_values ------------------------------
-    def test_hybrid_fixed_partial_beat(self):
-        rng = Random(11)
-        self._run_pages([hybrid(INT32_T, _rand(rng, 24))])
-
-    def test_hybrid_fixed_multi_beat(self):
-        rng = Random(12)
-        self._run_pages([hybrid(INT64_T, _rand(rng, 2 * BEAT_SIZE + 40))])
-
-    def test_hybrid_string(self):
-        rng = Random(13)
-        self._run_pages([hybrid(GERMAN_STR_T, _rand(rng, 3 * BEAT_SIZE))])
+    def test_dict_string_decoded_larger_than_page(self):
+        rng = Random(8)
+        self._run_pages([dict_string(_rand(rng, 48), _rand(rng, 3 * BEAT_SIZE))])
 
     # -- Realistic chunk shapes ----------------------------------------------
     def test_chunk_of_plain_fixed_pages(self):

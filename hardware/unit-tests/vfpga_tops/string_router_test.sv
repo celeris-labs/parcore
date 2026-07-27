@@ -7,17 +7,17 @@ import parcore::*;
 import libstf::*;
 import lynxTypes::*;
 
+
 /*
- * ValuesRouter (hardware/src/hdl/plain_data.sv) test wiring:
+ * String (hardware/src/hdl/plain_data.sv) test wiring:
  *
- *   axis_host_recv[0] -> in_from_stripped     (StripLevels output, PLAIN pages)
- *   axis_host_recv[1] -> in_from_dict_body    (DictionaryBody output, DICT pages)
- *   axis_host_recv[2] -> in_from_str_decoder  (PlainStringDecoder output)
- *   axis_host_recv[3] -> in_from_dictionary   (dictionary lookup, HYBRID pages)
+ *   axis_host_recv[0]      -> in_from_plain        (PLAIN pages)
+ *   axis_host_recv[1]      -> in_from_dict_body    (DICT pages)
+ *   axis_host_recv[2]      -> in_from_str_decoder  (PlainStringDecoder output)
  *
- *   out_values              -> axis_host_send[0]
- *   out_to_dict_str_decoder -> axis_host_send[1]
- *   out_to_dict_body        -> axis_host_send[2]
+ *   out_to_str_decoder     -> axis_host_send[0]    (String data)
+ *   out_to_plain           -> axis_host_send[1]    (Data fw to plain path)
+ *   out_to_dict_body       -> axis_host_send[2]    (Data fw to dict path)
  *
  * page_conf (page_conf_t) is driven per page over the config path, mirroring how
  * the ColumnChunkDecoder page FSM drives it in the real design.
@@ -31,6 +31,7 @@ always_comb cq_rd.tie_off_s();
 always_comb cq_wr.tie_off_s();
 
 for (genvar I = 3; I < N_STRM_AXI; I++) begin
+    always_comb axis_host_recv[I].tie_off_s();
     always_comb axis_host_send[I].tie_off_m();
 end
 
@@ -68,60 +69,48 @@ ready_valid_i #(page_conf_t) page_conf(clk, rst_n);
 ConfigWriteFIFO #(0, 8, page_conf_t) inst_page_conf (clk, rst_n, write_configs[0], page_conf);
 
 /* -- INPUTS ------------------------------------------------------------ */
-AXI4S axi_in_stripped (.aclk(clk), .aresetn(rst_n));
-`AXIS_ASSIGN(axis_host_recv[0], axi_in_stripped)
+AXI4S axi_in_from_plain (.aclk(clk), .aresetn(rst_n));
+`AXIS_ASSIGN(axis_host_recv[0], axi_in_from_plain)
 
-ndata_i #(data8_t, DATABEAT_SIZE) in_from_stripped(clk, rst_n);
-AXIToNData #(data8_t, DATABEAT_SIZE) inst_axi_to_ndata_stripped (
+ndata_i #(data8_t, DATABEAT_SIZE) in_from_plain(clk, rst_n);
+AXIToNData #(data8_t, DATABEAT_SIZE) inst_axi_to_plain (
     .clk(clk),
     .rst_n(rst_n),
 
-    .in(axi_in_stripped),
-    .out(in_from_stripped)
+    .in(axi_in_from_plain),
+    .out(in_from_plain)
 );
 
-AXI4S axi_in_dict_body (.aclk(clk), .aresetn(rst_n));
-`AXIS_ASSIGN(axis_host_recv[1], axi_in_dict_body)
+AXI4S axi_in_from_dict_body (.aclk(clk), .aresetn(rst_n));
+`AXIS_ASSIGN(axis_host_recv[1], axi_in_from_dict_body)
 
 ndata_i #(data8_t, DATABEAT_SIZE) in_from_dict_body(clk, rst_n);
 AXIToNData #(data8_t, DATABEAT_SIZE) inst_axi_to_ndata_dict_body (
     .clk(clk),
     .rst_n(rst_n),
 
-    .in(axi_in_dict_body),
+    .in(axi_in_from_dict_body),
     .out(in_from_dict_body)
 );
 
-AXI4S axi_in_str_decoder (.aclk(clk), .aresetn(rst_n));
-`AXIS_ASSIGN(axis_host_recv[2], axi_in_str_decoder)
+AXI4S axi_in_from_str_decoder (.aclk(clk), .aresetn(rst_n));
+`AXIS_ASSIGN(axis_host_recv[2], axi_in_from_str_decoder)
 
 ndata_i #(data8_t, DATABEAT_SIZE) in_from_str_decoder(clk, rst_n);
 AXIToNData #(data8_t, DATABEAT_SIZE) inst_axi_to_ndata_str_decoder (
     .clk(clk),
     .rst_n(rst_n),
 
-    .in(axi_in_str_decoder),
+    .in(axi_in_from_str_decoder),
     .out(in_from_str_decoder)
 );
 
-AXI4S axi_in_dictionary (.aclk(clk), .aresetn(rst_n));
-`AXIS_ASSIGN(axis_host_recv[3], axi_in_dictionary)
-
-ndata_i #(data8_t, DATABEAT_SIZE) in_from_dictionary(clk, rst_n);
-AXIToNData #(data8_t, DATABEAT_SIZE) inst_axi_to_ndata_dictionary (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .in(axi_in_dictionary),
-    .out(in_from_dictionary)
-);
-
 /* -- DESIGN WIRING ------------------------------------------------------ */
-ndata_i #(data8_t, DATABEAT_SIZE) out_values(clk, rst_n);
-ndata_i #(data8_t, DATABEAT_SIZE) out_to_dict_str_decoder(clk, rst_n);
-ndata_i #(data8_t, DATABEAT_SIZE) out_to_dict_body(clk, rst_n);
+ndata_i #(data8_t, DATABEAT_SIZE) out_to_str_decoder (clk, rst_n);
+ndata_i #(data8_t, DATABEAT_SIZE) out_to_plain (clk, rst_n);
+ndata_i #(data8_t, DATABEAT_SIZE) out_to_dict_body (clk, rst_n);
 
-ValuesRouter #(
+StringRouter #(
     .DATABEAT_SIZE(DATABEAT_SIZE)
 ) inst_values_router (
     .clk(clk),
@@ -129,43 +118,42 @@ ValuesRouter #(
 
     .page_conf(page_conf),
 
-    .in_from_stripped(in_from_stripped),
-    .in_from_dict_body(in_from_dict_body),
-    .in_from_str_decoder(in_from_str_decoder),
-    .in_from_dictionary(in_from_dictionary),
+    .in_from_plain (in_from_plain),
+    .in_from_dict_body (in_from_dict_body),
+    .out_to_str_decoder (out_to_str_decoder),
 
-    .out_to_dict_body(out_to_dict_body),
-    .out_to_str_decoder(out_to_dict_str_decoder),
-    .out_values(out_values)
+    .in_from_str_decoder (in_from_str_decoder),
+    .out_to_plain (out_to_plain),
+    .out_to_dict_body (out_to_dict_body)
 );
 
 /* -- OUTPUTS ----------------------------------------------------------- */
-AXI4S axi_out_values (.aclk(clk), .aresetn(rst_n));
-NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_values (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .in(out_values),
-    .out(axi_out_values)
-);
-`AXIS_ASSIGN(axi_out_values, axis_host_send[0])
-
-AXI4S axi_out_str_decoder (.aclk(clk), .aresetn(rst_n));
+AXI4S axi_out_to_str_decoder (.aclk(clk), .aresetn(rst_n));
 NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_str_decoder (
     .clk(clk),
     .rst_n(rst_n),
 
-    .in(out_to_dict_str_decoder),
-    .out(axi_out_str_decoder)
+    .in(out_to_str_decoder),
+    .out(axi_out_to_str_decoder)
 );
-`AXIS_ASSIGN(axi_out_str_decoder, axis_host_send[1])
+`AXIS_ASSIGN(axi_out_to_str_decoder, axis_host_send[0])
 
-AXI4S axi_out_dict_body (.aclk(clk), .aresetn(rst_n));
+AXI4S axi_out_to_plain (.aclk(clk), .aresetn(rst_n));
+NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_plain (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(out_to_plain),
+    .out(axi_out_to_plain)
+);
+`AXIS_ASSIGN(axi_out_to_plain, axis_host_send[1])
+
+AXI4S axi_out_to_dict_body (.aclk(clk), .aresetn(rst_n));
 NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_dict_body (
     .clk(clk),
     .rst_n(rst_n),
 
     .in(out_to_dict_body),
-    .out(axi_out_dict_body)
+    .out(axi_out_to_dict_body)
 );
-`AXIS_ASSIGN(axi_out_dict_body, axis_host_send[2])
+`AXIS_ASSIGN(axi_out_to_dict_body, axis_host_send[2])
