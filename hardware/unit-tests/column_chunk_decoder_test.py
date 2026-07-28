@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
-from coyote_test import fpga_stream, io_writer
+from coyote_test import fpga_test_case, fpga_stream, fpga_register, simulation_time
 from os.path import dirname, realpath, join
 
 import pyarrow.parquet as pq
@@ -11,8 +10,13 @@ from page_header_parser_test import (
     _extract_parquet_column_chunks,
 )
 
-from libstf_utils.configured_test_case import ConfiguredTestCase
-from parcore_utils.fpga_configuration import ColumnChunkDecoderConfig, Compression
+from libstf_utils.common import stream_type_to_libstf_type_t
+
+
+GERMAN_STR_T = 5
+
+INLINE_LEN = 12
+DEFAULT_HEAP_ADDR = 0x1000
 
 
 @dataclass
@@ -21,12 +25,32 @@ class _ColumnChunk:
     num_values: int
     chunk_bytes: bytearray   # full column-chunk: thrift headers + payloads concatenated
     stream_type: "fpga_stream.StreamType" = fpga_stream.StreamType.SIGNED_INT_64
-    is_required: bool = False  # REQUIRED columns have no definition levels in their data pages
-    # Type the decoder casts the values to, None for stream_type (no cast)
-    logical_type: Optional["fpga_stream.StreamType"] = None
+    # BYTE_ARRAY columns have no fpga_stream.StreamType equivalent, so their
+    # type_t is given directly.
+    type_t_override: int | None = None
+    heap_addr: int = 0
+    # String chunks only: the raw PLAIN bytes the decoder echoes on heap_out.
+    expected_heap: bytearray | None = None
 
-    def output_type(self) -> "fpga_stream.StreamType":
-        return self.logical_type if self.logical_type is not None else self.stream_type
+    @property
+    def type_t(self) -> int:
+        if self.type_t_override is not None:
+            return self.type_t_override
+        return stream_type_to_libstf_type_t(self.stream_type)
+
+    @property
+    def is_string(self) -> bool:
+        return self.type_t == GERMAN_STR_T
+
+    def _register(self) -> bytearray:
+        # column_chunk_conf_t packs (MSB -> LSB) as:
+        #   compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
+        compression = 1 if self.compression else 0
+        packed = (compression << 35) | ((self.num_values & 0xFFFFFFFF) << 3) | (self.type_t & 0x7)
+        return bytearray(packed.to_bytes(8, 'little'))
+
+    def _heap_register(self) -> bytearray:
+        return bytearray(self.heap_addr.to_bytes(8, 'little'))
 
 
 def read_bytes(filename: str) -> bytearray:
@@ -75,10 +99,13 @@ def _make_def_levels(num_values: int) -> bytes:
     return len(rle_body).to_bytes(4, 'little') + rle_body
 
 
-def make_plain_data(items: list[int], is_required: bool = False) -> _ColumnChunk:
-    stream = fpga_stream.Stream(fpga_stream.StreamType.SIGNED_INT_64, items)
+def make_plain_data(
+    items: list,
+    stream_type: "fpga_stream.StreamType" = fpga_stream.StreamType.SIGNED_INT_64,
+) -> _ColumnChunk:
+    stream = fpga_stream.Stream(stream_type, items)
     values = stream.data_to_bytearray()
-    def_levels = b'' if is_required else _make_def_levels(len(items))
+    def_levels = _make_def_levels(len(items))
     payload = bytearray(def_levels) + bytearray(values)
     hdr = _make_data_page_header(
         num_values=len(items),
@@ -91,7 +118,66 @@ def make_plain_data(items: list[int], is_required: bool = False) -> _ColumnChunk
         compression=False,
         num_values=len(items),
         chunk_bytes=chunk,
-        is_required=is_required,
+        stream_type=stream_type,
+    )
+
+
+# -- Synthetic PLAIN BYTE_ARRAY (german string) chunk ------------------------
+
+def _encode_strings(strings: list[bytes]) -> bytearray:
+    """PLAIN BYTE_ARRAY encoding: 4-byte LE length prefix followed by payload."""
+    buf = bytearray()
+    for s in strings:
+        buf += len(s).to_bytes(4, 'little')
+        buf += s
+    return buf
+
+
+def _german_records(strings: list[bytes], heap_addr: int) -> list[int]:
+    """The german_str_t records the decoder emits, serialised LSB-first.
+
+    Each 16-byte record is length[0:4] | prefix[4:8] | payload[8:16], where the
+    payload is the inline bytes 4..11 for strings of at most INLINE_LEN bytes and
+    an 8-byte heap address otherwise. The heap mirrors the encoded page verbatim,
+    length prefixes included, so a string's address is its payload offset within
+    that stream. Mirrors _expected_strings in plain_string_decoder_test.py.
+    """
+    out = bytearray()
+    element_offset = 4  # the first payload sits after its own length prefix
+    for s in strings:
+        n = len(s)
+        rec = bytearray(16)
+        rec[0:4] = n.to_bytes(4, 'little')
+        rec[4:8] = s[:4].ljust(4, b'\x00')
+        if n <= INLINE_LEN:
+            rec[8:16] = s[4:12].ljust(8, b'\x00')
+        else:
+            rec[8:16] = (heap_addr + element_offset).to_bytes(8, 'little')
+        out += rec
+        element_offset += n + 4
+    return list(out)
+
+
+def make_string_data(
+    strings: list[bytes],
+    heap_addr: int = DEFAULT_HEAP_ADDR,
+) -> _ColumnChunk:
+    values = _encode_strings(strings)
+    def_levels = _make_def_levels(len(strings))
+    payload = bytearray(def_levels) + values
+    hdr = _make_data_page_header(
+        num_values=len(strings),
+        uncompressed_size=len(payload),
+        compressed_size=len(payload),
+        encoding=0,  # PLAIN
+    )
+    return _ColumnChunk(
+        compression=False,
+        num_values=len(strings),
+        chunk_bytes=bytearray(hdr) + payload,
+        type_t_override=GERMAN_STR_T,
+        heap_addr=heap_addr,
+        expected_heap=values,
     )
 
 
@@ -111,12 +197,8 @@ def make_tricky(
     stream_type: "fpga_stream.StreamType" = fpga_stream.StreamType.SIGNED_INT_64,
     dict_values: list[int] = list(range(10, 20)),
     trailing_plain: bool = True,
-    is_required: bool = False,
 ) -> _ColumnChunk:
     hybrid_body = read_bytes(filename + '_chunk_decompressed.bin')
-    if is_required:
-        # REQUIRED column: drop the 4-byte length prefix + def_levels, keeping bit_width + runs.
-        hybrid_body = hybrid_body[int.from_bytes(hybrid_body[:4], 'little') + 4:]
 
     chunk = bytearray()
 
@@ -129,9 +211,9 @@ def make_tricky(
     )
     chunk += dict_body
 
-    # `factor` HYBRID pages. Unless the column is REQUIRED, each body carries its
-    # 4-byte def_levels length prefix + def_levels + RLE/BPE-encoded payload,
-    # which HybridPageDecoder skips at runtime.
+    # `factor` HYBRID pages. Each body already carries its 4-byte def_levels
+    # length prefix + def_levels + RLE/BPE-encoded payload — PageHeaderParser's
+    # SKIP_DEF_LEVELS state will strip the def_levels prefix at runtime.
     for _ in range(factor):
         chunk += _make_data_page_header(
             num_values=num_values,
@@ -147,7 +229,7 @@ def make_tricky(
     # path to be reset via the injected dummy beat (see ColumnChunkDecoder).
     if trailing_plain:
         plain_values = fpga_stream.Stream(stream_type, items).data_to_bytearray()
-        plain_def_levels = b'' if is_required else _make_def_levels(len(items))
+        plain_def_levels = _make_def_levels(len(items))
         plain_body = bytearray(plain_def_levels) + bytearray(plain_values)
         chunk += _make_data_page_header(
             num_values=len(items),
@@ -163,79 +245,64 @@ def make_tricky(
         num_values=total_num_values,
         chunk_bytes=chunk,
         stream_type=stream_type,
-        is_required=is_required,
     )
 
 
 # Reference outputs shared across cases.
-def _rle_output(dict_values: list[int]) -> list[int]:
-    # The rle_data fixture repeats dictionary index i - 10 for i in range(10, 20) i times
-    return [dict_values[i - 10] for i in range(10, 20) for _ in range(i)]
-
-_RLE_OUTPUT = _rle_output(list(range(10, 20)))
+_RLE_OUTPUT = [i for i in range(10, 20) for _ in range(i)]
 _PLAIN_OUTPUT = list(range(0, 256))
 
 
-class ColumnChunkDecoderTestCase(ConfiguredTestCase):
+class ColumnChunkDecoderTestCase(fpga_test_case.FPGATestCase):
     alternative_vfpga_top_file = "vfpga_tops/column_chunk_decoder_test.sv"
     debug_mode = True
 
-    def configure(self):
-        # Chunk-level configuration only — page-level configuration is produced
-        # inside ColumnChunkDecoder by PageHeaderParser.
-        config = self.config.get_config(ColumnChunkDecoderConfig)
-        for input in self.inputs:
-            compression = Compression.SNAPPY if input.compression else Compression.RAW
-            config.enqueue_column_chunk(
-                0, compression, input.num_values, input.stream_type, input.is_required,
-                input.logical_type
-            )
+    def __init__(self, a) -> None:
+        super().__init__(a)
+
+    def setUp(self):
+        return super().setUp()
+
+    def run_chunks(self, inputs: list[_ColumnChunk], outputs: list[list[int]]):
+        """Drive the decoder with one or more column chunks and assert outputs."""
+        # Chunk-level registers only — page-level configuration is now produced
+        # inside ColumnChunkDecoder by PageHeaderParser. Offset 3 mirrors
+        # page_header_parser_test.py (GlobalConfig occupies regs 0..2).
+        for input in inputs:
+            self.write_register(fpga_register.vFPGARegister(3, input._register()))
+            # The heap base lives in a second register that ColumnChunkDecoderConfig
+            # only consumes for german string chunks, so it is written only for
+            # those - writing it otherwise would desynchronise the two FIFOs.
+            if input.is_string:
+                self.write_register(fpga_register.vFPGARegister(4, input._heap_register()))
 
         # One stream input per column chunk (full thrift-wrapped bytes).
-        for input in self.inputs:
+        for input in inputs:
             self.set_stream_input(0, input.chunk_bytes)
 
-        # The output value width follows each chunk's logical type.
-        for input, output in zip(self.inputs, self.outputs):
-            self.set_expected_output(0, fpga_stream.Stream(input.output_type(), output))
+        # The output value width follows each chunk's declared type_t. String
+        # chunks emit fixed 16-byte german_str_t records, so they are compared as
+        # raw bytes rather than through a typed stream.
+        for input, output in zip(inputs, outputs):
+            if input.is_string:
+                self.set_expected_output(
+                    0, fpga_stream.Stream(fpga_stream.StreamType.UNSIGNED_INT_8, output))
+            else:
+                self.set_expected_output(0, fpga_stream.Stream(input.stream_type, output))
 
-    def finish_input(self, end_event):
-        # Reads the profile once all outputs were written, while the simulation is still running.
-        if self.read_profile_after_run:
-            self.get_io_writer().block_till_completed(
-                io_writer.CoyoteOperator.LOCAL_WRITE,
-                self._expected_completed_write_transfers,
-                end_event,
-            )
-            self.profile = self.config.get_config(ColumnChunkDecoderConfig).read_profile(0)
-
-        super().finish_input(end_event)
-
-    def run_chunks(self, inputs: list[_ColumnChunk], outputs: list[list[int]],
-                   read_profile: bool = False):
-        """Drive the decoder with one or more column chunks and assert outputs."""
-        self.inputs = inputs
-        self.outputs = outputs
-        self.read_profile_after_run = read_profile
+        # heap_out carries the raw string bytes for long strings; it stays idle
+        # for fixed-width chunks.
+        for input in inputs:
+            if input.expected_heap is not None:
+                self.set_expected_output(
+                    1, fpga_stream.Stream(fpga_stream.StreamType.UNSIGNED_INT_8,
+                                          list(input.expected_heap)))
 
         self.simulate_fpga()
         self.assert_simulation_output()
 
     def test_one_rle_page(self):
         self.run_chunks([_parquet_chunk('rle_data.parquet')], [_RLE_OUTPUT])
-
-    def test_profile(self):
-        self.run_chunks(
-            [_parquet_chunk('rle_data.parquet'), _parquet_chunk('bpe_data.parquet')],
-            [_RLE_OUTPUT, list(range(10, 20)) * 15],
-            read_profile=True,
-        )
-
-        # Every column chunk is one input and one output stream.
-        self.assertEqual(self.profile.input.last_handshakes, 2)
-        self.assertEqual(self.profile.output.last_handshakes, 2)
-        self.assertGreater(self.profile.input.handshakes_cycles, 0)
-        self.assertGreater(self.profile.output.handshakes_cycles, 0)
 
     def test_one_bpe_page(self):
         self.run_chunks([_parquet_chunk('bpe_data.parquet')], [list(range(10, 20)) * 15])
@@ -260,6 +327,7 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
         )
 
     def test_many_hybrid_pages(self):
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
         mixed_output = ([i**8 for i in range(10, 20) for _ in range(i)] +
                         list(range(128, 256)) * 2) * 2
         self.run_chunks(
@@ -292,6 +360,7 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
         #            dictionary state, chunk B would either materialise stale
         #            32-bit values or mis-size its 64-bit output, so a correct
         #            chunk B output proves the reset.
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
         chunk_a = make_tricky(
             'rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1,
             stream_type=fpga_stream.StreamType.SIGNED_INT_32,
@@ -306,115 +375,118 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
             [_RLE_OUTPUT + _PLAIN_OUTPUT, _RLE_OUTPUT],
         )
 
-    def test_required_plain_page(self):
-        self.run_chunks([make_plain_data(_PLAIN_OUTPUT, is_required=True)], [_PLAIN_OUTPUT])
+    # -- German strings -----------------------------------------------------
+    #
+    # A PLAIN BYTE_ARRAY chunk takes the string path: StripLevels -> PlainRouter
+    # -> StringRouter -> PlainStringDecoder -> GermanStrToNData -> out. Values
+    # land on stream 0 as 16-byte german_str_t records and the raw bytes are
+    # echoed on heap_out (stream 1).
 
-    def test_required_tricky_page(self):
-        tricky = make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 2,
-                             is_required=True)
-        self.run_chunks([tricky], [_RLE_OUTPUT * 2 + _PLAIN_OUTPUT])
+    def _run_strings(self, strings: list[bytes], heap_addr: int = DEFAULT_HEAP_ADDR):
+        chunk = make_string_data(strings, heap_addr)
+        self.run_chunks([chunk], [_german_records(strings, heap_addr)])
 
-    def test_required_and_optional_chunks(self):
-        # The flag is per chunk: alternate REQUIRED and OPTIONAL chunks back to back, covering both
-        # the hybrid and the plain (StripLevels) path.
+    def test_string_single_short(self):
+        self._run_strings([b'abc'])
+
+    def test_string_all_inline(self):
+        # Every string fits in the 12 inline bytes, so no heap address is used.
+        self._run_strings([b'a', b'bb', b'ccc', b'abcdefghijkl'])
+
+    def test_string_inline_boundary(self):
+        # 12 bytes is the last inline length; 13 is the first that spills.
+        self._run_strings([b'a' * INLINE_LEN, b'b' * (INLINE_LEN + 1)])
+
+    def test_string_all_long(self):
+        # Every record stores a heap address rather than inline bytes.
+        self._run_strings([b'x' * 20, b'y' * 33, b'z' * 17])
+
+    def test_string_mixed_lengths(self):
+        self._run_strings([b'ab', b'c' * 40, b'defghijkl', b'm' * 13, b'', b'no'])
+
+    def test_string_multi_beat(self):
+        # More than four records per 64-byte beat, forcing GermanStrToNData to
+        # emit several full beats plus a partial final one.
+        strings = [bytes([0x41 + (i % 26)]) * (1 + i % 30) for i in range(37)]
+        self._run_strings(strings)
+
+    def test_string_nondefault_heap_addr(self):
+        self._run_strings([b'p' * 25, b'q' * 14], heap_addr=0xDEAD0000)
+
+    # -- Mixed data types ---------------------------------------------------
+
+    def test_mixed_fixed_widths(self):
+        # One chunk per fixed width, back to back. Each chunk reconfigures the
+        # byte scaling that NormalizeUntil and DataRewriteLast are driven with,
+        # so a wrong shift shows up as a truncated or never-terminating output.
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
+        bytes_out = list(range(0, 200))
+        i32 = list(range(-100, 100))
+        i64 = list(range(0, 150))
         self.run_chunks(
             [
-                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1,
-                            is_required=True),
-                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1),
-                make_plain_data(_PLAIN_OUTPUT, is_required=True),
+                make_plain_data(bytes_out, fpga_stream.StreamType.UNSIGNED_INT_8),
+                make_plain_data(i32, fpga_stream.StreamType.SIGNED_INT_32),
+                make_plain_data(i64, fpga_stream.StreamType.SIGNED_INT_64),
+            ],
+            [bytes_out, i32, i64],
+        )
+
+    def test_mixed_float_widths(self):
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
+        f32 = [float(i) for i in range(0, 128)]
+        f64 = [float(i) * 0.5 for i in range(0, 96)]
+        self.run_chunks(
+            [
+                make_plain_data(f32, fpga_stream.StreamType.FLOAT_32),
+                make_plain_data(f64, fpga_stream.StreamType.FLOAT_64),
+            ],
+            [f32, f64],
+        )
+
+    def test_string_then_fixed(self):
+        # The type switch that matters most: the string path must fully drain and
+        # the PSD's first-page latch must re-arm before the fixed chunk runs.
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
+        strings = [b'alpha', b'b' * 30, b'gamma']
+        self.run_chunks(
+            [make_string_data(strings), make_plain_data(_PLAIN_OUTPUT)],
+            [_german_records(strings, DEFAULT_HEAP_ADDR), _PLAIN_OUTPUT],
+        )
+
+    def test_fixed_then_string(self):
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
+        strings = [b'x' * 18, b'yz']
+        self.run_chunks(
+            [make_plain_data(_PLAIN_OUTPUT), make_string_data(strings)],
+            [_PLAIN_OUTPUT, _german_records(strings, DEFAULT_HEAP_ADDR)],
+        )
+
+    def test_back_to_back_string_chunks(self):
+        # Two string chunks in a row: the second must pick up its own heap base,
+        # which only happens if psd_first_page re-arms on the chunk boundary.
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
+        first = [b'a' * 20, b'bb']
+        second = [b'c' * 15, b'dddd', b'e' * 40]
+        self.run_chunks(
+            [make_string_data(first, 0x1000), make_string_data(second, 0x9000)],
+            [_german_records(first, 0x1000), _german_records(second, 0x9000)],
+        )
+
+    def test_string_between_hybrid_chunks(self):
+        # A string chunk sandwiched between dictionary-encoded chunks, exercising
+        # the dictionary flush and the string path in the same run.
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
+        strings = [b'mid', b'f' * 22]
+        self.run_chunks(
+            [
                 _parquet_chunk('rle_data.parquet'),
+                make_string_data(strings),
+                _parquet_chunk('bpe_data.parquet'),
             ],
             [
-                _RLE_OUTPUT + _PLAIN_OUTPUT,
-                _RLE_OUTPUT + _PLAIN_OUTPUT,
-                _PLAIN_OUTPUT,
                 _RLE_OUTPUT,
-            ],
-        )
-
-    def test_logical_types(self):
-        # Back-to-back chunks cast to narrower logical types, covering dictionary, hybrid and plain
-        # pages of OPTIONAL and REQUIRED columns, followed by a 64-bit chunk without a cast. The
-        # INT16 values are negative and use both bytes to catch byte selection and sign errors.
-        int16_dict  = [-1000 + 237 * i for i in range(10)]
-        int16_plain = list(range(-1000, 1000, 7))
-
-        int16_chunk = make_tricky(
-            'rle_data_rg0_col0', len(_RLE_OUTPUT), int16_plain, 1,
-            stream_type=fpga_stream.StreamType.SIGNED_INT_32, dict_values=int16_dict,
-        )
-        int16_chunk.logical_type = fpga_stream.StreamType.SIGNED_INT_16
-
-        uint8_chunk = make_tricky(
-            'rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 2,
-            stream_type=fpga_stream.StreamType.SIGNED_INT_32, is_required=True,
-        )
-        uint8_chunk.logical_type = fpga_stream.StreamType.UNSIGNED_INT_8
-
-        self.run_chunks(
-            [int16_chunk, uint8_chunk, make_plain_data(_PLAIN_OUTPUT)],
-            [
-                _rle_output(int16_dict) + int16_plain,
-                _RLE_OUTPUT * 2 + _PLAIN_OUTPUT,
-                _PLAIN_OUTPUT,
-            ],
-        )
-
-    def test_logical_type_int32_from_int64(self):
-        # INT64 chunks cast to INT32: a dictionary chunk with hybrid and plain pages and a REQUIRED
-        # plain chunk with a partial last beat, followed by an INT64 chunk without a cast. The values
-        # cover the whole INT32 range, including both ends and negative values.
-        int32_dict  = [-2**31, -1, 0, 1, 2**31 - 1, -123456789, 987654321, -7, 65536, -65537]
-        int32_plain = list(range(-2**31, 2**31, 2**31 // 50))
-
-        dict_chunk = make_tricky(
-            'rle_data_rg0_col0', len(_RLE_OUTPUT), int32_plain, 2, dict_values=int32_dict,
-        )
-        dict_chunk.logical_type = fpga_stream.StreamType.SIGNED_INT_32
-
-        plain_values = [-2**31 + 3 * i for i in range(37)]
-        plain_chunk = make_plain_data(plain_values, is_required=True)
-        plain_chunk.logical_type = fpga_stream.StreamType.SIGNED_INT_32
-
-        self.run_chunks(
-            [dict_chunk, plain_chunk, make_plain_data(_PLAIN_OUTPUT)],
-            [
-                _rle_output(int32_dict) * 2 + int32_plain,
-                plain_values,
-                _PLAIN_OUTPUT,
-            ],
-        )
-
-    def test_logical_types_from_int64(self):
-        # INT64 chunks cast to INT16 and UINT8, which the decoder does in two steps (64 -> 32 bit on
-        # the dictionary and plain paths, then to the logical type at the output): an OPTIONAL
-        # dictionary chunk with hybrid and plain pages, a REQUIRED one, and a REQUIRED plain chunk
-        # with a partial last beat, followed by an INT64 chunk without a cast. The INT16 values cover
-        # both ends of the range.
-        int16_dict  = [-2**15, -1, 0, 1, 2**15 - 1, -12345, 23456, -7, 256, -257]
-        int16_plain = list(range(-2**15, 2**15, 2**15 // 40))
-
-        int16_chunk = make_tricky(
-            'rle_data_rg0_col0', len(_RLE_OUTPUT), int16_plain, 2, dict_values=int16_dict,
-        )
-        int16_chunk.logical_type = fpga_stream.StreamType.SIGNED_INT_16
-
-        uint8_chunk = make_tricky(
-            'rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1, is_required=True,
-        )
-        uint8_chunk.logical_type = fpga_stream.StreamType.UNSIGNED_INT_8
-
-        plain_values = [-2**15 + 5 * i for i in range(45)]
-        plain_chunk = make_plain_data(plain_values, is_required=True)
-        plain_chunk.logical_type = fpga_stream.StreamType.SIGNED_INT_16
-
-        self.run_chunks(
-            [int16_chunk, uint8_chunk, plain_chunk, make_plain_data(_PLAIN_OUTPUT)],
-            [
-                _rle_output(int16_dict) * 2 + int16_plain,
-                _RLE_OUTPUT + _PLAIN_OUTPUT,
-                plain_values,
-                _PLAIN_OUTPUT,
+                _german_records(strings, DEFAULT_HEAP_ADDR),
+                list(range(10, 20)) * 15,
             ],
         )

@@ -80,6 +80,9 @@ typedef enum logic [1:0] {
 } page_type_t;
 
 typedef struct packed {
+    // Buffer address at which raw string bytes will land. Used for german strings longer than 12
+    // bytes. The software writes it to its own register, the other fields share one.
+    vaddress_t    string_heap_addr;
     type_t        logical_typ;
     logic         is_required;
     compression_t compression;
@@ -95,7 +98,7 @@ typedef struct packed {
 typedef struct packed {
     logic update_buffer_addr;
     data32_t        num_values;
-// See column_chunk_conf_t.string_heap_addr
+    // See column_chunk_conf_t.string_heap_addr
     vaddress_t      buffer_addr;
 } plain_str_decoder_conf_t;
 
