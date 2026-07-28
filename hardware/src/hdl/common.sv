@@ -101,10 +101,17 @@ typedef struct packed {
 } plain_str_decoder_conf_t;
 
 typedef struct packed {
-    page_type_t page_type;
-    data32_t    num_values;
+        page_type_t page_type;
+        data32_t    num_values;
     logic       last;
 } page_conf_t;
+
+// The slice of the configuration that the routing modules need. Deliberately
+// narrow: this is the config that has to reach the most places.
+typedef struct packed {
+    type_t      typ;
+    page_type_t ptyp;
+} page_type_info_t;
 
 typedef struct packed {
     stream_profile_t in;

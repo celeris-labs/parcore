@@ -34,12 +34,9 @@ def _rand(rng: Random, n: int) -> bytearray:
 
 
 def _page_conf(page_type: int, typ: int, num_values: int = 0, last: int = 0) -> int:
-    # page_conf_t packs (MSB -> LSB):
-    #   page_type_t [2 bits] | num_values [32 bits] | type_t [3 bits] | last [1 bit]
-    return (((page_type & 0x3) << 36)
-            | ((num_values & 0xFFFFFFFF) << 4)
-            | ((typ & 0x7) << 1)
-            | (last & 0x1))
+    # page_type_info_t packs (MSB -> LSB):
+    #   type_t [3 bits] | page_type_t [2 bits]
+    return ((typ & 0x7) << 2) | (page_type & 0x3)
 
 
 def plain_fixed(typ: int, values: bytearray) -> dict:

@@ -16,7 +16,7 @@ import lynxTypes::*;
  *   out_values             -> axis_host_send[0]
  *   out_to_str_decoder     -> axis_host_send[1]
  *
- * page_conf (page_conf_t) is driven per page over the config path, mirroring how
+ * page_conf (page_type_info_t) is driven per page over the config path, mirroring how
  * the ColumnChunkDecoder page FSM drives it in the real design.
  */
 
@@ -62,8 +62,8 @@ GlobalConfig #(
 
 always_comb read_configs[0].tie_off_s();
 
-ready_valid_i #(page_conf_t) page_conf(clk, rst_n);
-ConfigWriteFIFO #(0, 8, page_conf_t) inst_page_conf (clk, rst_n, write_configs[0], page_conf);
+ready_valid_i #(page_type_info_t) page_conf(clk, rst_n);
+ConfigWriteFIFO #(0, 8, page_type_info_t) inst_page_conf (clk, rst_n, write_configs[0], page_conf);
 
 /* -- INPUTS ------------------------------------------------------------ */
 AXI4S axi_in_stripped (.aclk(clk), .aresetn(rst_n));
