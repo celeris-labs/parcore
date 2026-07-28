@@ -12,7 +12,7 @@ module PlainRouter #(
     input logic clk,
     input logic rst_n,
 
-    ready_valid_i.s page_conf,              // #(page_conf_t),
+    ready_valid_i.s page_conf,              // #(page_type_info_t),
 
     ndata_i.s in_from_stripped,         // #(data8_t, DATABEAT_SIZE)
     ndata_i.s in_from_str_decoder,         // #(data8_t, DATABEAT_SIZE)
@@ -116,9 +116,9 @@ endgenerate
 
 // ------ Config Chain  ------
 
-ready_valid_i #(page_conf_t) DEMUX_config (.*);
-ready_valid_i #(page_conf_t) DEMUX_config_fw (.*);
-RegisteredReadyValidDuplicator #(page_conf_t, 2) inst_DEMUX1_conf_manager (
+ready_valid_i #(page_type_info_t) DEMUX_config (.*);
+ready_valid_i #(page_type_info_t) DEMUX_config_fw (.*);
+RegisteredReadyValidDuplicator #(page_type_info_t, 2) inst_DEMUX1_conf_manager (
     .clk (clk),
     .rst_n (rst_n),
     
@@ -131,10 +131,10 @@ assign demux_select.data =
         VALUE_ROUTER_DEMUX_FIXED_PATH;
 assign demux_select.valid =
     DEMUX_config.valid &&
-    DEMUX_config.data.page_type == PAGE_TYPE_PLAIN;
+    DEMUX_config.data.ptyp == PAGE_TYPE_PLAIN;
 assign DEMUX_config.ready = demux_select.ready;
 
-ready_valid_i #(page_conf_t) MUX_config (.*);
+ready_valid_i #(page_type_info_t) MUX_config (.*);
 
 assign MUX_config.data = DEMUX_config_fw.data;
 assign MUX_config.valid = DEMUX_config_fw.valid;
@@ -146,7 +146,7 @@ assign mux_select.data =
         VALUE_ROUTER_MUX_FROM_FIXED_PATH;
 assign mux_select.valid =
     MUX_config.valid &&
-    MUX_config.data.page_type == PAGE_TYPE_PLAIN;
+    MUX_config.data.ptyp == PAGE_TYPE_PLAIN;
 assign MUX_config.ready = mux_select.ready;
 
 

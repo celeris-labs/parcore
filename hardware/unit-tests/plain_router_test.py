@@ -32,12 +32,9 @@ def _rand(rng: Random, n: int) -> bytearray:
 
 
 def _page_conf(page_type: int, typ: int, num_values: int = 0, last: int = 0) -> int:
-    # page_conf_t packs (MSB -> LSB):
-    #   page_type_t [2 bits] | num_values [32 bits] | type_t [3 bits] | last [1 bit]
-    return (((page_type & 0x3) << 36)
-            | ((num_values & 0xFFFFFFFF) << 4)
-            | ((typ & 0x7) << 1)
-            | (last & 0x1))
+    # page_type_info_t packs (MSB -> LSB):
+    #   type_t [3 bits] | page_type_t [2 bits]
+    return ((typ & 0x7) << 2) | (page_type & 0x3)
 
 
 def plain_fixed(typ: int, values: bytearray) -> dict:
@@ -210,11 +207,8 @@ class PlainRouterTestCase(fpga_test_case.FPGATestCase):
             dict_string(_rand(rng, 64), _rand(rng, 24)),
             # none
             hybrid(GERMAN_STR_T, _rand(rng, 128)),
-            # none
             hybrid(GERMAN_STR_T, _rand(rng, 192)),
-            # none
             hybrid(GERMAN_STR_T, _rand(rng, 207)),
-            # none
             hybrid(GERMAN_STR_T, _rand(rng, 15)),
             # in_from_stripped -> out_to_str_decoder, in_from_str_decoder -> out_values
             plain_string(_rand(rng, 323), _rand(rng, 278)),

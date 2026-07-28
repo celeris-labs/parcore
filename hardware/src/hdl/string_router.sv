@@ -11,7 +11,7 @@ module StringRouter #(
     input logic clk,
     input logic rst_n,
 
-    ready_valid_i.s page_conf,      // #(page_conf_t),
+    ready_valid_i.s page_conf,      // #(page_type_info_t),
 
     ndata_i.s in_from_plain,        // #(data8_t, DATABEAT_SIZE)
     ndata_i.s in_from_dict_body,    // #(data8_t, DATABEAT_SIZE)
@@ -80,9 +80,9 @@ DataDemultiplexer #(2) inst_demux (
 
 // ------ Config Chain  ------
 
-ready_valid_i #(page_conf_t) MUX_config (.*);
-ready_valid_i #(page_conf_t) MUX_config_fw (.*);
-RegisteredReadyValidDuplicator #(page_conf_t, 2) inst_MUX1_conf_manager (
+ready_valid_i #(page_type_info_t) MUX_config (.*);
+ready_valid_i #(page_type_info_t) MUX_config_fw (.*);
+RegisteredReadyValidDuplicator #(page_type_info_t, 2) inst_MUX1_conf_manager (
     .clk (clk),
     .rst_n (rst_n),
     
@@ -91,28 +91,28 @@ RegisteredReadyValidDuplicator #(page_conf_t, 2) inst_MUX1_conf_manager (
 );
 
 assign mux_select.data =
-    MUX_config.data.page_type == PAGE_TYPE_PLAIN ?
+    MUX_config.data.ptyp == PAGE_TYPE_PLAIN ?
         STR_ROUTE_PLAIN_TO_STR_DEC :
         STR_ROUTE_DICT_TO_STR_DEC;
 assign mux_select.valid =
     MUX_config.valid &&
-    MUX_config.data.page_type != PAGE_TYPE_HYBRID &&
+    MUX_config.data.ptyp != PAGE_TYPE_HYBRID &&
     MUX_config.data.typ == GERMAN_STR_T;
 assign MUX_config.ready = mux_select.ready;
 
-ready_valid_i #(page_conf_t) DEMUX_config (.*);
+ready_valid_i #(page_type_info_t) DEMUX_config (.*);
 
 assign DEMUX_config.data = MUX_config_fw.data;
 assign DEMUX_config.valid = MUX_config_fw.valid;
 assign MUX_config_fw.ready = DEMUX_config.ready;
 assign demux_select.data =
-    MUX_config.data.page_type == PAGE_TYPE_PLAIN ?
+    DEMUX_config.data.ptyp == PAGE_TYPE_PLAIN ?
         STR_ROUTE_STR_DEC_TO_PLAIN :
         STR_ROUTE_STR_DEC_TO_DICT_BODY;
 assign demux_select.valid =
     DEMUX_config.valid &&
-    MUX_config.data.page_type != PAGE_TYPE_HYBRID &&
-    MUX_config.data.typ == GERMAN_STR_T;
+    DEMUX_config.data.ptyp != PAGE_TYPE_HYBRID &&
+    DEMUX_config.data.typ == GERMAN_STR_T;
 assign DEMUX_config.ready = demux_select.ready;
 
 
