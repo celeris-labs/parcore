@@ -93,11 +93,10 @@ typedef struct packed {
 } hybrid_page_conf_t;
 
 typedef struct packed {
-    // Buffer address at which raw string bytes will land
-    // Used for german strings longer than 12 bytes
-    offset_t      offset;
-    data32_t      num_values;
-    vaddress_t    buffer_addr;
+    logic update_buffer_addr;
+    data32_t        num_values;
+// See column_chunk_conf_t.string_heap_addr
+    vaddress_t      buffer_addr;
 } plain_str_decoder_conf_t;
 
 typedef struct packed {
