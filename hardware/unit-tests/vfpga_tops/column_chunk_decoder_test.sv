@@ -11,7 +11,10 @@ always_comb sq_wr.tie_off_m();
 always_comb cq_rd.tie_off_s();
 always_comb cq_wr.tie_off_s();
 
-for (genvar I = 1; I < N_STRM_AXI; I++) begin
+// send[1] carries the string heap; recv[1] is unused.
+always_comb axis_host_recv[1].tie_off_s();
+
+for (genvar I = 2; I < N_STRM_AXI; I++) begin
     always_comb axis_host_recv[I].tie_off_s();
     always_comb axis_host_send[I].tie_off_m();
 end
@@ -85,9 +88,25 @@ NDataToAXI #(data8_t, 64) inst_ndata_to_axi (
     .out(axi_host_send_0)
 );
 
-// discard typed interface
-typed_ndata_i #(64) out(clk, rst_n);
+ndata_i #(data8_t, 64) out(clk, rst_n);
 `DATA_ASSIGN(out, out_u8);
+
+// String heap: only carries data for german strings longer than 12 bytes, so it
+// stays idle for fixed-width chunks.
+AXI4S axi_host_send_1 (.aclk(clk), .aresetn(rst_n));
+`AXIS_ASSIGN(axi_host_send_1, axis_host_send[1])
+
+ndata_i #(data8_t, 64) heap_u8(clk, rst_n);
+NDataToAXI #(data8_t, 64) inst_ndata_to_axi_heap (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(heap_u8),
+    .out(axi_host_send_1)
+);
+
+ndata_i #(data8_t, 64) heap_out(clk, rst_n);
+`DATA_ASSIGN(heap_out, heap_u8);
 
 /* -- DESIGN WIRING ----------------------------------------------------- */
 
@@ -101,6 +120,7 @@ ColumnChunkDecoder #(
 
     .in(in),
     .out(out),
+    .heap_out(heap_out),
 
     .profile(profile[0])
 );
