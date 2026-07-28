@@ -4,7 +4,6 @@
 
 import libstf::*;
 import parcore::*;
-import parcore_data_paths::*;
 
 module DictionaryBody #(
     parameter int DATABEAT_SIZE,
