@@ -12,7 +12,7 @@ module PlainStringDecoder #(
     input  logic clk,
     input  logic rst_n,
 
-    ready_valid_i.s conf,           // { num_values, initial byte offset in heap }
+    ready_valid_i.s conf,           // #(plain_str_decoder_conf_t)
     ndata_i.s       in_data,        // #(data8_t, STREAM_WIDTH)
     data_i.m        out_strings,    // #(german_str_t)
     ndata_i.m       out_data        // #(data8_t, STREAM_WIDTH)
@@ -149,81 +149,82 @@ module PlainStringDecoder #(
     state_t state;
 
     always_ff @( posedge clk ) begin : length_extractor_fsm
-        if ( !rst_n ) begin
-            state <= WAIT_CONF;
-            cursor <= 0;
-            values_remaining <= 0;
-            in_data_buffer.data <= '0;
-            in_data_buffer.keep <= '0;
-            in_data_buffer.last <= 0;
-        end else begin
-            case (state)
-                WAIT_CONF: begin
-                    if (conf.valid) begin
-                        if (in.valid)
-                            state <= EMIT_LENS_AND_STREAM;
-                        else
-                            state <= WAIT_FIRST;
-                        cursor <= conf.data.offset;
-                        values_remaining <= conf.data.num_values;
-                        heap_addr <= conf.data.buffer_addr + LENGTH_PREFIX_LEN;
-                        cursor_after_prefix <= LENGTH_PREFIX_LEN;
-                        updateInputBuffer();
-                    end
-                end
-                WAIT_FIRST: begin
+    if ( !rst_n ) begin
+        state <= WAIT_CONF;
+        cursor <= 0;
+        values_remaining <= 0;
+        in_data_buffer.data <= '0;
+        in_data_buffer.keep <= '0;
+        in_data_buffer.last <= 0;
+    end else begin
+        case (state)
+            WAIT_CONF: begin
+                if (conf.valid) begin
                     if (in.valid)
                         state <= EMIT_LENS_AND_STREAM;
+                    else
+                        state <= WAIT_FIRST;
+                    cursor <= 0;
+                    values_remaining <= conf.data.num_values;
+                    if (conf.data.update_buffer_addr)
+                        heap_addr <= conf.data.buffer_addr + LENGTH_PREFIX_LEN;
+                    cursor_after_prefix <= LENGTH_PREFIX_LEN;
                     updateInputBuffer();
                 end
-                EMIT_LENS_AND_STREAM: begin
-                    // Cursor update logic
-                    if (!cursor_in_view) begin
-                        if(out_data_internal.ready && in.valid) begin
-                            cursor <= cursor - STREAM_WIDTH;
-                        end
-                    end else if (out_strings.ready) begin
-                        if (cursor_n_crosses && out_data_internal.ready && in.valid) begin
-                            cursor <= cursor_n - STREAM_WIDTH;
-                            heap_addr <= heap_addr + LENGTH_PREFIX_LEN + length;
-                        end
-                        else if (!cursor_n_crosses && (!last_val || out_data_internal.ready)) begin
-                            cursor <= cursor_n;
-                            heap_addr <= heap_addr + LENGTH_PREFIX_LEN + length;
-                        end
-                    end
-
-                    // Values are only updated when lengths are emitted
-                    if(out_strings.valid && out_strings.ready)
-                        values_remaining <= values_remaining - 1;
-                    
-                    // Input buffer update logic
-                    if ((!cursor_in_view || (cursor_n_crosses && out_strings.ready)) && out_data_internal.ready && in.valid) begin
-                        updateInputBuffer();
-                    end
-
-                    // state update logic
-                    if (cursor_in_view && last_val && out_strings.ready && out_data_internal.ready) begin
-                        if (!cursor_n_crosses)
-                            state <= WAIT_CONF;
-                        else if (in.valid)
-                            state <= EMIT_STREAM;
-                    end
-                end
-                EMIT_STREAM: begin
-                    if (out_data_internal.ready && (in.valid || cursor_in_view)) begin
+            end
+            WAIT_FIRST: begin
+                if (in.valid)
+                    state <= EMIT_LENS_AND_STREAM;
+                updateInputBuffer();
+            end
+            EMIT_LENS_AND_STREAM: begin
+                // Cursor update logic
+                if (!cursor_in_view) begin
+                    if(out_data_internal.ready && in.valid) begin
                         cursor <= cursor - STREAM_WIDTH;
-                        updateInputBuffer();
                     end
-                    
-                    if (cursor_in_view && out_data_internal.ready)
-                        state <= WAIT_CONF; 
+                end else if (out_strings.ready) begin
+                    if (cursor_n_crosses && out_data_internal.ready && in.valid) begin
+                        cursor <= cursor_n - STREAM_WIDTH;
+                        heap_addr <= heap_addr + LENGTH_PREFIX_LEN + length;
+                    end
+                    else if (!cursor_n_crosses && (!last_val || out_data_internal.ready)) begin
+                        cursor <= cursor_n;
+                        heap_addr <= heap_addr + LENGTH_PREFIX_LEN + length;
+                    end
                 end
-                default: begin
-                    
+
+                // Values are only updated when lengths are emitted
+                if(out_strings.valid && out_strings.ready)
+                    values_remaining <= values_remaining - 1;
+                
+                // Input buffer update logic
+                if ((!cursor_in_view || (cursor_n_crosses && out_strings.ready)) && out_data_internal.ready && in.valid) begin
+                    updateInputBuffer();
                 end
-            endcase
-        end
+
+                // state update logic
+                if (cursor_in_view && last_val && out_strings.ready && out_data_internal.ready) begin
+                    if (!cursor_n_crosses)
+                        state <= WAIT_CONF;
+                    else if (in.valid)
+                        state <= EMIT_STREAM;
+                end
+            end
+            EMIT_STREAM: begin
+                if (out_data_internal.ready && (in.valid || cursor_in_view)) begin
+                    cursor <= cursor - STREAM_WIDTH;
+                    updateInputBuffer();
+                end
+                
+                if (cursor_in_view && out_data_internal.ready)
+                    state <= WAIT_CONF; 
+            end
+            default: begin
+                
+            end
+        endcase
+    end
     end
 
     always_comb begin
