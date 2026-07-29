@@ -17,8 +17,7 @@ import libstf::GERMAN_STR_T;
 import parcore::*;
 
 module ColumnChunkDecoder #(
-    parameter DATABEAT_SIZE = AXI_DATA_BITS / 8,
-    parameter type id_t = data32_t
+    parameter DATABEAT_SIZE = AXI_DATA_BITS / 8
 ) (
     input logic clk,
     input logic rst_n,
