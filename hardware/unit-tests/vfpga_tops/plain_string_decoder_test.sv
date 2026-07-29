@@ -73,7 +73,9 @@ ConfigWriteFIFO#(1, 1, vaddress_t) heap_addr_config_fifo (
 );
 
 always_comb begin : buildConf
-    decoder_conf.data.offset = '0;
+    // A fresh heap base is written alongside every config here, so the decoder
+    // reloads it on each page rather than walking on from the previous one.
+    decoder_conf.data.update_buffer_addr = 1'b1;
     decoder_conf.data.num_values = latched_num_values.data;
     decoder_conf.data.buffer_addr = latched_heap_addr.data;
     decoder_conf.valid = latched_num_values.valid && latched_heap_addr.valid;

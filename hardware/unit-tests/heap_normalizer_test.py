@@ -118,3 +118,36 @@ class HeapNormalizerTestCase(fpga_test_case.FPGATestCase):
             [(1, 0, _rand(rng, 128)), (0, 1, None)],
             [(1, 1, _rand(rng, 12))],
         ])
+
+    # -- Config backlog -------------------------------------------------------
+    #
+    # Every case above uses pages of a few beats, so each conf is consumed well
+    # before the next AXI-Lite write lands and the internal skid never holds
+    # more than one entry. ColumnChunkDecoder is not so gentle: it enqueues one
+    # conf per page on page_conf_fire, so a chunk's confs arrive back to back
+    # and queue up while the first page is still draining through the decoder.
+    #
+    # These cases reproduce that by making the pages large enough (tens of
+    # beats) that the FSM stays in PASSTHROUGH while the remaining confs pile
+    # up behind it. A normaliser that reads the pre-skid conf instead of the
+    # skidded one will latch an entry one or two ahead of the page it is
+    # actually processing, and flush at the wrong page boundary.
+
+    def test_large_pages_conf_backlog(self):
+        rng = Random(12)
+        self._run([[(1, 0, _rand(rng, 64 * BEAT_SIZE)),
+                    (1, 0, _rand(rng, 64 * BEAT_SIZE)),
+                    (1, 1, _rand(rng, 64 * BEAT_SIZE))]])
+
+    def test_many_large_pages_conf_backlog(self):
+        rng = Random(13)
+        pages = [(1, 0, _rand(rng, 32 * BEAT_SIZE)) for _ in range(5)]
+        pages.append((1, 1, _rand(rng, 32 * BEAT_SIZE)))
+        self._run([pages])
+
+    def test_large_pages_with_skip_and_flush(self):
+        rng = Random(14)
+        self._run([[(1, 0, _rand(rng, 48 * BEAT_SIZE)),
+                    (0, 0, None),
+                    (1, 0, _rand(rng, 48 * BEAT_SIZE)),
+                    (0, 1, None)]])
