@@ -24,7 +24,13 @@ enum class Type : unsigned char {
   BYTE_ARRAY = 5
 };
 std::ostream &operator<<(std::ostream &os, Type typ);
+/**
+ * Whether the type decodes into a flat run of fixed-width values. BYTE_ARRAY is
+ * excluded: the hardware decodes it, but into german_str_t records plus a
+ * separate string heap. Use is_string_type for that.
+ */
 bool is_libstf_type(const Type &typ);
+bool is_string_type(const Type &typ);
 libstf::type_t to_libstf_type(const Type &typ);
 
 struct ColumnChunk {

@@ -22,13 +22,28 @@ public:
 
   [[nodiscard]] const libstf::stream_t &decoder() const;
 
+  // PairedOutputWriter gives every decoder two logical output streams sharing
+  // one physical channel: values on 2I, the string heap on 2I + 1. The heap
+  // stays completely silent for anything that is not a BYTE_ARRAY column, so no
+  // transfer and no interrupt are raised on it there.
+  [[nodiscard]] libstf::stream_t values_stream() const;
+  [[nodiscard]] libstf::stream_t heap_stream() const;
+
   struct Handle {
   public:
     Handle(std::shared_ptr<ColumnChunkDecoder> column_chunk_decoder,
            std::unique_lock<std::mutex> lock,
-           std::shared_ptr<libstf::OutputHandle> output_handle);
+           std::shared_ptr<libstf::OutputHandle> output_handle,
+           uint64_t string_heap_address);
 
     void add_chunk(const std::shared_ptr<libstf::Buffer> &buffer);
+
+    /**
+     * Device address the string heap of this column chunk will be written to,
+     * and the base the addresses inside its german_str_t records are relative
+     * to. Zero for chunks that are not BYTE_ARRAY.
+     */
+    [[nodiscard]] uint64_t string_heap_address() const;
 
     // The && qualifier means this can only be called on a moving handle
     std::shared_ptr<libstf::OutputHandle> done() &&;
@@ -38,6 +53,7 @@ public:
     std::unique_lock<std::mutex> lock_;
 
     std::shared_ptr<libstf::OutputHandle> output_handle_;
+    uint64_t string_heap_address_;
     bool chunk_written_;
   };
 
@@ -57,7 +73,9 @@ private:
   std::mutex mtx;
   size_t column_chunk_enqueued_configs_;
 
-  libstf::stream_mask_t decoder_mask() const;
+  // The heap stream is only included for BYTE_ARRAY chunks; for anything else
+  // the hardware never writes there, so waiting on it would hang.
+  libstf::stream_mask_t decoder_mask(bool with_heap) const;
 
   void enqueue_stream_input(const std::shared_ptr<libstf::Buffer> &buffer);
 };

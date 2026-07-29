@@ -27,8 +27,10 @@ inline uint64_t compression_to_hardware(metadata::Compression compression) {
 }
 
 // column_chunk_conf_t packs (MSB -> LSB) as:
-//   defer_dict_decoding [1 bit] | logical type_t [3 bits] | is_required [1 bit] |
-//   compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
+//   logical type_t [3 bits] | is_required [1 bit] | compression_t [1 bit] | num_values [32 bits] |
+//   type_t [3 bits]
+// The string_heap_addr [48 bits] does not fit alongside the rest in a single 64-bit AXIL write, so
+// it travels in a second register that the hardware only pops for GERMAN_STR_T chunks.
 constexpr const uint32_t COLUMN_CHUNK_DECODER_NUM_VALUES_SHIFT = 3;
 constexpr const uint32_t COLUMN_CHUNK_DECODER_COMPRESSION_SHIFT =
     COLUMN_CHUNK_DECODER_NUM_VALUES_SHIFT + 32;
@@ -57,7 +59,7 @@ void ColumnChunkDecoderConfig::enqueue_column_chunk(libstf::stream_t      decode
                                                     metadata::Compression compression,
                                                     uint64_t num_values, libstf::type_t typ,
                                                     bool is_required, libstf::type_t logical_typ,
-                                                    bool defer_dict_decoding) {
+                                                    uint64_t string_heap_addr) {
     if (decoder >= num_decoders_) {
         throw std::runtime_error("attempted to configure ColumnChunkDecoder " +
                                  std::to_string(decoder) + " (zero-based numbering), out of " +
@@ -78,7 +80,11 @@ void ColumnChunkDecoderConfig::enqueue_column_chunk(libstf::stream_t      decode
         (compression_to_hardware(compression) << COLUMN_CHUNK_DECODER_COMPRESSION_SHIFT) |
         ((num_values & 0xFFFFFFFF) << COLUMN_CHUNK_DECODER_NUM_VALUES_SHIFT) |
         (static_cast<uint64_t>(typ) & 0x7);
-    write_register(libstf::ConfigRegister(decoder, packed));
+    write_register(libstf::ConfigRegister(2 * decoder, packed));
+    // Writing this for any other type would desynchronise the two config FIFOs, since
+    // the hardware only pops it for GERMAN_STR_T.
+    if (typ == libstf::type_t::GERMAN_STR_T)
+        write_register(libstf::ConfigRegister(2 * decoder + 1, string_heap_addr));
     Profiler::close_regions({column_config_prefix + "enqueue_column_chunk"});
 }
 
