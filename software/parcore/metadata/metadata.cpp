@@ -37,6 +37,12 @@ bool is_libstf_type(const Type &typ) {
   }
 }
 
+// Deliberately excluded from is_libstf_type: BYTE_ARRAY is decodable by the
+// hardware (see to_libstf_type) but produces german_str_t records plus a
+// separate string heap rather than a flat run of fixed-width values, so callers
+// have to opt into handling two output streams.
+bool is_string_type(const Type &typ) { return typ == Type::BYTE_ARRAY; }
+
 libstf::type_t to_libstf_type(const Type &typ) {
   switch (typ) {
   case Type::BYTE_T:
@@ -49,6 +55,8 @@ libstf::type_t to_libstf_type(const Type &typ) {
     return libstf::type_t::FLOAT_T;
   case Type::DOUBLE_T:
     return libstf::type_t::DOUBLE_T;
+  case Type::BYTE_ARRAY:
+    return libstf::type_t::GERMAN_STR_T;
   default:
     throw std::runtime_error("cannot convert type to libstf::type_t");
   }

@@ -18,13 +18,21 @@ ColumnChunkDecoder::ColumnChunkDecoder(
 
 const libstf::stream_t &ColumnChunkDecoder::decoder() const { return decoder_; }
 
+libstf::stream_t ColumnChunkDecoder::values_stream() const { return 2 * decoder_; }
+libstf::stream_t ColumnChunkDecoder::heap_stream() const { return 2 * decoder_ + 1; }
+
 ColumnChunkDecoder::Handle::Handle(
     std::shared_ptr<ColumnChunkDecoder> column_chunk_decoder,
     std::unique_lock<std::mutex> lock,
-    std::shared_ptr<libstf::OutputHandle> output_handle)
+    std::shared_ptr<libstf::OutputHandle> output_handle,
+    uint64_t string_heap_address)
     : column_chunk_decoder_(std::move(column_chunk_decoder)),
       lock_(std::move(lock)), output_handle_(output_handle),
-      chunk_written_(false) {}
+      string_heap_address_(string_heap_address), chunk_written_(false) {}
+
+uint64_t ColumnChunkDecoder::Handle::string_heap_address() const {
+  return string_heap_address_;
+}
 
 void ColumnChunkDecoder::Handle::add_chunk(
     const std::shared_ptr<libstf::Buffer> &buffer) {
@@ -57,19 +65,35 @@ ColumnChunkDecoder::decode_column_chunk(
   assert(column_chunk_enqueued_configs_ + 1 <
          column_chunk_config_->maximum_num_enqueued_configs());
 
+  auto type = metadata::to_libstf_type(column_chunk.type);
+  const bool is_string = type == libstf::type_t::GERMAN_STR_T;
+
+  // Acquiring the handle is what commits the output buffers to the hardware, so
+  // it has to happen before the chunk config is written: the decoder needs the
+  // heap's base address up front to fill in the addresses of long strings.
   auto output_handle =
-      output_buffer_manager_->acquire_output_handle(decoder_mask());
+      output_buffer_manager_->acquire_output_handle(decoder_mask(is_string));
+
+  uint64_t string_heap_address = 0;
+  if (is_string) {
+    // The decoder walks the heap linearly from this one base, so the whole
+    // chunk's string bytes must land in the buffer starting here. A chunk large
+    // enough to spill into the next buffer would produce records pointing at
+    // the wrong place; callers detect that by checking that the heap stream
+    // yielded a single buffer.
+    string_heap_address = reinterpret_cast<uint64_t>(
+        output_buffer_manager_->next_buffer_address(heap_stream()));
+  }
 
   column_chunk_config_->enqueue_column_chunk(
-      decoder_, column_chunk.compression, column_chunk.num_values,
-      metadata::to_libstf_type(column_chunk.type), column_chunk.is_required,
-      column_chunk.logical_type());
+      decoder_, column_chunk.compression, column_chunk.num_values, type,
+      column_chunk.is_required, column_chunk.logical_type(), string_heap_address);
 
   column_chunk_enqueued_configs_ += 1;
 
   Profiler::close_regions({prefix + "decode_column_chunk"});
   return std::make_unique<Handle>(shared_from_this(), std::move(lock),
-                                  output_handle);
+                                  output_handle, string_heap_address);
 }
 
 void ColumnChunkDecoder::finished_decoding_column_chunk(
@@ -78,9 +102,11 @@ void ColumnChunkDecoder::finished_decoding_column_chunk(
   column_chunk_enqueued_configs_ -= 1;
 }
 
-libstf::stream_mask_t ColumnChunkDecoder::decoder_mask() const {
+libstf::stream_mask_t ColumnChunkDecoder::decoder_mask(bool with_heap) const {
   libstf::stream_mask_t mask;
-  mask.set(decoder_);
+  mask.set(values_stream());
+  if (with_heap)
+    mask.set(heap_stream());
   return mask;
 }
 
