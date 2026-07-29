@@ -38,11 +38,11 @@ state_t state;
 ndata_i #(data8_t, NUM_BYTES) to_normalizer (.*);
 
 task fetch_conf_transition();
-    generates_heap <= conf.data[1];
-    last_page <= conf.data[0];
-    if (conf.data[1])
+    generates_heap <= _conf.data[1];
+    last_page <= _conf.data[0];
+    if (_conf.data[1])
         state <= PASSTHROUGH;
-    else if (conf.data[0])
+    else if (_conf.data[0])
         state <= EMIT_DUMMY;
     else
         state <= WAIT_CONF;
@@ -54,7 +54,7 @@ if (!rst_n) begin
 end else begin
     case (state)
         WAIT_CONF: begin
-            if (conf.valid) 
+            if (_conf.valid)
                 fetch_conf_transition();
         end
         EMIT_DUMMY: begin
