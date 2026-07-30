@@ -19,6 +19,8 @@ std::ostream &operator<<(std::ostream &os, Type typ) {
     return os << "FLOAT_T";
   case Type::DOUBLE_T:
     return os << "DOUBLE_T";
+  case Type::BYTE_ARRAY:
+    return os << "BYTE_ARRAY";
   default:
     return os << "UNEXPECTED TYPE";
   }
