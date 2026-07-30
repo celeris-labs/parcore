@@ -352,6 +352,18 @@ int main(int argc, char *argv[]) {
       } else {
         std::vector<uint8_t> expected;
         for (const auto &cc : cpu_data->chunks()) {
+          if (cc->type_id() == arrow::Type::DECIMAL128) {
+            // Parquet stores these with an INT64 physical type and the decoder
+            // emits exactly that, but Arrow widens them to 128 bits on read.
+            // The buffer is little endian, so the decoder's value is the low
+            // half of each 16-byte entry.
+            auto arr = std::static_pointer_cast<arrow::FixedSizeBinaryArray>(cc);
+            for (int64_t k = 0; k < arr->length(); ++k) {
+              const uint8_t *v = arr->GetValue(k);
+              expected.insert(expected.end(), v, v + libstf::size_of(typ));
+            }
+            continue;
+          }
           auto arr = std::static_pointer_cast<arrow::PrimitiveArray>(cc);
           const uint8_t *data = arr->data()->GetValues<uint8_t>(1);
           expected.insert(expected.end(), data, data + arr->length() * libstf::size_of(typ));
