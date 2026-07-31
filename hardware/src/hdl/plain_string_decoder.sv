@@ -29,7 +29,8 @@ module PlainStringDecoder #(
     localparam int VIEW_BITS            = $clog2(STREAM_WIDTH);
 
     // ---------------------------------------------------------------------
-    // Assertions
+    // Input side prelude
+    // Build lookahead beats + skid
     // ---------------------------------------------------------------------
     ndata_i #(data8_t, VIEW_WIDTH) in_extended (.*);
     ndata_i #(data8_t, VIEW_WIDTH) in (.*);
@@ -56,9 +57,11 @@ module PlainStringDecoder #(
         .out    ( in )
     );
 
+    // ---------------------------------------------------------------------
+    // Output side postlude
+    // Skidding
+    // ---------------------------------------------------------------------
     ndata_i #(data8_t, STREAM_WIDTH) out_data_internal (.*);
-
-
     NDataSkidBuffer #(
         .data_t(data8_t),
         .NUM_ELEMENTS(STREAM_WIDTH)
@@ -68,6 +71,17 @@ module PlainStringDecoder #(
 
         .in     ( out_data_internal ),
         .out    ( out_data )
+    );
+
+    data_i #(german_str_t) out_strings_internal (.*);
+    DataSkidBuffer #(
+        .data_t(german_str_t)
+    ) string_out_skidder (
+        .clk    ( clk ),
+        .rst_n  ( rst_n ),
+
+        .in     ( out_strings_internal ),
+        .out    ( out_strings )
     );
 
 
@@ -106,12 +120,13 @@ module PlainStringDecoder #(
     logic cursor_n_crosses;
     logic last_val;
     logic is_short;
+    logic bytes_left_in_next_beat;
 
     assign cursor_in_view = cursor < STREAM_WIDTH;
     assign cursor_n_crosses = cursor_n > STREAM_WIDTH;
     assign last_val = values_remaining == 1;
-    // A string is fully inline ("short") iff it fits in prefix + suffix bytes.
     assign is_short = length <= INLINE_STR_BYTES;
+    assign bytes_left_in_next_beat = cursor > STREAM_WIDTH;
 
     // ---------------------------------------------------------------------
     // German String Construction
@@ -183,7 +198,7 @@ module PlainStringDecoder #(
                     if(out_data_internal.ready && in.valid) begin
                         cursor <= cursor - STREAM_WIDTH;
                     end
-                end else if (out_strings.ready) begin
+                end else if (out_strings_internal.ready) begin
                     if (cursor_n_crosses && out_data_internal.ready && in.valid) begin
                         cursor <= cursor_n - STREAM_WIDTH;
                         heap_addr <= heap_addr + LENGTH_PREFIX_LEN + length;
@@ -195,16 +210,16 @@ module PlainStringDecoder #(
                 end
 
                 // Values are only updated when lengths are emitted
-                if(out_strings.valid && out_strings.ready)
+                if(out_strings_internal.valid && out_strings_internal.ready)
                     values_remaining <= values_remaining - 1;
                 
                 // Input buffer update logic
-                if ((!cursor_in_view || (cursor_n_crosses && out_strings.ready)) && out_data_internal.ready && in.valid) begin
+                if ((!cursor_in_view || (cursor_n_crosses && out_strings_internal.ready)) && out_data_internal.ready && in.valid) begin
                     updateInputBuffer();
                 end
 
                 // state update logic
-                if (cursor_in_view && last_val && out_strings.ready && out_data_internal.ready) begin
+                if (cursor_in_view && last_val && out_strings_internal.ready && out_data_internal.ready) begin
                     if (!cursor_n_crosses)
                         state <= WAIT_CONF;
                     else if (in.valid)
@@ -212,12 +227,12 @@ module PlainStringDecoder #(
                 end
             end
             EMIT_STREAM: begin
-                if (out_data_internal.ready && (in.valid || cursor_in_view)) begin
+                if (out_data_internal.ready && (in.valid || !bytes_left_in_next_beat)) begin
                     cursor <= cursor - STREAM_WIDTH;
                     updateInputBuffer();
                 end
-                
-                if (cursor_in_view && out_data_internal.ready)
+
+                if (!bytes_left_in_next_beat && out_data_internal.ready)
                     state <= WAIT_CONF; 
             end
             default: begin
@@ -232,29 +247,29 @@ module PlainStringDecoder #(
             WAIT_CONF: in.ready = 1;
             WAIT_FIRST: in.ready = 1;
             EMIT_LENS_AND_STREAM: in.ready = out_data_internal.ready &&
-                    (!cursor_in_view || (cursor_n_crosses && out_strings.ready));
-            EMIT_STREAM: in.ready = !cursor_in_view && out_data_internal.ready;
+                    (!cursor_in_view || (cursor_n_crosses && out_strings_internal.ready));
+            EMIT_STREAM: in.ready = bytes_left_in_next_beat && out_data_internal.ready;
         endcase
     end
 
     assign conf.ready = state == WAIT_CONF;
-    assign out_strings.valid =
+    assign out_strings_internal.valid =
             state == EMIT_LENS_AND_STREAM &&
             cursor_in_view &&
             (
                 (cursor_n_crosses && out_data_internal.ready && in.valid) ||
                 (!cursor_n_crosses && (!last_val || out_data_internal.ready))
             );
-    assign out_strings.data = german;
-    assign out_strings.keep = 1;
-    assign out_strings.last = last_val;
+    assign out_strings_internal.data = german;
+    assign out_strings_internal.keep = 1;
+    assign out_strings_internal.last = last_val;
     assign out_data_internal.valid =
             state == EMIT_LENS_AND_STREAM &&
             (
                 (!cursor_in_view && in.valid) ||
-                (cursor_in_view && out_strings.ready && ((cursor_n_crosses && in.valid) || (!cursor_n_crosses && last_val)))
+                (cursor_in_view && out_strings_internal.ready && ((cursor_n_crosses && in.valid) || (!cursor_n_crosses && last_val)))
             ) ||
-            (state == EMIT_STREAM && (in.valid || cursor_in_view));
+            (state == EMIT_STREAM && (in.valid || !bytes_left_in_next_beat));
     assign out_data_internal.data = in_data_buffer.data;
     assign out_data_internal.keep = in_data_buffer.keep;
     assign out_data_internal.last = in_data_buffer.last;

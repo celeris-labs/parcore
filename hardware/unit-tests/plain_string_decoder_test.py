@@ -195,6 +195,34 @@ class PlainStringDecoderTest(fpga_test_case.FPGATestCase):
         self._run([b"hi", b"x" * 20, b"yo", b"z" * 30, b"end"])
 
     # ------------------------------------------------------------------
+    # Payloads that end exactly on a beat boundary
+    # ------------------------------------------------------------------
+    #
+    # Every case above ends mid-beat (9, 6, 8, 16, 21, 17, 69, 204 bytes ...), so
+    # nothing here ever covered a payload that is a whole number of beats. That
+    # is the shape SF100 hangs on: in vfpga_top the decoder emitted only the
+    # first beat of a 64-byte payload and never asserted last, which starves
+    # HeapNormalizer and leaves StreamWriter parked on an unfinished transfer.
+    # The 63-byte case is the control - one byte shorter, same string count.
+
+    def test_payload_exactly_one_beat(self):
+        """4-byte prefix + 60 bytes = 64, exactly one beat."""
+        self._run([b"a" * 60])
+
+    def test_payload_one_byte_short_of_a_beat(self):
+        """Control: 63 bytes, so the final beat is partially filled."""
+        self._run([b"a" * 59])
+
+    def test_payload_exactly_two_beats(self):
+        """A single string whose encoding is exactly 128 bytes."""
+        self._run([b"b" * 124])
+
+    def test_payload_exact_beats_multiple_strings(self):
+        """Several strings summing to exactly 128 bytes, so the boundary falls
+        between records rather than inside one."""
+        self._run([b"c" * 60, b"d" * 28, b"e" * 20, b"f" * 4])
+
+    # ------------------------------------------------------------------
     # Lookahead / beat-boundary behaviour
     # ------------------------------------------------------------------
 
