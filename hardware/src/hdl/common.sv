@@ -110,7 +110,12 @@ typedef struct packed {
 
 // The slice of the configuration that the routing modules need. Deliberately
 // narrow: this is the config that has to reach the most places.
+//
+// first_hybrid marks the page that opens this chunk's hybrid index stream. It
+// sits above typ/ptyp so their bit positions are unchanged for the router test
+// benches, which build this struct through a ConfigWriteFIFO cast.
 typedef struct packed {
+    logic       first_hybrid;
     type_t      typ;
     page_type_t ptyp;
 } page_type_info_t;

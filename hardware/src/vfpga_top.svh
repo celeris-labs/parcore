@@ -12,6 +12,10 @@ localparam N_STREAMS = N_STRM_AXI;
 localparam DATABEAT_SIZE = 32;
 localparam AXI_DATA_SIZE = 64;
 
+// Pipeline depth on every stream between the shell (SLR0) and a decoder. Matches
+// N_STAGES_0 in Coyote's dcpl_static.sv, which crosses a comparable distance.
+localparam AXIS_CROSSING_STAGES = 3;
+
 /* -- Fix clock and reset names ----------------------------------------- */
 logic clk;
 logic rst_n;
@@ -77,12 +81,23 @@ generate
         AXI4S axi_host_recv (.aclk(clk), .aresetn(rst_n));
         `AXIS_ASSIGN(axis_host_recv[I], axi_host_recv)
 
+        AXI4S axi_host_recv_piped (.aclk(clk), .aresetn(rst_n));
+        axis_reg_array #(
+            .N_STAGES(AXIS_CROSSING_STAGES)
+        ) inst_recv_pipe (
+            .aclk(clk),
+            .aresetn(rst_n),
+
+            .s_axis(axi_host_recv),
+            .m_axis(axi_host_recv_piped)
+        );
+
         ndata_i #(data8_t, AXI_DATA_SIZE) _in(clk, rst_n);
         AXIToNData #(data8_t, AXI_DATA_SIZE) inst_axi_to_ndata (
             .clk(clk),
             .rst_n(rst_n),
 
-            .in(axi_host_recv),
+            .in(axi_host_recv_piped),
             .out(_in)
         );
 
@@ -102,24 +117,43 @@ generate
         ndata_i #(data8_t, AXI_DATA_SIZE) dec_out_resized (clk, rst_n);
 
         // Values -> stream 2I.
+        AXI4S axi_values (.aclk(clk), .aresetn(rst_n));
         NDataToAXI #(data8_t, AXI_DATA_SIZE) inst_values_to_axi (
             .clk(clk),
             .rst_n(rst_n),
 
             .in(dec_out_resized),
-            .out(outputs[2*I])
+            .out(axi_values)
+        );
+        axis_reg_array #(
+            .N_STAGES(AXIS_CROSSING_STAGES)
+        ) inst_values_pipe (
+            .aclk(clk),
+            .aresetn(rst_n),
+
+            .s_axis(axi_values),
+            .m_axis(outputs[2*I])
         );
 
-        // Heap -> stream 2I+1. Stays idle for every chunk that is not a german
-        // string chunk, so nothing is written and no interrupt is raised there.
+        // Heap -> stream 2I+1.
         ndata_i #(data8_t, DATABEAT_SIZE) dec_heap(clk, rst_n);
         ndata_i #(data8_t, AXI_DATA_SIZE) dec_heap_resized(clk, rst_n);
+        AXI4S axi_heap (.aclk(clk), .aresetn(rst_n));
         NDataToAXI #(data8_t, AXI_DATA_SIZE) inst_heap_to_axi (
             .clk(clk),
             .rst_n(rst_n),
 
             .in(dec_heap_resized),
-            .out(outputs[2*I+1])
+            .out(axi_heap)
+        );
+        axis_reg_array #(
+            .N_STAGES(AXIS_CROSSING_STAGES)
+        ) inst_heap_pipe (
+            .aclk(clk),
+            .aresetn(rst_n),
+
+            .s_axis(axi_heap),
+            .m_axis(outputs[2*I+1])
         );
 
         /* -- DESIGN WIRING ----------------------------------------------------- */

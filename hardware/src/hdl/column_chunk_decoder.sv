@@ -430,10 +430,17 @@ SkidBuffer #(page_type_info_t) inst_page_conf_reg_2 (
     .out(page_level_config_chain[3])
 );
 
-// DictionaryID rescales one index stream per hybrid page.
+// DictionaryID rescales one index stream, and HybridPageDecoder emits one such
+// stream per column chunk -- hybrid_conf.last only rises on the chunk's final
+// page, so a chunk's hybrid pages arrive as a single stream. DictionaryID
+// retires one selection from each of its two select queues per stream, so it
+// gets exactly one dtype per stream. Enqueueing one per hybrid page instead
+// pushed four selections per chunk against one retirement, and the two-deep
+// skid buffers holding those selections filled and deadlocked the decoder on
+// the third dictionary chunk.
 assign dict_dtype_pre.data   = dict_dtype_conf.data.typ;
 assign dict_dtype_pre.valid  = dict_dtype_conf.valid
-                            && dict_dtype_conf.data.ptyp == PAGE_TYPE_HYBRID;
+                            && dict_dtype_conf.data.first_hybrid;
 assign dict_dtype_conf.ready = dict_dtype_pre.ready;
 
 SkidBuffer #(type_t) inst_dict_dtype_skid (
@@ -570,6 +577,7 @@ assign num_cc_values.data  = chunk_confs[0].data.num_values << cc_typ_shift;
 assign num_cc_values.valid = chunk_confs[0].valid && (state == ST_IDLE);
 
 // ---- Per-page config ---------------------------------------------
+// .first_hybrid is driven further down, next to the hybrid_conf it mirrors.
 assign page_level_config_chain[0].data.typ  = cc_typ;
 assign page_level_config_chain[0].data.ptyp = page_conf.data.page_type;
 assign page_level_config_chain[0].valid     = page_conf_fire;
@@ -647,12 +655,34 @@ assign hybrid_flush = dict_seen
                    && page_conf.data.last
                    && page_conf.data.page_type == PAGE_TYPE_PLAIN;
 
+logic page_feeds_hybrid;
+assign page_feeds_hybrid = hybrid_flush
+                        || page_conf.data.page_type == PAGE_TYPE_HYBRID;
+
 assign hybrid_conf.data  = hybrid_flush ? '0 : page_conf.data.num_values;
 assign hybrid_conf.keep  = ~hybrid_flush;
 assign hybrid_conf.last  = page_conf.data.last;
-assign hybrid_conf.valid = page_conf_fire
-                        && (hybrid_flush
-                            || page_conf.data.page_type == PAGE_TYPE_HYBRID);
+assign hybrid_conf.valid = page_conf_fire && page_feeds_hybrid;
+
+// The page that opens this chunk's hybrid stream, which is the one page that
+// carries a dtype to DictionaryID. A flush counts: it produces a last beat and
+// therefore a stream, even though it rides on a plain page.
+logic hybrid_stream_open;
+
+always_ff @(posedge clk) begin
+    if (!reset_synced) begin
+        hybrid_stream_open <= 1'b0;
+    end else if (page_conf_fire) begin
+        if (page_conf.data.last) begin
+            hybrid_stream_open <= 1'b0;
+        end else if (page_feeds_hybrid) begin
+            hybrid_stream_open <= 1'b1;
+        end
+    end
+end
+
+assign page_level_config_chain[0].data.first_hybrid =
+    page_feeds_hybrid && !hybrid_stream_open;
 
 // ------ Stream profiling ------------------------
 stream_profile_i profile_in ();
@@ -685,49 +715,56 @@ StreamProfiler inst_profile_out (
     .profile(profile_out)
 );
 
-// `ifdef SYNTHESIS
-// ila_page_decoder inst_ila_page_decoder (
-//     .clk(clk),
-//     .probe0(reset_synced),
+// ------ Heap path instrumentation ---------------------------------------
+// Counts what the decoder puts on psd_out_heap, the PlainStringDecoder's heap
+// output as it enters HeapNormalizer. This is the last point before the packing
+// and last-rewriting, so comparing these against what the host receives says
+// whether a missing heap completion was never produced or was lost downstream.
 //
-//     .probe1(state),
-//     .probe2(last_page),
-//
-//     .probe3(in_select.ready),
-//     .probe4(in_select.valid),
-//     .probe5(in_select.data),
-//
-//     .probe6(out_select.ready),
-//     .probe7(out_select.valid),
-//     .probe8(out_select.data),
-//
-//     .probe9(hybrid_conf.ready),
-//     .probe10(hybrid_conf.valid),
-//     .probe11(hybrid_conf.data),
-//
-//     .probe12(decompressor_out.ready),
-//     .probe13(decompressor_out.valid),
-//     .probe14(decompressor_out.last),
-//     .probe15(decompressor_out.keep),
-//
-//     .probe16(ins[IN_HYBRID].ready),
-//     .probe17(ins[IN_HYBRID].valid),
-//     .probe18(decompressor_out.last),
-//     .probe19(ins[IN_HYBRID].keep),
-//
-//     .probe20(hybrid_out.ready),
-//     .probe21(hybrid_out.valid),
-//
-//     .probe22(out.ready),
-//     .probe23(out.valid),
-//     .probe24(out.keep),
-//     .probe25(out.last),
-//
-//     .probe26(inner_out.ready),
-//     .probe27(inner_out.valid),
-//     .probe28(inner_out.keep),
-//     .probe29(inner_out.last)
-// );
-// `endif
+// Free running and 32 bits, so the byte count wraps after 4 GiB. Only the deltas
+// across a chunk are meaningful; lasts is the interesting one, since it should
+// equal the number of string chunks decoded.
+data32_t heap_in_beats, heap_in_lasts, heap_in_bytes;
+
+always_ff @(posedge clk) begin
+    if (!reset_synced) begin
+        heap_in_beats <= '0;
+        heap_in_lasts <= '0;
+        heap_in_bytes <= '0;
+    end else if (psd_out_heap.valid && psd_out_heap.ready) begin
+        heap_in_beats <= heap_in_beats + 1;
+        heap_in_lasts <= heap_in_lasts + data32_t'(psd_out_heap.last);
+        heap_in_bytes <= heap_in_bytes + data32_t'($countones(psd_out_heap.keep));
+    end
+end
+
+`ifdef DEBUG
+// The heap path either side of HeapNormalizer, plus its config. A chunk that
+// ends with heap_in_lasts incremented but nothing arriving at the host means
+// the last was swallowed between here and the writer.
+ila_heap_path inst_ila_heap_path (
+    .clk(clk),
+    .probe0(reset_synced),
+    .probe1(state),
+
+    .probe2(psd_out_heap.valid),
+    .probe3(psd_out_heap.ready),
+    .probe4(psd_out_heap.last),
+    .probe5(psd_out_heap.keep),
+
+    .probe6(heap_in_beats),
+    .probe7(heap_in_lasts),
+    .probe8(heap_in_bytes),
+
+    .probe9(heap_packed.valid),
+    .probe10(heap_packed.ready),
+    .probe11(heap_packed.last),
+    .probe12(heap_packed.keep),
+
+    .probe13(heap_conf.valid),
+    .probe14(heap_conf.ready),
+    .probe15(heap_conf.data)
+);
+`endif
 
 endmodule
