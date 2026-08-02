@@ -7,6 +7,7 @@
 // directly rather than the Reader hierarchy, so the two-stream handling stays
 // visible instead of being buried behind next_column_chunk().
 
+#include <atomic>
 #include <boost/program_options.hpp>
 #include <chrono>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arrow/array.h>
@@ -233,21 +235,168 @@ int main(int argc, char *argv[]) {
   auto column_chunk_config = global_config.get_config<parcore::ColumnChunkDecoderConfig>();
 
 #ifdef ENABLE_SIMULATION
-  obm = std::make_shared<libstf::OutputBufferManager>(cthread, mem_config, pool, tlb,
-                                                      ~libstf::stream_mask_t(0), 2,
-                                                      1 << 21 /* 2MiB */);
+  // SimpleMemoryPool is a bump allocator over a fixed 1 GiB arena whose free()
+  // is a no-op, so every buffer the manager retires is gone for good and the
+  // run dies once the arena is used up -- at 2 MiB a buffer that was ~390
+  // column chunks. 512 KiB still covers any single chunk these files produce
+  // and gives the arena four times the reach.
+  size_t obm_buffers = 2, obm_capacity = 1 << 19 /* 512KiB */;
 #else
-  obm = std::make_shared<libstf::OutputBufferManager>(cthread, mem_config, pool, tlb,
-                                                      ~libstf::stream_mask_t(0), 40,
-                                                      1 << 24 /* 16MiB */);
+  size_t obm_buffers = 40, obm_capacity = 1 << 24 /* 16MiB */;
 #endif
+  // Overridable so the buffer budget can be swept without a rebuild -- the same
+  // sweep is what distinguishes a per-stream depth from a shared one.
+  if (const char *e = std::getenv("PARCORE_OBM_BUFFERS"))
+    obm_buffers = std::stoul(e);
+  if (const char *e = std::getenv("PARCORE_OBM_CAPACITY"))
+    obm_capacity = std::stoul(e);
+
+  obm = std::make_shared<libstf::OutputBufferManager>(
+      cthread, mem_config, pool, tlb, ~libstf::stream_mask_t(0), obm_buffers, obm_capacity);
   obm->flush_buffers();
   std::cout << "flushed buffers" << std::endl;
+
+  // maximum_num_enqueued_buffers() is a hardware register. If it is a budget
+  // shared across streams rather than a per-stream depth, then enqueueing
+  // num_buffers_to_enqueue on each of num_streams overruns it and the surplus
+  // goes nowhere -- which would starve a stream of somewhere to write after a
+  // fixed number of buffers, regardless of the data.
+  std::cout << "buffer budget: num_streams=" << obm->num_streams()
+            << " num_buffers_to_enqueue=" << obm->num_buffers_to_enqueue() << " (per stream)"
+            << " hardware_max=" << mem_config->maximum_num_enqueued_buffers()
+            << " total_requested=" << obm->num_streams() * obm->num_buffers_to_enqueue()
+            << std::endl;
+  if (obm->num_streams() * obm->num_buffers_to_enqueue() >
+      mem_config->maximum_num_enqueued_buffers()) {
+    std::cout << "  *** total_requested exceeds hardware_max ***" << std::endl;
+  }
 
   auto decoder =
       std::make_shared<parcore::ColumnChunkDecoder>(cthread, tlb, obm, column_chunk_config, 0);
 
   size_t decoded = 0, skipped = 0, failed = 0;
+
+  // -- stall watchdog ------------------------------------------------------
+  // The StreamProfilers on the decoder's in and out ports are not behind
+  // `ifdef DEBUG, so their counters are readable over the register interface
+  // even in a build without ILAs. They are free running, so sampling them twice
+  // while wedged says which side is blocked:
+  //
+  //   in.stalled  climbing -> in.valid && !in.ready   : decoder wedged inside
+  //   in.starved  climbing -> in.ready && !in.valid   : decoder waiting on input
+  //   out.stalled climbing -> out.valid && !out.ready : writer not taking values
+  //   out.starved climbing -> decoder producing nothing
+  //
+  // Note there is no profiler on heap_out, so a blocked heap path shows up as
+  // in.stalled with out.starved rather than directly.
+  std::atomic<bool> wd_stop{false};
+  std::atomic<size_t> wd_chunk{0};
+  std::atomic<long long> wd_started_ms{0};
+  const long long wd_timeout_ms =
+      std::getenv("PARCORE_STALL_TIMEOUT_S")
+          ? std::stoll(std::getenv("PARCORE_STALL_TIMEOUT_S")) * 1000
+          : 10000;
+
+  auto now_ms = [] {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+
+  auto dump_profile = [&](const char *tag) {
+    try {
+      auto p = column_chunk_config->read_profile(0);
+      std::cerr << "[stall] " << tag << " chunk=" << wd_chunk.load()
+                << "  in: hs=" << p.in.handshakes_cycles << " starved=" << p.in.starved_cycles
+                << " stalled=" << p.in.stalled_cycles << " idle=" << p.in.idle_cycles
+                << " | out: hs=" << p.out.handshakes_cycles << " starved=" << p.out.starved_cycles
+                << " stalled=" << p.out.stalled_cycles << " idle=" << p.out.idle_cycles
+                << std::endl;
+    } catch (const std::exception &e) {
+      // A diagnostic must never take the run down with it.
+      std::cerr << "[stall] " << tag << " profile read failed: " << e.what() << std::endl;
+    }
+  };
+
+  std::thread watchdog([&] {
+    bool reported = false;
+    try {
+    while (!wd_stop.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      auto started = wd_started_ms.load();
+      if (started == 0 || wd_stop.load())
+        continue;
+      if (now_ms() - started < wd_timeout_ms) {
+        reported = false;
+        continue;
+      }
+      if (reported)
+        continue;
+      reported = true;
+      std::cerr << "[stall] chunk " << wd_chunk.load() << " has been in flight for "
+                << (now_ms() - started) / 1000 << "s" << std::endl;
+      for (libstf::stream_t s = 0; s < obm->num_streams(); ++s) {
+        auto st = obm->stats(s);
+        std::cerr << "[stall] stream " << static_cast<int>(s)
+                  << " outstanding=" << st.enqueued_now << " enqueued_total=" << st.enqueued_total
+                  << " interrupts=" << st.interrupts << " bytes=" << st.bytes_written << std::endl;
+      }
+      // Two samples three seconds apart: whichever counter moved is the blockage.
+      dump_profile("sample1");
+      std::this_thread::sleep_for(std::chrono::seconds(3));
+      dump_profile("sample2");
+
+      // The heap buffer the FPGA is currently writing into. If the chunk's heap
+      // bytes are already here then the data arrived and only the completion
+      // (last) went missing -- the writer is sitting on a partially filled
+      // buffer that will never fill, so no interrupt is ever raised. If it is
+      // still zeroed, the heap was never produced at all. Those are different
+      // bugs and this tells them apart.
+      try {
+        const auto *p = static_cast<const unsigned char *>(obm->next_buffer_address(1));
+        const size_t cap = obm->buffer_capacity();
+
+        // Walk back to the last non-zero byte: that is how far the FPGA got.
+        // Coarse by 4 KiB, then refine. A freshly mmap'd buffer is zeroed, but a
+        // recycled one may hold an older chunk's bytes, so compare the boundary
+        // against the chunk's expected heap size rather than trusting it alone.
+        size_t page = cap;
+        while (page > 0) {
+          page -= 4096;
+          bool any = false;
+          for (size_t k = 0; k < 4096 && !any; ++k)
+            any = p[page + k] != 0;
+          if (any)
+            break;
+        }
+        size_t last_nz = page;
+        for (size_t k = 0; k < 4096; ++k)
+          if (p[page + k] != 0)
+            last_nz = page + k;
+
+        std::cerr << "[stall] heapbuf capacity=" << cap << " last_nonzero_byte=" << last_nz
+                  << " (" << (last_nz * 100.0 / cap) << "% of buffer)" << std::endl;
+
+        for (size_t off : {size_t(0), last_nz > 64 ? last_nz - 47 : size_t(0)}) {
+          std::cerr << "[stall] heapbuf+" << off << ":";
+          for (size_t k = 0; k < 48 && off + k < cap; ++k)
+            std::cerr << " " << std::hex << std::setw(2) << std::setfill('0')
+                      << static_cast<unsigned>(p[off + k]);
+          std::cerr << std::dec << "  |";
+          for (size_t k = 0; k < 48 && off + k < cap; ++k) {
+            unsigned char c = p[off + k];
+            std::cerr << (c >= 32 && c < 127 ? static_cast<char>(c) : '.');
+          }
+          std::cerr << "|" << std::endl;
+        }
+      } catch (const std::exception &e) {
+        std::cerr << "[stall] heap buffer peek failed: " << e.what() << std::endl;
+      }
+    }
+    } catch (const std::exception &e) {
+      std::cerr << "[stall] watchdog stopped: " << e.what() << std::endl;
+    }
+  });
 
   for (size_t i = start_group; i < end_group; ++i) {
     const auto &group = meta.groups[i];
@@ -276,6 +425,17 @@ int main(int argc, char *argv[]) {
       std::cout << "\toffset: " << chunk.offset << ", size: " << chunk.total_compressed_size
                 << std::endl;
 
+      // Buffer bookkeeping, printed *before* the transfer so the last line in
+      // the log describes the state the FPGA was handed when it stopped. On
+      // stderr and unbuffered so nothing is lost if the process is killed.
+      for (libstf::stream_t s = 0; s < obm->num_streams(); ++s) {
+        auto st = obm->stats(s);
+        std::cerr << "[bufs] chunk=" << decoded << " rg=" << i << " col=" << j << " stream=" << s
+                  << " outstanding=" << st.enqueued_now << "/" << obm->num_buffers_to_enqueue()
+                  << " enqueued_total=" << st.enqueued_total << " interrupts=" << st.interrupts
+                  << " bytes=" << st.bytes_written << std::endl;
+      }
+
       // -- read the raw column chunk into device-visible memory ------------
       void *raw_ptr;
       auto alloc = pool->allocate(chunk.total_compressed_size, &raw_ptr);
@@ -293,6 +453,8 @@ int main(int argc, char *argv[]) {
 
       // -- FPGA -------------------------------------------------------------
       auto fpga_start = std::chrono::high_resolution_clock::now();
+      wd_chunk.store(decoded);
+      wd_started_ms.store(now_ms());
 
       // The Handle holds the decoder's mutex for its whole lifetime, and
       // std::move(*handle).done() does not destroy it - the unique_ptr still
@@ -374,6 +536,9 @@ int main(int argc, char *argv[]) {
         failed += 1;
     }
   }
+
+  wd_stop.store(true);
+  watchdog.join();
 
   std::cout << separator << std::endl;
   std::cout << decoded << " column chunk(s) decoded, " << skipped << " skipped, " << failed
