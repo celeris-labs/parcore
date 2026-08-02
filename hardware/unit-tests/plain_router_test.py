@@ -2,7 +2,7 @@ from random import Random
 
 from coyote_test import fpga_test_case, fpga_register
 
-REG_PAGE_CONF = 3
+REG_CONF = 3
 
 # page_type_t
 PAGE_TYPE_HYBRID = 0
@@ -31,12 +31,6 @@ def _rand(rng: Random, n: int) -> bytearray:
     return bytearray(rng.randrange(256) for _ in range(n))
 
 
-def _page_conf(page_type: int, typ: int, num_values: int = 0, last: int = 0) -> int:
-    # page_type_info_t packs (MSB -> LSB):
-    #   type_t [3 bits] | page_type_t [2 bits]
-    return ((typ & 0x7) << 2) | (page_type & 0x3)
-
-
 def plain_fixed(typ: int, values: bytearray) -> dict:
     """PLAIN page of a fixed-width type: stripped bytes go straight to out_values."""
     return {"page_type": PAGE_TYPE_PLAIN, "typ": typ,
@@ -52,18 +46,19 @@ def plain_string(page_bytes: bytearray, decoded: bytearray) -> dict:
 
 
 def dict_string(body_bytes: bytearray, decoded: bytearray) -> dict:
+    """DICT page of german strings: the body travels via the StringRouter, so
+    this module sees neither data nor config."""
     return {"page_type": PAGE_TYPE_DICT, "typ": GERMAN_STR_T}
 
 
 def dict_fixed(typ: int) -> dict:
-    """DICT page of a fixed-width type: the body bypasses this module entirely,
-    so the router only consumes the page config."""
+    """DICT page of a fixed-width type: the body bypasses this module entirely."""
     return {"page_type": PAGE_TYPE_DICT, "typ": typ}
 
 
 def hybrid(typ: int, values: bytearray) -> dict:
-    """HYBRID page: the ids were resolved by the dictionary, so the looked-up
-    values are forwarded straight to out_values."""
+    """HYBRID page: the ids were resolved by the dictionary and reach the output
+    multiplexer directly, bypassing this module."""
     return {"page_type": PAGE_TYPE_HYBRID, "typ": typ}
 
 
@@ -71,18 +66,20 @@ class PlainRouterTestCase(fpga_test_case.FPGATestCase):
     """
     Tests PlainRouter (hardware/src/hdl/plain_data.sv): the byte-level crossbar
     between StripLevels, the DictionaryBody, the PlainStringDecoder and the value
-    output path. One page_conf is consumed per page and picks the route:
+    output path. conf is a bare type_t and picks the route:
 
-      PLAIN  / fixed   in_from_stripped    -> out_values
-      PLAIN  / german  in_from_stripped    -> out_to_str_decoder
-                       in_from_str_decoder -> out_values
-      DICT   / german  none
-      DICT   / fixed   none
-      HYBRID / any     none
+      german  in_from_stripped    -> out_to_str_decoder
+              in_from_str_decoder -> out_values
+      fixed   in_from_stripped    -> out_values
+
+    The router no longer inspects the page type, so it is configured once per
+    PLAIN page only. DICT and HYBRID pages carry no data through it and must not
+    be configured: their select would never be retired and would desync the
+    demultiplexer from the multiplexer for every page that follows.
 
     The router never touches the bytes, so every expected output is its input
-    bytes unchanged. Page boundaries are the stream `last` beats: one page_conf
-    per last-terminated transfer on each active stream.
+    bytes unchanged. Page boundaries are the stream `last` beats: one conf per
+    last-terminated transfer on each active stream.
 
     vfpga top wiring:
       recv[0] -> in_from_stripped
@@ -95,11 +92,10 @@ class PlainRouterTestCase(fpga_test_case.FPGATestCase):
     debug_mode = True
 
     def _run_pages(self, pages: list[dict]):
-        for i, page in enumerate(pages):
-            conf = _page_conf(page["page_type"], page["typ"],
-                              last=1 if i == len(pages) - 1 else 0)
-            self.write_register(fpga_register.vFPGARegister(
-                REG_PAGE_CONF, bytearray(conf.to_bytes(8, 'little'))))
+        for page in pages:
+            if page["page_type"] == PAGE_TYPE_PLAIN:
+                self.write_register(fpga_register.vFPGARegister(
+                    REG_CONF, bytearray(page["typ"].to_bytes(8, 'little'))))
 
             for key, stream in (("stripped", IN_STRIPPED),
                                 ("from_str_decoder", IN_STR_DECODER)):
@@ -167,11 +163,14 @@ class PlainRouterTestCase(fpga_test_case.FPGATestCase):
         ])
 
     def test_fixed_dict_then_hybrid_pages(self):
+        # The trailing plain page is what the router actually sees; the dict and
+        # hybrid pages ahead of it must leave its config queues untouched.
         rng = Random(16)
         self._run_pages([
             dict_fixed(INT64_T),
             hybrid(INT64_T, _rand(rng, BEAT_SIZE)),
             hybrid(INT64_T, _rand(rng, 40)),
+            plain_fixed(INT64_T, _rand(rng, 3 * BEAT_SIZE)),
         ])
 
     def test_string_dict_then_hybrid_pages(self):
@@ -180,6 +179,20 @@ class PlainRouterTestCase(fpga_test_case.FPGATestCase):
             dict_string(_rand(rng, 2 * BEAT_SIZE), _rand(rng, BEAT_SIZE)),
             hybrid(GERMAN_STR_T, _rand(rng, BEAT_SIZE + 32)),
             hybrid(GERMAN_STR_T, _rand(rng, 16)),
+            plain_string(_rand(rng, BEAT_SIZE + 24), _rand(rng, 48)),
+        ])
+
+    def test_non_plain_pages_between_routed_pages(self):
+        """A dict or hybrid page between two plain pages of different types must
+        not shift the routing: the second plain page picks up its own config."""
+        rng = Random(21)
+        self._run_pages([
+            plain_string(_rand(rng, 96), _rand(rng, 40)),
+            dict_fixed(INT32_T),
+            hybrid(INT32_T, _rand(rng, BEAT_SIZE)),
+            plain_fixed(INT32_T, _rand(rng, BEAT_SIZE + 12)),
+            hybrid(GERMAN_STR_T, _rand(rng, 32)),
+            plain_string(_rand(rng, 2 * BEAT_SIZE), _rand(rng, BEAT_SIZE + 8)),
         ])
 
     def test_string_dict_then_plain_string_pages(self):

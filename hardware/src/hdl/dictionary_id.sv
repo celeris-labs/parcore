@@ -15,7 +15,7 @@ module DictionaryID #(
     input logic clk,
     input logic rst_n,
 
-    ready_valid_i.s dtype,  // Data type for which the dictionary indices should be generated
+    ready_valid_i.s conf,       // #(type_t)
 
     ndata_i.s in,               // #(id_t, NUM_ELEMENTS)
     ndata_i.m out               // #(id_t, NUM_ELEMENTS * FACTOR)
@@ -37,95 +37,51 @@ module DictionaryID #(
 //             [ Path 1:  64-bit ]-----------------+      |
 //             [ Path 2: 128-bit ]------------------------+
 
-typedef enum logic[1:0] { 
-    ENQUEUE_FRONT,
-    ENQUEUE_BACK
-} state_t;
-state_t state;
 
-typedef logic [$clog2(INDEX_PATH_COUNT)-1:0] sel_t;
-function automatic sel_t mux_selection (input type_t _type);
+typedef logic [$clog2(INDEX_PATH_COUNT)-1:0] path_idx_t;
+function automatic path_idx_t type_to_path (input type_t _type);
     case (_type)
-        INT64_T:        mux_selection = sel_t'(1);
-        DOUBLE_T:       mux_selection = sel_t'(1);
-        GERMAN_STR_T:   mux_selection = sel_t'(2);
-        default:        mux_selection = sel_t'(0);
+        INT64_T:        type_to_path = path_idx_t'(1);
+        DOUBLE_T:       type_to_path = path_idx_t'(1);
+        GERMAN_STR_T:   type_to_path = path_idx_t'(2);
+        default:        type_to_path = path_idx_t'(0);
     endcase
 endfunction
 
-ready_valid_i #(type_t) _dtype (clk, rst_n);
-SkidBuffer #(type_t) inst_dtype_skid (
+ready_valid_i #(path_idx_t) conf_processed (clk, rst_n);
+assign conf_processed.data = type_to_path(conf.data);
+assign conf_processed.valid = conf.valid;
+assign conf.ready = conf_processed.ready;
+
+ready_valid_i #(path_idx_t) demux_select (clk, rst_n);
+ready_valid_i #(path_idx_t) mux_select (clk, rst_n);
+RegisteredReadyValidDuplicator #(type_t, 2) inst_conf_duplicate (
     .clk (clk),
     .rst_n (rst_n),
-
-    .in (dtype),
-    .out (_dtype)
+    
+    .in (conf_processed),
+    .out ({demux_select, mux_select})
 );
 
-ready_valid_i #(select_t) select_front (clk, rst_n);
-ready_valid_i #(select_t) _select_front (clk, rst_n);
-SkidBuffer #(select_t) inst_select_front_skid (
-    .clk (clk),
-    .rst_n (rst_n),
-
-    .in (select_front),
-    .out (_select_front)
-);
-
-ready_valid_i #(select_t) select_back (clk, rst_n);
-ready_valid_i #(select_t) _select_back (clk, rst_n);
-SkidBuffer #(select_t) inst_select_back_skid (
-    .clk (clk),
-    .rst_n (rst_n),
-
-    .in (select_back),
-    .out (_select_back)
-);
-
-select_t current_selection;
-assign current_selection = _dtype.data == GERMAN_STR_T ? 1 : 0;
-
-assign select_front.data = mux_selection(_dtype.data);
-assign select_front.valid = _dtype.valid && state == ENQUEUE_FRONT;
-
-assign select_back.data = mux_selection(_dtype.data);
-assign select_back.valid = _dtype.valid && state == ENQUEUE_BACK;
-
-assign _dtype.ready = state == ENQUEUE_BACK && select_back.ready;
-
-always_ff @( posedge clk ) begin
-if (!rst_n) begin
-    state <= ENQUEUE_FRONT;
-end else begin
-    case (state)
-        ENQUEUE_FRONT: begin
-            if (_dtype.valid && select_front.ready) begin
-                state <= ENQUEUE_BACK;
-            end
-        end 
-        ENQUEUE_BACK: begin
-            if (_dtype.valid && select_back.ready) begin
-                state <= ENQUEUE_FRONT;
-            end
-        end
-        default: begin end
-    endcase
-end
-end
-
+ready_valid_i #(path_idx_t) _demux_select (clk, rst_n);
+`SKID_SIGNAL(path_idx_t, clk, rst_n, demux_select, _demux_select);
 ndata_i #(id_t, NUM_ELEMENTS) ins [INDEX_PATH_COUNT] (clk, rst_n);
-ndata_i #(id_t, NUM_ELEMENTS) outs [INDEX_PATH_COUNT] (clk, rst_n);
 DataDemultiplexer #(
     INDEX_PATH_COUNT
 ) inst_demux_input_side (
     .clk    (clk),
     .rst_n  (rst_n),
 
-    .select (_select_front),
+    .select (_demux_select),
 
     .in     (in),
     .out    (ins)
 );
+
+
+ready_valid_i #(path_idx_t) _mux_select (clk, rst_n);
+`SKID_SIGNAL(path_idx_t, clk, rst_n, mux_select, _mux_select);
+ndata_i #(id_t, NUM_ELEMENTS) outs [INDEX_PATH_COUNT] (clk, rst_n);
 DataMultiplexer #(
     id_t,
     NUM_ELEMENTS,
@@ -134,7 +90,7 @@ DataMultiplexer #(
     .clk    (clk),
     .rst_n  (rst_n),
 
-    .select (_select_back),
+    .select (_mux_select),
 
     .in     (outs),
     .out    (out)

@@ -13,7 +13,7 @@ module DictionaryBody #(
     input logic clk,
     input logic rst_n,
 
-    ready_valid_i.s dtype,          // #(type_t),
+    ready_valid_i.s conf,          // #(type_t),
 
     ndata_i.s in_body,              // #(data8_t, DATABEAT_SIZE)
     ndata_i.s in_german_strings,    // #(data8_t, DATABEAT_SIZE)
@@ -24,76 +24,40 @@ module DictionaryBody #(
 
 `RESET_RESYNC
 
-
-typedef enum logic[1:0] { 
-    ENQUEUE_FRONT,
-    ENQUEUE_BACK
-} state_t;
-state_t state;
-
 typedef logic[$clog2(DICT_BODY_PATHS_CNT)-1:0] select_t;
 
-ready_valid_i #(type_t) _dtype (clk, reset_synced);
-SkidBuffer #(type_t) inst_dtype_skid (
+ready_valid_i #(select_t) conf_processed (clk, reset_synced);
+assign conf_processed.data = conf.data == GERMAN_STR_T ? 1 : 0;
+assign conf_processed.valid = conf.valid;
+assign conf.ready = conf_processed.ready;
+
+ready_valid_i #(select_t) demux_select (clk, reset_synced);
+ready_valid_i #(select_t) _demux_select (clk, reset_synced);
+SkidBuffer #(select_t) inst_demux_select_skid (
     .clk (clk),
     .rst_n (reset_synced),
 
-    .in (dtype),
-    .out (_dtype)
+    .in (demux_select),
+    .out (_demux_select)
 );
 
-ready_valid_i #(select_t) select_front (clk, reset_synced);
-ready_valid_i #(select_t) _select_front (clk, reset_synced);
-SkidBuffer #(select_t) inst_select_front_skid (
+ready_valid_i #(select_t) mux_select (clk, reset_synced);
+ready_valid_i #(select_t) _mux_select (clk, reset_synced);
+SkidBuffer #(select_t) inst_mux_select_skid (
     .clk (clk),
     .rst_n (reset_synced),
 
-    .in (select_front),
-    .out (_select_front)
+    .in (mux_select),
+    .out (_mux_select)
 );
 
-ready_valid_i #(select_t) select_back (clk, reset_synced);
-ready_valid_i #(select_t) _select_back (clk, reset_synced);
-SkidBuffer #(select_t) inst_select_back_skid (
+RegisteredReadyValidDuplicator #(type_t, 2) inst_conf_duplicate (
     .clk (clk),
-    .rst_n (reset_synced),
-
-    .in (select_back),
-    .out (_select_back)
+    .rst_n (rst_n),
+    
+    .in (conf_processed),
+    .out ({demux_select, mux_select})
 );
-
-select_t current_selection;
-assign current_selection = _dtype.data == GERMAN_STR_T ? 1 : 0;
-
-assign select_front.data = current_selection;
-assign select_front.valid = _dtype.valid && state == ENQUEUE_FRONT;
-
-assign select_back.data = current_selection;
-assign select_back.valid = _dtype.valid && state == ENQUEUE_BACK;
-
-assign _dtype.ready = state == ENQUEUE_BACK && select_back.ready;
-
-always_ff @( posedge clk ) begin
-if (!rst_n) begin
-    state <= ENQUEUE_FRONT;
-end else begin
-    case (state)
-        ENQUEUE_FRONT: begin
-            if (_dtype.valid && select_front.ready) begin
-                state <= ENQUEUE_BACK;
-            end
-        end 
-        ENQUEUE_BACK: begin
-            if (_dtype.valid && select_back.ready) begin
-                state <= ENQUEUE_FRONT;
-            end
-        end
-        default: begin
-            
-        end
-    endcase
-end
-end
 
 ndata_i #(data8_t, DATABEAT_SIZE)
         dictionary_raw_body [DICT_BODY_PATHS_CNT] (clk, reset_synced);
@@ -107,7 +71,7 @@ DataDemultiplexer #(
     .clk (clk),
     .rst_n (reset_synced),
 
-    .select (_select_front),
+    .select (_demux_select),
 
     .in (in_body),
     .out (dictionary_raw_body)
@@ -121,7 +85,7 @@ DataMultiplexer #(
     .clk (clk),
     .rst_n (reset_synced),
 
-    .select (_select_back),
+    .select (_mux_select),
 
     .in (dictionary_processed_body),
     .out (out_to_dict)

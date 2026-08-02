@@ -11,7 +11,7 @@ module StringRouter #(
     input logic clk,
     input logic rst_n,
 
-    ready_valid_i.s page_conf,      // #(page_type_info_t),
+    ready_valid_i.s conf,      // #(page_type_info_t),
 
     ndata_i.s in_from_plain,        // #(data8_t, DATABEAT_SIZE)
     ndata_i.s in_from_dict_body,    // #(data8_t, DATABEAT_SIZE)
@@ -86,7 +86,7 @@ RegisteredReadyValidDuplicator #(page_type_info_t, 2) inst_MUX1_conf_manager (
     .clk (clk),
     .rst_n (rst_n),
     
-    .in (page_conf),
+    .in (conf),
     .out ({MUX_config, MUX_config_fw})
 );
 
