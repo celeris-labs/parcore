@@ -6,13 +6,8 @@ import lynxTypes::AXI_DATA_BITS;
 import libstf::data8_t;
 import libstf::data32_t;
 import libstf::type_t;
-import libstf::vaddress_t;
 import libstf::german_str_t;
-import libstf::BYTE_T;
 import libstf::INT32_T;
-import libstf::INT64_T;
-import libstf::FLOAT_T;
-import libstf::DOUBLE_T;
 import libstf::GERMAN_STR_T;
 import parcore::*;
 
@@ -38,13 +33,7 @@ function automatic int unsigned max(int unsigned a, int unsigned b);
 endfunction
 
 // Number of 32-bit elements per data beat - this is used to size the dictionary
-localparam NUM_ELEMS_SMALLES_ELEM = max(8, DATABEAT_SIZE / ($bits(data32_t) / 8));
-// Number of string elements per data beat
-localparam NUM_STR_IDS = DATABEAT_SIZE / ($bits(german_str_t) / 8);
-
-// ------ Page Level Config Chain -----------------
-ready_valid_i #(page_type_info_t) page_level_config_chain[4] (clk, rst_n);
-
+localparam NUM_DICT_ELEM = max(8, DATABEAT_SIZE / ($bits(data32_t) / 8));
 
 // ------ Column Chunk Config wiring -----------------
 ready_valid_i #(column_chunk_conf_t) chunk_confs[2](clk, reset_synced);
@@ -77,13 +66,12 @@ PageHeaderParser #(
 
 // ------ Decompressor ---------------------
 ready_valid_i #(compression_t) decompressor_conf(clk, reset_synced);
-ready_valid_i #(compression_t) _decompressor_conf(clk, reset_synced);
 ndata_i #(data8_t, DATABEAT_SIZE) decompressor_out(clk, reset_synced);
 Decompressor #(DATABEAT_SIZE) inst_decompressor (
     .clk(clk),
     .rst_n(reset_synced),
 
-    .conf(_decompressor_conf),
+    .conf(decompressor_conf),
 
     .in(page_payload),
     .out(decompressor_out)
@@ -99,13 +87,13 @@ typedef enum logic [$bits(page_type_t) - 1:0] {
 } in_selector_t;
 `ASSERT_ELAB(NUM_IN <= 2**$bits(in_selector_t))
 
-ready_valid_i #(in_selector_t) in_select(clk, reset_synced);
+ready_valid_i #(in_selector_t) data_page_path_conf(clk, reset_synced);
 ndata_i #(data8_t, DATABEAT_SIZE) ins[NUM_IN](clk, reset_synced);
-DataDemultiplexer #(NUM_IN) inst_multiplexer (
+DataDemultiplexer #(NUM_IN) inst_page_data_demultiplexer (
     .clk(clk),
     .rst_n(reset_synced),
 
-    .select(in_select),
+    .select(data_page_path_conf),
 
     .in(decompressor_out),
     .out(ins)
@@ -123,7 +111,6 @@ NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_plain_in_skid_buffer (
     .in(ins[IN_PLAIN]),
     .out(plain_in)
 );
-logic plain_stripped_select;
 
 StripLevels #(
     .NUM_BYTES(DATABEAT_SIZE)
@@ -135,7 +122,7 @@ StripLevels #(
     .out(plain_stripped)
 );
 
-ready_valid_i #(page_type_info_t) plain_router_conf (clk, rst_n);
+ready_valid_i #(type_t) plain_router_conf (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) stripped_to_plain (clk, rst_n);
 `DATA_ASSIGN(plain_stripped, stripped_to_plain)
 ndata_i #(data8_t, DATABEAT_SIZE) str_decoder_to_plain (clk, rst_n);
@@ -145,7 +132,7 @@ PlainRouter #(DATABEAT_SIZE) inst_values_router (
     .clk (clk),
     .rst_n (rst_n),
 
-    .page_conf (plain_router_conf),
+    .conf (plain_router_conf),
 
     .in_from_stripped (stripped_to_plain),
     .in_from_str_decoder (str_decoder_to_plain),
@@ -157,9 +144,7 @@ PlainRouter #(DATABEAT_SIZE) inst_values_router (
 // ------ German String Decoder ---------------
 
 ready_valid_i #(plain_str_decoder_conf_t) plain_str_decoder_conf (clk, rst_n);
-ready_valid_i #(plain_str_decoder_conf_t) _plain_str_decoder_conf (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_in (clk, rst_n);
-// The decoder emits one german string per beat; the router moves full beats.
 data_i #(german_str_t) psd_out_strings (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_strings_packed (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_out_heap (clk, rst_n);
@@ -169,19 +154,15 @@ PlainStringDecoder #(DATABEAT_SIZE) inst_psd (
     .clk (clk),
     .rst_n (rst_n),
 
-    .conf (_plain_str_decoder_conf),
+    .conf (plain_str_decoder_conf),
 
     .in_data (psd_in),
     .out_strings (psd_out_strings),
     .out_data (psd_out_heap)
 );
 
-// Raw bytes of german strings longer than 12 bytes, written to the string heap.
-// The decoder emits one packet per page, but it walks its heap pointer as if the
-// pages were contiguous, so the pages have to be packed into a single chunk-wide
-// packet - otherwise every page after the first hands out addresses shifted by
-// the previous page's tail padding.
-ready_valid_i #(logic[1:0])       heap_conf   (clk, reset_synced);
+// The heap normalizer is used to pack the heap values across pages
+ready_valid_i #(logic[1:0]) heap_normalize_conf (clk, reset_synced);
 ndata_i #(data8_t, DATABEAT_SIZE) heap_packed (clk, reset_synced);
 
 HeapNormalizer #(
@@ -190,7 +171,7 @@ HeapNormalizer #(
     .clk (clk),
     .rst_n (reset_synced),
 
-    .conf (heap_conf),
+    .conf (heap_normalize_conf),
 
     .in (psd_out_heap),
     .out (heap_packed)
@@ -213,7 +194,7 @@ StringRouter #(DATABEAT_SIZE) inst_str_router (
     .clk (clk),
     .rst_n (rst_n),
 
-    .page_conf (str_router_conf),
+    .conf (str_router_conf),
 
     .in_from_plain (plain_to_str_decoder),
     .in_from_dict_body (dict_body_to_str_decoder),
@@ -226,12 +207,12 @@ StringRouter #(DATABEAT_SIZE) inst_str_router (
 
 // ------ Dictionary Page Path ---------------
 ndata_i #(data8_t, DATABEAT_SIZE) dict_body_to_dict (clk, rst_n);
-ready_valid_i #(type_t) dict_body_dtype (clk, reset_synced);
+ready_valid_i #(type_t) dict_body_conf (clk, reset_synced);
 DictionaryBody #(DATABEAT_SIZE) inst_dict_body (
     .clk (clk),
     .rst_n (reset_synced),
 
-    .dtype (dict_body_dtype),
+    .conf (dict_body_conf),
 
     .in_body (ins[IN_DICT]),
     .in_german_strings (str_decoder_to_dict_body),
@@ -242,42 +223,41 @@ DictionaryBody #(DATABEAT_SIZE) inst_dict_body (
 
 
 // ------ Dictionary Encoded Path ---------------
-data_i #(data32_t) hybrid_conf(clk, reset_synced);
-data_i #(data32_t) _hybrid_conf(clk, reset_synced);
-ndata_i #(id_t, NUM_ELEMS_SMALLES_ELEM) dict_ids_native (clk, reset_synced);
+data_i #(data32_t) hybrid_page_decoder_conf(clk, reset_synced);
+ndata_i #(id_t, NUM_DICT_ELEM) dict_ids_native (clk, reset_synced);
 HybridPageDecoder #(
     .data_t(id_t),
-    .NUM_ELEMENTS(NUM_ELEMS_SMALLES_ELEM),
+    .NUM_ELEMENTS(NUM_DICT_ELEM),
     .NUM_BYTES(DATABEAT_SIZE)
 ) inst_hybrid_page_decoder (
     .clk(clk),
     .rst_n(reset_synced),
 
-    .conf(_hybrid_conf),
+    .conf(hybrid_page_decoder_conf),
 
     .in(ins[IN_HYBRID]),
     .out(dict_ids_native)
 );
 
-ready_valid_i #(type_t) dictionary_body_dtype (clk, rst_n);
-ndata_i #(id_t, NUM_ELEMS_SMALLES_ELEM) dict_ids_scaled (clk, reset_synced);
+ready_valid_i #(type_t) dict_id_conf (clk, rst_n);
+ndata_i #(id_t, NUM_DICT_ELEM) dict_ids_scaled (clk, reset_synced);
 DictionaryID #(
     id_t,
-    NUM_ELEMS_SMALLES_ELEM
+    NUM_DICT_ELEM
 ) inst_index_conversion (
     .clk(clk),
     .rst_n(reset_synced),
 
-    .dtype (dictionary_body_dtype),
+    .conf (dict_id_conf),
 
     .in (dict_ids_native),
     .out (dict_ids_scaled)
 );
 
 // The Dictionary indexes 32-bit values while the rest of the path moves bytes.
-// Both carry 512 bits per beat, so the adapters below only regroup keep.
-ndata_i #(data32_t, NUM_ELEMS_SMALLES_ELEM) dict_in_values  (clk, reset_synced);
-ndata_i #(data32_t, NUM_ELEMS_SMALLES_ELEM) dict_out_values (clk, reset_synced);
+// These wires logically convert one to another
+ndata_i #(data32_t, NUM_DICT_ELEM) dict_in_values  (clk, reset_synced);
+ndata_i #(data32_t, NUM_DICT_ELEM) dict_out_values (clk, reset_synced);
 ndata_i #(data8_t, DATABEAT_SIZE) dict_decoded_bytes (.*);
 
 assign dict_in_values.data     = dict_body_to_dict.data;
@@ -290,7 +270,7 @@ assign dict_decoded_bytes.last  = dict_out_values.last;
 assign dict_decoded_bytes.valid = dict_out_values.valid;
 assign dict_out_values.ready    = dict_decoded_bytes.ready;
 
-for (genvar I = 0; I < NUM_ELEMS_SMALLES_ELEM; I++) begin
+for (genvar I = 0; I < NUM_DICT_ELEM; I++) begin
     assign dict_in_values.keep[I] = &dict_body_to_dict.keep[4*I +: 4];
     assign dict_decoded_bytes.keep[4*I +: 4] = {4{dict_out_values.keep[I]}};
 end
@@ -298,7 +278,7 @@ end
 Dictionary #(
     .value_t(data32_t),
     .id_t(id_t),
-    .NUM_ELEMENTS(NUM_ELEMS_SMALLES_ELEM)
+    .NUM_ELEMENTS(NUM_DICT_ELEM)
 ) inst_dictionary (
     .clk(clk),
     .rst_n(reset_synced),
@@ -309,8 +289,7 @@ Dictionary #(
     .out(dict_out_values)
 );
 
-ready_valid_i #(data32_t) last_rewrite_page_elems (clk, rst_n);
-ready_valid_i #(data32_t) _last_rewrite_page_elems (clk, rst_n);
+ready_valid_i #(data32_t) rewrite_last_conf (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) hybrid_path_out (.*);
 DataRewriteLast #(
     .data_t(data8_t),
@@ -319,7 +298,7 @@ DataRewriteLast #(
     .clk (clk),
     .rst_n (rst_n),
 
-    .num_elements (_last_rewrite_page_elems),
+    .num_elements (rewrite_last_conf),
 
     .in (dict_decoded_bytes),
     .out (hybrid_path_out)
@@ -337,7 +316,7 @@ ndata_i #(data8_t, DATABEAT_SIZE) outs[NUM_OUT](clk, reset_synced);
 `DATA_ASSIGN(plain_to_out, outs[OUT_PLAIN])
 `DATA_ASSIGN(hybrid_path_out, outs[OUT_HYBRID])
 
-ready_valid_i #(logic) out_mux_select (clk, rst_n);
+ready_valid_i #(logic) out_mux_conf (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) per_page_out(clk, reset_synced);
 DataMultiplexer #(
     data8_t,
@@ -347,14 +326,13 @@ DataMultiplexer #(
     .clk (clk),
     .rst_n (rst_n),
 
-    .select (out_mux_select),
+    .select (out_mux_conf),
 
     .in (outs),
     .out(per_page_out)
 );
 
-ready_valid_i #(data32_t) num_cc_values (clk, rst_n);
-ready_valid_i #(data32_t) _num_cc_values (clk, rst_n);
+ready_valid_i #(data32_t) normalize_until_conf (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) per_cc_out (clk, reset_synced);
 NormalizeUntil #(
     data8_t,
@@ -364,7 +342,7 @@ NormalizeUntil #(
     .clk (clk),
     .rst_n (rst_n),
 
-    .size (_num_cc_values),
+    .size (normalize_until_conf),
 
     .in (per_page_out),
     .out (per_cc_out)
@@ -375,314 +353,282 @@ NormalizeUntil #(
 // ------------------------------------------------------------------
 // ------ Config distribution ---------------------------------------
 // ------------------------------------------------------------------
-// Every sink sits behind a skid buffer, so one page config is handed to all of
-// them in a single cycle and nothing has to be retired before the next page is
-// accepted. Selects that do not apply to a page are simply not enqueued; each
-// queue stays paired with its own stream because both advance once per page.
 
-// ---- Page-level config chain (page_type_info_t, 5 bits) ----------
-// stage 0 -> plain_router_conf, dictionary_body_dtype
-// stage 1 -> str_router_conf
-// stage 2 -> out_mux_select
-// Each RegisteredReadyValidDuplicator registers its input, so the long haul
-// from here to each router terminates on a flop at both ends.
-ready_valid_i #(page_type_info_t) dict_dtype_conf (clk, reset_synced);
-ready_valid_i #(type_t)           dict_dtype_pre  (clk, reset_synced);
-ready_valid_i #(page_type_info_t) dict_body_conf  (clk, reset_synced);
-ready_valid_i #(type_t)           dict_body_pre   (clk, reset_synced);
-ready_valid_i #(logic)            out_mux_sel_pre (clk, reset_synced);
-ready_valid_i #(in_selector_t)    in_select_pre   (clk, reset_synced);
 
-// The input demultiplexer routes every page, keyed purely on its type.
-assign in_select_pre.data  = in_selector_t'(page_conf.data.page_type);
-assign in_select_pre.valid = page_conf_fire;
-
-SkidBuffer #(in_selector_t) inst_in_select_skid (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in(in_select_pre),
-    .out(in_select)
-);
-
-RegisteredReadyValidDuplicator #(page_type_info_t, 4) inst_page_conf_fan_0 (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in(page_level_config_chain[0]),
-    .out({plain_router_conf, dict_dtype_conf, dict_body_conf,
-          page_level_config_chain[1]})
-);
-
-RegisteredReadyValidDuplicator #(page_type_info_t, 2) inst_page_conf_fan_1 (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in(page_level_config_chain[1]),
-    .out({str_router_conf, page_level_config_chain[2]})
-);
-
-SkidBuffer #(page_type_info_t) inst_page_conf_reg_2 (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in(page_level_config_chain[2]),
-    .out(page_level_config_chain[3])
-);
-
-// DictionaryID rescales one index stream, and HybridPageDecoder emits one such
-// stream per column chunk -- hybrid_conf.last only rises on the chunk's final
-// page, so a chunk's hybrid pages arrive as a single stream. DictionaryID
-// retires one selection from each of its two select queues per stream, so it
-// gets exactly one dtype per stream. Enqueueing one per hybrid page instead
-// pushed four selections per chunk against one retirement, and the two-deep
-// skid buffers holding those selections filled and deadlocked the decoder on
-// the third dictionary chunk.
-assign dict_dtype_pre.data   = dict_dtype_conf.data.typ;
-assign dict_dtype_pre.valid  = dict_dtype_conf.valid
-                            && dict_dtype_conf.data.first_hybrid;
-assign dict_dtype_conf.ready = dict_dtype_pre.ready;
-
-SkidBuffer #(type_t) inst_dict_dtype_skid (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in(dict_dtype_pre),
-    .out(dictionary_body_dtype)
-);
-
-// DictionaryBody routes one body per dictionary page.
-assign dict_body_pre.data   = dict_body_conf.data.typ;
-assign dict_body_pre.valid  = dict_body_conf.valid
-                           && dict_body_conf.data.ptyp == PAGE_TYPE_DICT;
-assign dict_body_conf.ready = dict_body_pre.ready;
-
-SkidBuffer #(type_t) inst_dict_body_dtype_skid (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in(dict_body_pre),
-    .out(dict_body_dtype)
-);
-
-// Dictionary pages emit no values, so they get no output-mux select.
-assign out_mux_sel_pre.data  =
-    page_level_config_chain[3].data.ptyp == PAGE_TYPE_HYBRID ? OUT_HYBRID
-                                                             : OUT_PLAIN;
-assign out_mux_sel_pre.valid = page_level_config_chain[3].valid
-                            && page_level_config_chain[3].data.ptyp != PAGE_TYPE_DICT;
-assign page_level_config_chain[3].ready = out_mux_sel_pre.ready;
-
-SkidBuffer #(logic) inst_out_mux_sel_skid (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in(out_mux_sel_pre),
-    .out(out_mux_select)
-);
-
-// ---- Skid buffers for the directly driven sinks ------------------
-`SKID_SIGNAL(compression_t, clk, reset_synced, decompressor_conf, _decompressor_conf)
-`SKID_SIGNAL(plain_str_decoder_conf_t, clk, reset_synced, plain_str_decoder_conf, _plain_str_decoder_conf)
-`SKID_SIGNAL(data32_t, clk, reset_synced, last_rewrite_page_elems, _last_rewrite_page_elems)
-`SKID_SIGNAL(data32_t, clk, reset_synced, num_cc_values, _num_cc_values)
-
-DataSkidBuffer #(data32_t) inst_hybrid_conf_skid (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in(hybrid_conf),
-    .out(_hybrid_conf)
-);
-
-// ---- Chunk-level context -----------------------------------------
-typedef enum logic {
-    ST_IDLE,
-    ST_CONFIGURED
+typedef enum logic[1:0] {
+    WAIT_FOR_CC_CONF,
+    WAIT_FOR_PAGE_CONF,
+    CONFIGURE,
+    WAIT_CONSUMPTION
 } state_t;
 state_t state;
 
-// A column chunk carries a single data type, so the dtype half of
-// page_type_info_t comes from the chunk config, not from page_conf_t.
-compression_t cc_compression;
-type_t        cc_typ;
-vaddress_t    cc_heap_addr_base;
-vaddress_t    cc_heap_addr;
+logic first_page;
+logic dict_page_seen;
+logic hybrid_page_seen;
 
-logic page_conf_fire;
-assign page_conf_fire = page_conf.valid && page_conf.ready;
+column_chunk_conf_t cc_conf_latched;
+page_conf_t page_conf_r;
 
-// A page is only taken once every queue it feeds has room. All of these readies
-// come out of skid-buffer state, never from a valid, so this is not a loop.
-assign page_conf.ready = (state == ST_CONFIGURED)
-                      && in_select_pre.ready
-                      && decompressor_conf.ready
-                      && plain_str_decoder_conf.ready
-                      && last_rewrite_page_elems.ready
-                      && hybrid_conf.ready
-                      && heap_conf.ready
-                      && page_level_config_chain[0].ready;
+logic all_modules_consumed_configs;
 
-assign chunk_confs[0].ready = (state == ST_IDLE) && num_cc_values.ready;
-
-always_ff @(posedge clk) begin
-    if (!reset_synced) begin
-        state <= ST_IDLE;
-    end else begin
-        case (state)
-            ST_IDLE: begin
-                if (chunk_confs[0].valid && chunk_confs[0].ready) begin
-                    cc_compression <= chunk_confs[0].data.compression;
-                    cc_typ         <= chunk_confs[0].data.typ;
-                    state          <= ST_CONFIGURED;
+always_ff @( posedge clk )
+if (!reset_synced) begin
+    state <= WAIT_FOR_CC_CONF;
+    first_page <= 1;
+    dict_page_seen <= 0;
+    hybrid_page_seen <= 0;
+end else begin
+    case (state)
+        WAIT_FOR_CC_CONF:
+            if (chunk_confs[0].valid) begin
+                cc_conf_latched <= chunk_confs[0].data;
+                state           <= WAIT_FOR_PAGE_CONF;
+            end
+        WAIT_FOR_PAGE_CONF:
+            if (page_conf.valid) begin
+                page_conf_r   <= page_conf.data; 
+                state               <= CONFIGURE;
+            end
+        CONFIGURE:
+            state <= WAIT_CONSUMPTION;
+        WAIT_CONSUMPTION: begin
+            if (all_modules_consumed_configs) begin
+                if (page_conf_r.last) begin
+                    state <= WAIT_FOR_CC_CONF;
+                    first_page <= 1;
+                    dict_page_seen <= 0;
+                    hybrid_page_seen <= 0;
+                end else begin
+                    state <= WAIT_FOR_PAGE_CONF;
+                    first_page <= 0;
+                    dict_page_seen <=
+                            dict_page_seen || page_conf_r.page_type == PAGE_TYPE_DICT;
+                    hybrid_page_seen <= 
+                            hybrid_page_seen || page_conf_r.page_type == PAGE_TYPE_HYBRID;
                 end
             end
-            ST_CONFIGURED: begin
-                if (page_conf_fire && page_conf.data.last) begin
-                    state <= ST_IDLE;
-                end
-            end
-        endcase
-    end
-end
-
-// ---- Chunk-scoped config -----------------------------------------
-// NormalizeUntil packs across page boundaries until the chunk's value count is
-// reached, so it is configured once per chunk rather than per page.
-// NormalizeUntil and DataRewriteLast both count stream elements, and the output
-// path is byte granular, so the value counts are scaled to bytes here.
-logic [2:0] typ_shift;
-always_comb begin
-    case (cc_typ)
-        INT32_T, FLOAT_T:  typ_shift = 3'd2;
-        INT64_T, DOUBLE_T: typ_shift = 3'd3;
-        GERMAN_STR_T:      typ_shift = 3'd4;
-        default:           typ_shift = 3'd0; // BYTE_T
+        end
     endcase
 end
 
-// The chunk config has not been latched yet when this fires, so it is scaled
-// with the type coming straight off the config rather than with cc_typ.
-logic [2:0] cc_typ_shift;
-always_comb begin
-    case (chunk_confs[0].data.typ)
-        INT32_T, FLOAT_T:  cc_typ_shift = 3'd2;
-        INT64_T, DOUBLE_T: cc_typ_shift = 3'd3;
-        GERMAN_STR_T:      cc_typ_shift = 3'd4;
-        default:           cc_typ_shift = 3'd0; // BYTE_T
+
+function automatic logic n_conf_valid(input logic conf_valid, conf_ready, configure_when);
+    case (state)
+        CONFIGURE:        n_conf_valid = configure_when;
+        WAIT_CONSUMPTION: n_conf_valid = conf_valid && !conf_ready;
+        default:          n_conf_valid = 1'b0;
     endcase
+endfunction
+
+localparam logic FOR_EVERY_PAGE = 1;
+
+// ------ Frontend configuration ---------------------------------------
+ready_valid_i #(compression_t) _decompressor_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_decompressor
+    _decompressor_conf.valid <= n_conf_valid(
+        _decompressor_conf.valid,
+        _decompressor_conf.ready,
+        FOR_EVERY_PAGE
+    );
+    _decompressor_conf.data <= cc_conf_latched.compression;
 end
+`SKID_SIGNAL(compression_t, clk, rst_n, _decompressor_conf, decompressor_conf)
 
-assign num_cc_values.data  = chunk_confs[0].data.num_values << cc_typ_shift;
-assign num_cc_values.valid = chunk_confs[0].valid && (state == ST_IDLE);
-
-// ---- Per-page config ---------------------------------------------
-// .first_hybrid is driven further down, next to the hybrid_conf it mirrors.
-assign page_level_config_chain[0].data.typ  = cc_typ;
-assign page_level_config_chain[0].data.ptyp = page_conf.data.page_type;
-assign page_level_config_chain[0].valid     = page_conf_fire;
-
-assign decompressor_conf.data  = cc_compression;
-assign decompressor_conf.valid = page_conf_fire;
-
-// DataRewriteLast re-injects a per-page last on the hybrid path only.
-assign last_rewrite_page_elems.data  = page_conf.data.num_values << typ_shift;
-assign last_rewrite_page_elems.valid = page_conf_fire
-                                    && page_conf.data.page_type == PAGE_TYPE_HYBRID;
-
-// ---- PlainStringDecoder config -----------------------------------
-// The decoder walks its own heap pointer once it has a base, so the chunk's
-// heap base is latched on the first page of the chunk and reused for the rest.
-logic psd_first_page;
-
-always_ff @(posedge clk) begin
-    if (!reset_synced) begin
-        psd_first_page <= 1'b1;
-    end else begin
-        // The chunk config is long retired by the time pages arrive, so the base
-        // address is captured with it and handed to the first page of the chunk.
-        if (chunk_confs[0].valid && chunk_confs[0].ready) begin
-            cc_heap_addr_base <= chunk_confs[0].data.string_heap_addr;
-        end
-
-        if (page_conf_fire) begin
-            // The page after a chunk's last page opens the next chunk.
-            psd_first_page <= page_conf.data.last;
-
-            if (psd_first_page) begin
-                cc_heap_addr <= cc_heap_addr_base;
-            end
-        end
-    end
+ready_valid_i #(in_selector_t) _data_page_path_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_data_page_path
+    _data_page_path_conf.valid <= n_conf_valid(
+        _data_page_path_conf.valid,
+        _data_page_path_conf.ready,
+        FOR_EVERY_PAGE
+    );
+    _data_page_path_conf.data <= in_selector_t'(page_conf_r.page_type);
 end
+`SKID_SIGNAL(in_selector_t, clk, rst_n, _data_page_path_conf, data_page_path_conf)
 
-assign plain_str_decoder_conf.data.update_buffer_addr = psd_first_page;
-assign plain_str_decoder_conf.data.num_values         = page_conf.data.num_values;
-assign plain_str_decoder_conf.data.buffer_addr        = cc_heap_addr_base;
-assign plain_str_decoder_conf.valid = page_conf_fire
-                                   && cc_typ == GERMAN_STR_T
-                                   && page_conf.data.page_type != PAGE_TYPE_HYBRID;
 
-// ---- HeapNormalizer config ---------------------------------------
-// One entry per page of a string chunk: {generates_heap, last_page}. Pages that
-// reach the decoder contribute bytes; HYBRID pages contribute none but still take
-// an entry, so the chunk's final page always carries the flush even when it emits
-// no heap of its own. Other chunks enqueue nothing and leave the heap silent.
-assign heap_conf.data  = {page_conf.data.page_type != PAGE_TYPE_HYBRID,
-                          page_conf.data.last};
-assign heap_conf.valid = page_conf_fire && cc_typ == GERMAN_STR_T;
+// ------ Hybrid Path configuration ---------------------------------------
+/**
+ *
+ * The hybrid path has a special edge case that needs to be handled with a
+ * dummy beat (PLAIN fallback):
+ *
+ * If a column chunk starts with dictionary encoding but ends on PLAIN
+ * encoded data pages, the routing elements of the hybrid path and the
+ * dictionary itself will never see a last signal, as the HybridPageDecoder
+ * only emits a last signal iff it receives the last page of the column
+ * chunk. In the case of PLAIN fallback, the HybridPageDecoder never
+ * receives the last page, thus the routing elements and dictionary are
+ * never reset and thus misconfigured for the next column chuk.
+ */
 
-// ---- HybridPageDecoder config ------------------------------------
-// A chunk that carried a dictionary page but ends on a plain page never sends a
-// last beat down the hybrid path, so the Dictionary would hold its contents into
-// the next chunk. Enqueue a dummy config with keep low and last high to flush it.
-logic dict_seen;
-
-always_ff @(posedge clk) begin
-    if (!reset_synced) begin
-        dict_seen <= 1'b0;
-    end else if (page_conf_fire) begin
-        if (page_conf.data.last) begin
-            dict_seen <= 1'b0;
-        end else if (page_conf.data.page_type == PAGE_TYPE_DICT) begin
-            dict_seen <= 1'b1;
-        end
-    end
-end
-
+data_i #(data32_t) _hybrid_page_decoder_conf (clk, reset_synced);
+// This condition is only true if a PLAIN fallback occured
 logic hybrid_flush;
-assign hybrid_flush = dict_seen
-                   && page_conf.data.last
-                   && page_conf.data.page_type == PAGE_TYPE_PLAIN;
+assign hybrid_flush = page_conf_r.last &&
+            page_conf_r.page_type == PAGE_TYPE_PLAIN &&
+            dict_page_seen;
 
-logic page_feeds_hybrid;
-assign page_feeds_hybrid = hybrid_flush
-                        || page_conf.data.page_type == PAGE_TYPE_HYBRID;
+logic enqueue_hybrid_page_decoder_conf;
+assign enqueue_hybrid_page_decoder_conf = hybrid_flush ||
+                     page_conf_r.page_type == PAGE_TYPE_HYBRID;
+always_ff @( posedge clk ) begin : configure_hybrid_page_decoder
+    _hybrid_page_decoder_conf.valid <= n_conf_valid(
+        _hybrid_page_decoder_conf.valid,
+        _hybrid_page_decoder_conf.ready,
+        enqueue_hybrid_page_decoder_conf
+    );
 
-assign hybrid_conf.data  = hybrid_flush ? '0 : page_conf.data.num_values;
-assign hybrid_conf.keep  = ~hybrid_flush;
-assign hybrid_conf.last  = page_conf.data.last;
-assign hybrid_conf.valid = page_conf_fire && page_feeds_hybrid;
-
-// The page that opens this chunk's hybrid stream, which is the one page that
-// carries a dtype to DictionaryID. A flush counts: it produces a last beat and
-// therefore a stream, even though it rides on a plain page.
-logic hybrid_stream_open;
-
-always_ff @(posedge clk) begin
-    if (!reset_synced) begin
-        hybrid_stream_open <= 1'b0;
-    end else if (page_conf_fire) begin
-        if (page_conf.data.last) begin
-            hybrid_stream_open <= 1'b0;
-        end else if (page_feeds_hybrid) begin
-            hybrid_stream_open <= 1'b1;
-        end
-    end
+    // All these signals remain stable during configuration
+    _hybrid_page_decoder_conf.data <= hybrid_flush ? '0 : page_conf_r.num_values;
+    _hybrid_page_decoder_conf.keep <= ~hybrid_flush;
+    _hybrid_page_decoder_conf.last <= page_conf_r.last;
 end
+`SKID_DATA_SIGNAL(data32_t, clk, rst_n, _hybrid_page_decoder_conf, hybrid_page_decoder_conf)
 
-assign page_level_config_chain[0].data.first_hybrid =
-    page_feeds_hybrid && !hybrid_stream_open;
+// The Hybrid path routing needs to be once per hybrid pages group
+ready_valid_i #(type_t) _dict_id_conf (clk, rst_n);
+logic enqueue_dict_id_conf;
+assign enqueue_dict_id_conf =
+        !hybrid_page_seen &&
+        (hybrid_flush || page_conf_r.page_type == PAGE_TYPE_HYBRID);
+always_ff @( posedge clk ) begin : configure_dict_id
+    _dict_id_conf.valid <= n_conf_valid(
+        _dict_id_conf.valid,
+        _dict_id_conf.ready,
+        enqueue_dict_id_conf
+    );
+    _dict_id_conf.data <= hybrid_flush ? INT32_T : cc_conf_latched.typ;
+end
+`SKID_SIGNAL(type_t, clk, rst_n, _dict_id_conf, dict_id_conf)
+
+ready_valid_i #(data32_t) _rewrite_last_conf (clk, rst_n);
+always_ff @( posedge clk ) begin : configure_rewrite_last
+    _rewrite_last_conf.valid <= n_conf_valid(
+        _rewrite_last_conf.valid,
+        _rewrite_last_conf.ready,
+        page_conf_r.page_type == PAGE_TYPE_HYBRID
+    );
+    _rewrite_last_conf.data <=
+        page_conf_r.num_values * GET_TYPE_BYTES(cc_conf_latched.typ);
+end
+`SKID_SIGNAL(data32_t, clk, rst_n, _rewrite_last_conf, rewrite_last_conf)
+
+// ------ Dictionary Page Path configuration ---------------------------------------
+ready_valid_i #(type_t) _dict_body_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_dict_body
+    _dict_body_conf.valid <= n_conf_valid(
+        _dict_body_conf.valid,
+        _dict_body_conf.ready,
+        page_conf_r.page_type == PAGE_TYPE_DICT
+    );
+    _dict_body_conf.data <= cc_conf_latched.typ;
+end
+`SKID_SIGNAL(type_t, clk, rst_n, _dict_body_conf, dict_body_conf)
+
+// ------ Plain Data Page Path configuration ---------------------------------------
+ready_valid_i #(type_t) _plain_router_conf (clk, rst_n);
+always_ff @( posedge clk ) begin : configure_plain_router
+    _plain_router_conf.valid <= n_conf_valid(
+        _plain_router_conf.valid,
+        _plain_router_conf.ready,
+        page_conf_r.page_type == PAGE_TYPE_PLAIN
+    );
+    _plain_router_conf.data <= cc_conf_latched.typ;
+end
+`SKID_SIGNAL(type_t, clk, rst_n, _plain_router_conf, plain_router_conf)
+
+// ------ String Path configuration ---------------------------------------
+ready_valid_i #(page_type_info_t) _str_router_conf (clk, rst_n);
+always_ff @( posedge clk ) begin : configure_str_router
+    _str_router_conf.valid <= n_conf_valid(
+        _str_router_conf.valid,
+        _str_router_conf.ready,
+        FOR_EVERY_PAGE
+    );
+    _str_router_conf.data <= {
+        cc_conf_latched.typ,
+        page_conf_r.page_type,
+        page_conf_r.last
+    };
+end
+`SKID_SIGNAL(page_type_info_t, clk, rst_n, _str_router_conf, str_router_conf)
+
+ready_valid_i #(plain_str_decoder_conf_t) _plain_str_decoder_conf (clk, rst_n);
+logic plain_str_decoder_active;
+assign plain_str_decoder_active =
+    cc_conf_latched.typ == GERMAN_STR_T &&
+    page_conf_r.page_type != PAGE_TYPE_HYBRID;
+
+always_ff @( posedge clk ) begin : configure_plain_str_decoder
+    _plain_str_decoder_conf.valid <= n_conf_valid(
+        _plain_str_decoder_conf.valid,
+        _plain_str_decoder_conf.ready,
+        plain_str_decoder_active
+    );
+    _plain_str_decoder_conf.data <= {
+        first_page,
+        page_conf_r.num_values,
+        cc_conf_latched.string_heap_addr
+    };
+end
+`SKID_SIGNAL(plain_str_decoder_conf_t, clk, rst_n, _plain_str_decoder_conf, plain_str_decoder_conf)
+
+ready_valid_i #(logic[1:0]) _heap_normalize_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_heap_normalize
+    _heap_normalize_conf.valid <= n_conf_valid(
+        _heap_normalize_conf.valid,
+        _heap_normalize_conf.ready,
+        cc_conf_latched.typ == GERMAN_STR_T
+    );
+    _heap_normalize_conf.data <= {
+        page_conf_r.page_type != PAGE_TYPE_HYBRID,
+        page_conf_r.last
+    };
+end
+`SKID_SIGNAL(logic[1:0], clk, rst_n, _heap_normalize_conf, heap_normalize_conf)
+
+// ------ Output MUX control ---------------------------------------
+ready_valid_i #(logic) _out_mux_conf (clk, rst_n);
+always_ff @( posedge clk ) begin : configure_out_mux
+    _out_mux_conf.valid <= n_conf_valid(
+        _out_mux_conf.valid,
+        _out_mux_conf.ready,
+        page_conf_r.page_type != PAGE_TYPE_DICT
+    );
+    _out_mux_conf.data <= page_conf_r.page_type == PAGE_TYPE_HYBRID ?
+            OUT_HYBRID :
+            OUT_PLAIN;
+end
+`SKID_SIGNAL(logic, clk, rst_n, _out_mux_conf, out_mux_conf)
+
+// ------ Column Chunk level configurations ---------------------------------------
+ready_valid_i #(data32_t) _normalize_until_conf (clk, rst_n);
+always_ff @( posedge clk ) begin : configure_normalize_until
+    _normalize_until_conf.valid <= n_conf_valid(
+        _normalize_until_conf.valid,
+        _normalize_until_conf.ready,
+        first_page
+    );
+    _normalize_until_conf.data <= 
+        cc_conf_latched.num_values * GET_TYPE_BYTES(cc_conf_latched.typ);
+end
+`SKID_SIGNAL(data32_t, clk, rst_n, _normalize_until_conf, normalize_until_conf)
+
+assign all_modules_consumed_configs =
+        !_decompressor_conf.valid &&
+        !_data_page_path_conf.valid &&
+        !_hybrid_page_decoder_conf.valid &&
+        !_dict_id_conf.valid &&
+        !_dict_body_conf.valid &&
+        !_plain_router_conf.valid &&
+        !_str_router_conf.valid &&
+        !_plain_str_decoder_conf.valid &&
+        !_rewrite_last_conf.valid &&
+        !_out_mux_conf.valid &&
+        !_normalize_until_conf.valid;
+assign chunk_confs[0].ready = state == WAIT_FOR_CC_CONF;
+assign page_conf.ready = state == WAIT_FOR_PAGE_CONF;
 
 // ------ Stream profiling ------------------------
 stream_profile_i profile_in ();
@@ -739,32 +685,73 @@ always_ff @(posedge clk) begin
 end
 
 `ifdef DEBUG
-// The heap path either side of HeapNormalizer, plus its config. A chunk that
-// ends with heap_in_lasts incremented but nothing arriving at the host means
-// the last was swallowed between here and the writer.
-ila_heap_path inst_ila_heap_path (
+// Every port of the five modules that can stall the pipeline on their own:
+// Decompressor, HybridPageDecoder, Dictionary, PlainStringDecoder and the
+// output multiplexer. A blocked stream reads as valid=1 with ready=0, so
+// ready is captured alongside valid - without it the trace says something is
+// stuck but not which side is holding it up.
+//
+// None of these widths depend on DATABEAT_SIZE, so one IP serves both the 32-
+// and 64-byte configurations.
+ila_cc_decoder inst_ila_cc_decoder (
     .clk(clk),
     .probe0(reset_synced),
     .probe1(state),
 
-    .probe2(psd_out_heap.valid),
-    .probe3(psd_out_heap.ready),
-    .probe4(psd_out_heap.last),
-    .probe5(psd_out_heap.keep),
+    // Decompressor
+    .probe2(decompressor_conf.valid),
+    .probe3(decompressor_conf.ready),
+    .probe4(page_payload.valid),
+    .probe5(page_payload.ready),
+    .probe6(decompressor_out.valid),
+    .probe7(decompressor_out.ready),
 
-    .probe6(heap_in_beats),
-    .probe7(heap_in_lasts),
-    .probe8(heap_in_bytes),
+    // HybridPageDecoder
+    .probe8(hybrid_page_decoder_conf.valid),
+    .probe9(hybrid_page_decoder_conf.ready),
+    .probe10(ins[IN_HYBRID].valid),
+    .probe11(ins[IN_HYBRID].ready),
+    .probe12(dict_ids_native.valid),
+    .probe13(dict_ids_native.ready),
 
-    .probe9(heap_packed.valid),
-    .probe10(heap_packed.ready),
-    .probe11(heap_packed.last),
-    .probe12(heap_packed.keep),
+    // Dictionary
+    .probe14(dict_in_values.valid),
+    .probe15(dict_in_values.ready),
+    .probe16(dict_ids_scaled.valid),
+    .probe17(dict_ids_scaled.ready),
+    .probe18(dict_out_values.valid),
+    .probe19(dict_out_values.ready),
 
-    .probe13(heap_conf.valid),
-    .probe14(heap_conf.ready),
-    .probe15(heap_conf.data)
+    // PlainStringDecoder
+    .probe20(plain_str_decoder_conf.valid),
+    .probe21(plain_str_decoder_conf.ready),
+    .probe22(psd_in.valid),
+    .probe23(psd_in.ready),
+    .probe24(psd_out_strings.valid),
+    .probe25(psd_out_strings.ready),
+    .probe26(psd_out_heap.valid),
+    .probe27(psd_out_heap.ready),
+
+    // Output multiplexer
+    .probe28(out_mux_conf.valid),
+    .probe29(out_mux_conf.ready),
+    .probe30(plain_to_out.valid),
+    .probe31(plain_to_out.ready),
+    .probe32(hybrid_path_out.valid),
+    .probe33(hybrid_path_out.ready),
+    .probe34(per_page_out.valid),
+    .probe35(per_page_out.ready),
+
+    // Heap-path counters: a chunk that ends with heap_in_lasts incremented but
+    // nothing arriving at the host means the last was swallowed downstream.
+    .probe36(heap_in_beats),
+    .probe37(heap_in_lasts),
+    .probe38(heap_in_bytes)
 );
 `endif
+
+`undef CONFIGURE_VALID
+`undef FOR_EVERY_PAGE
+`undef RESET_WHEN_FIRE
 
 endmodule

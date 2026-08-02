@@ -116,7 +116,7 @@ StringRouter #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .page_conf(page_conf),
+    .conf(page_conf),
 
     .in_from_plain (in_from_plain),
     .in_from_dict_body (in_from_dict_body),

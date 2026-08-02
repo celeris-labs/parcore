@@ -16,8 +16,9 @@ import lynxTypes::*;
  *   out_values             -> axis_host_send[0]
  *   out_to_str_decoder     -> axis_host_send[1]
  *
- * page_conf (page_type_info_t) is driven per page over the config path, mirroring how
- * the ColumnChunkDecoder page FSM drives it in the real design.
+ * conf (type_t) is driven once per PLAIN page over the config path. The router no
+ * longer filters on page type, so DICT and HYBRID pages -- which never reach it --
+ * must not be configured, mirroring how the ColumnChunkDecoder drives it.
  */
 
 /* -- Tie-off unused interfaces and signals ----------------------------- */
@@ -43,7 +44,7 @@ localparam int DATABEAT_SIZE = 64;
 
 /* -- CONFIG ------------------------------------------------------------ */
 // ValuesRouter carries no config registers in the real design (its parent drives
-// page_conf), so the register plumbing lives directly in this test top.
+// conf), so the register plumbing lives directly in this test top.
 write_config_i write_configs[1](.*);
 read_config_i  read_configs [1](.*);
 GlobalConfig #(
@@ -62,8 +63,8 @@ GlobalConfig #(
 
 always_comb read_configs[0].tie_off_s();
 
-ready_valid_i #(page_type_info_t) page_conf(clk, rst_n);
-ConfigWriteFIFO #(0, 8, page_type_info_t) inst_page_conf (clk, rst_n, write_configs[0], page_conf);
+ready_valid_i #(type_t) conf(clk, rst_n);
+ConfigWriteFIFO #(0, 8, type_t) inst_conf (clk, rst_n, write_configs[0], conf);
 
 /* -- INPUTS ------------------------------------------------------------ */
 AXI4S axi_in_stripped (.aclk(clk), .aresetn(rst_n));
@@ -100,7 +101,7 @@ PlainRouter #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .page_conf(page_conf),
+    .conf(conf),
 
     .in_from_stripped(in_from_stripped),
     .in_from_str_decoder(in_from_str_decoder),

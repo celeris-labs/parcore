@@ -1,3 +1,6 @@
+import os
+import unittest
+
 from dataclasses import dataclass
 from coyote_test import fpga_test_case, fpga_stream, fpga_register, simulation_time
 from os.path import dirname, realpath, join
@@ -77,6 +80,138 @@ def _parquet_chunk(parquet_filename: str, col_idx: int = 0) -> _ColumnChunk:
         num_values=col_meta.num_values,
         chunk_bytes=case.chunk_bytes,
     )
+
+
+# -- lineitem_stress_uniform.parquet, row group 0 ---------------------------
+#
+# vfpga_top hangs on column 3 of this file: input consumed, no write request ever
+# issued, and 119k idle cycles after it. Columns 1 and 2 are the controls -- same
+# chunk shape (one PLAIN dictionary page then four RLE_DICTIONARY data pages of 8
+# values each) and they complete. The three differ only in how many dictionary
+# entries they carry:
+#
+#   col1 l_partkey     32 entries, 256 B dictionary page   passes
+#   col2 l_suppkey     11 entries,  88 B                   passes
+#   col3 l_linenumber   7 entries,  56 B                   HANGS
+#
+# 7 entries is the first of the three that does not fill a whole DATABEAT_SIZE=32
+# beat pair, which is why these run at both 32 and 64 bytes per beat.
+#
+# The chunks are inlined verbatim rather than read from the file: each is the
+# byte range [dictionary_page_offset or data_page_offset, +total_compressed_size)
+# of row group 0, i.e. thrift page headers plus their SNAPPY payloads, exactly
+# what _extract_parquet_column_chunks used to hand over. All 48 row groups of
+# lineitem_stress_uniform.parquet are byte-identical (it was generated with
+# make_lineitem_stress.py --uniform), so row group 0 is the whole story.
+_STRESS_ROWS = 32
+
+# col0 l_orderkey  INT64  PLAIN, no dictionary  275 B
+_STRESS_COL0_ORDERKEY = bytes.fromhex(
+    # [  0] DATA PLAIN  nvals=8  header 18 B + payload 48 B
+    "1500158c0115602c15101500150615060000461802000000"
+    "1001000d0100040d0800080d08000c0d0800100d0800140d"
+    "083c18000000000000001500000000000000"
+    # [ 66] DATA PLAIN  nvals=8  header 18 B + payload 51 B
+    "1500158c0115662c15101500150615060000461c02000000"
+    "100119000901041d000901002109070400250d0800290d08"
+    "002d0d083c2a000000000000002e00000000000000"
+    # [135] DATA PLAIN  nvals=8  header 18 B + payload 52 B
+    "1500158c0115682c15101500150615060000461c02000000"
+    "1001320009010036090708003a000901003e09070400420d"
+    "08003f0d083c43000000000000004700000000000000"
+    # [205] DATA PLAIN  nvals=8  header 18 B + payload 52 B
+    "1500158c0115682c15101500150615060000461c02000000"
+    "10014b000901004f09070400530d08045700090100540907"
+    "0400580d083c5c000000000000006000000000000000"
+)
+
+# col1 l_partkey  INT64  dictionary of 32 entries (-100..-69), 256 B body  282 B
+_STRESS_COL1_PARTKEY = bytes.fromhex(
+    # [  0] DICT PLAIN  nvals=32  header 16 B + payload 141 B
+    "1504158004159a024c154015001200008002049cff090100"
+    "9d090704ff9e0d08009f0d0800a00d0800a10d0800a20d08"
+    "00a30d0800a40d0800a50d0800a60d0800a70d0800a80d08"
+    "00a90d0800aa0d0800ab0d0800ac0d0800ad0d0800ae0d08"
+    "00af0d0800b00d0800b10d0800b20d0800b30d0800b40d08"
+    "00b50d0800b60d0800b70d0800b80d0800b90d083cbaffff"
+    "ffffffffffbbffffffffffffff"
+    # [157] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "01030388c6fa"
+    # [187] DATA RLE_DICTIONARY  nvals=8  bit_width 4  header 17 B + payload 14 B
+    "15001518151c2c151015101506150600000c2c0200000010"
+    "01040398badcfe"
+    # [218] DATA RLE_DICTIONARY  nvals=8  bit_width 5  header 17 B + payload 15 B
+    "1500151a151e2c151015101506150600000d300200000010"
+    "01050330ca49abbd"
+    # [250] DATA RLE_DICTIONARY  nvals=8  bit_width 5  header 17 B + payload 15 B
+    "1500151a151e2c151015101506150600000d300200000010"
+    "01050338ebcdbbff"
+)
+
+# col2 l_suppkey  INT64  dictionary of 11 entries (-5..5), 88 B body  192 B
+_STRESS_COL2_SUPPKEY = bytes.fromhex(
+    # [  0] DICT PLAIN  nvals=11  header 15 B + payload 54 B
+    "150415b001156c4c151615001200005804fbff090100fc09"
+    "0704fffd0d0800fe0d08110100000d0100010d0800020d08"
+    "00030d083c04000000000000000500000000000000"
+    # [ 69] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "01030388c6fa"
+    # [ 99] DATA RLE_DICTIONARY  nvals=8  bit_width 4  header 17 B + payload 14 B
+    "15001518151c2c151015101506150600000c2c0200000010"
+    "010403980a2143"
+    # [130] DATA RLE_DICTIONARY  nvals=8  bit_width 4  header 17 B + payload 14 B
+    "15001518151c2c151015101506150600000c2c0200000010"
+    "0104036587a910"
+    # [161] DATA RLE_DICTIONARY  nvals=8  bit_width 4  header 17 B + payload 14 B
+    "15001518151c2c151015101506150600000c2c0200000010"
+    "01040332547698"
+)
+
+# col3 l_linenumber  INT64  dictionary of 7 entries (1..7), 56 B body  174 B
+_STRESS_COL3_LINENUMBER = bytes.fromhex(
+    # [  0] DICT PLAIN  nvals=7  header 14 B + payload 40 B
+    "1504157015504c150e150012000038040100090100020907"
+    "0400030d0800040d0800050d083c06000000000000000700"
+    "000000000000"
+    # [ 54] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "01030388c61a"
+    # [ 84] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "010303d15823"
+    # [114] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "0103031a6b44"
+    # [144] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "010303638d68"
+)
+
+_STRESS_CHUNKS = {
+    0: _STRESS_COL0_ORDERKEY,
+    1: _STRESS_COL1_PARTKEY,
+    2: _STRESS_COL2_SUPPKEY,
+    3: _STRESS_COL3_LINENUMBER,
+}
+
+
+def _stress_chunk(col: int) -> _ColumnChunk:
+    return _ColumnChunk(
+        compression=True,
+        num_values=_STRESS_ROWS,
+        chunk_bytes=bytearray(_STRESS_CHUNKS[col]),
+    )
+
+
+def stress_dict_chunks() -> list[tuple[str, int, list[int]]]:
+    """(name, column index, expected values) for the three dictionary columns."""
+    return [
+        ('l_partkey',    1, [(i % 200) - 100 for i in range(_STRESS_ROWS)]),
+        ('l_suppkey',    2, [(i % 11) - 5    for i in range(_STRESS_ROWS)]),
+        ('l_linenumber', 3, [(i % 7) + 1     for i in range(_STRESS_ROWS)]),
+    ]
 
 
 # -- Synthetic PLAIN-only chunk ---------------------------------------------
@@ -300,6 +435,62 @@ class ColumnChunkDecoderTestCase(fpga_test_case.FPGATestCase):
 
         self.simulate_fpga()
         self.assert_simulation_output()
+
+    def _run_stress_column(self, col: int, expected: list[int]):
+        self.run_chunks([_stress_chunk(col)], [expected])
+
+    def test_stress_dict_32_entries(self):
+        """Control: 32-entry dictionary, 4 pages of 8 values."""
+        self._run_stress_column(*stress_dict_chunks()[0][1:])
+
+    def test_stress_dict_11_entries(self):
+        """Control: 11-entry dictionary."""
+        self._run_stress_column(*stress_dict_chunks()[1][1:])
+
+    def test_stress_dict_7_entries(self):
+        """l_linenumber: 7-entry dictionary. Hangs vfpga_top at DATABEAT_SIZE=32."""
+        self._run_stress_column(*stress_dict_chunks()[2][1:])
+
+    def _run_stress_sequence(self, cols: list[int], expected: list[list[int]]):
+        # A fixed window rather than till_finished(): each of these chunks takes
+        # roughly a microsecond, so the default 4us is too short and a trailing
+        # chunk comes back zeroed whether or not anything is wrong -- but
+        # till_finished() never returns on the sequences that do hang. 20us is
+        # ~5x what a four-chunk sequence needs.
+        self.overwrite_simulation_time(simulation_time.SimulationTime.fixed_time(
+            20, simulation_time.SimulationTimeUnit.MICROSECONDS))
+        self.run_chunks([_stress_chunk(c) for c in cols], expected)
+
+    def test_stress_dict_two_back_to_back(self):
+        cases = stress_dict_chunks()[:2]
+        self._run_stress_sequence([c for _, c, _ in cases], [e for _, _, e in cases])
+
+    def test_stress_dict_all_three_back_to_back(self):
+        """The failing chunk preceded by the two that work, as vfpga_top saw it."""
+        cases = stress_dict_chunks()
+        self._run_stress_sequence([c for _, c, _ in cases], [e for _, _, e in cases])
+
+    def test_stress_dict_same_chunk_three_times(self):
+        """Separates "third dictionary chunk" from "a dictionary that shrank"."""
+        _, col, expected = stress_dict_chunks()[2]
+        self._run_stress_sequence([col] * 3, [expected] * 3)
+
+    def test_stress_dict_shrinking_dictionaries(self):
+        """32 -> 11 -> 7 entries, the order vfpga_top hit. Reversed below."""
+        cases = stress_dict_chunks()
+        self._run_stress_sequence([c for _, c, _ in cases], [e for _, _, e in cases])
+
+    def test_stress_dict_growing_dictionaries(self):
+        """7 -> 11 -> 32 entries."""
+        cases = list(reversed(stress_dict_chunks()))
+        self._run_stress_sequence([c for _, c, _ in cases], [e for _, _, e in cases])
+
+    def test_stress_plain_then_dicts(self):
+        """l_orderkey (PLAIN) first, exactly as vfpga_top decoded row group 0."""
+        cases = stress_dict_chunks()
+        self._run_stress_sequence(
+            [0] + [c for _, c, _ in cases],
+            [[i * 3 + (i % 7) for i in range(_STRESS_ROWS)]] + [e for _, _, e in cases])
 
     def test_one_rle_page(self):
         self.run_chunks([_parquet_chunk('rle_data.parquet')], [_RLE_OUTPUT])

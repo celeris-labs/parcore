@@ -14,7 +14,7 @@ import lynxTypes::*;
  *   out_to_dict       -> axis_host_send[0]  (body forwarded to the dictionary)
  *   out_to_psd        -> axis_host_send[1]  (body forwarded to the PSD, german pages only)
  *
- * dtype (type_t) is driven per page over the config path, mirroring how the
+ * conf (type_t) is driven per page over the config path, mirroring how the
  * parent drives it in the real design.
  */
 
@@ -41,7 +41,7 @@ localparam int DATABEAT_SIZE = 64;
 
 /* -- CONFIG ------------------------------------------------------------ */
 // DictionaryBodyRouter carries no config registers in the real design (its
-// parent drives dtype), so the register plumbing lives directly in this top.
+// parent drives conf), so the register plumbing lives directly in this top.
 write_config_i write_configs[1](.*);
 read_config_i  read_configs [1](.*);
 GlobalConfig #(
@@ -60,8 +60,8 @@ GlobalConfig #(
 
 always_comb read_configs[0].tie_off_s();
 
-ready_valid_i #(type_t) dtype(clk, rst_n);
-ConfigWriteFIFO #(0, 8, type_t) inst_dtype (clk, rst_n, write_configs[0], dtype);
+ready_valid_i #(type_t) conf(clk, rst_n);
+ConfigWriteFIFO #(0, 8, type_t) inst_conf (clk, rst_n, write_configs[0], conf);
 
 /* -- INPUTS ------------------------------------------------------------ */
 AXI4S axi_in_body (.aclk(clk), .aresetn(rst_n));
@@ -98,7 +98,7 @@ DictionaryBody #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .dtype(dtype),
+    .conf(conf),
 
     .in_body(in_body),
     .in_german_strings(in_german_strings),

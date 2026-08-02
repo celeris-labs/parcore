@@ -73,7 +73,8 @@ DictionaryID #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .dtype(data_type),
+    .conf(data_type),
+    
     .in(in),
     .out(out)
 );
