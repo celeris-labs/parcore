@@ -82,6 +82,10 @@ Metadata from_file(const std::string &path) {
                                                : cc->data_page_offset());
       chunk.total_compressed_size =
           static_cast<uint64_t>(cc->total_compressed_size());
+      // A level section (and thus its length prefix) only precedes the page body
+      // when the schema says it's needed.      
+      chunk.has_rep_levels = schema->Column(j)->max_repetition_level() > 0;
+      chunk.has_def_levels = schema->Column(j)->max_definition_level() > 0;
       group.chunks.push_back(chunk);
     }
     meta.groups.push_back(std::move(group));

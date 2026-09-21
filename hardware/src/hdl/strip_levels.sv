@@ -12,20 +12,30 @@ import parcore::*;
  * This module strips the repetition and definition levels from the start of a
  * page and emits a normalized stream.
  *
- * A page starts with a 4-byte length prefix followed by that many level bytes,
- * i.e. the first `NUM_BYTES_OFFSET + <prefix>` bytes are levels that have to be
- * discarded. Because everything after the header is dense, the only mismatch
- * between input and output beats is a single, constant byte shift `h` (the
- * header length modulo NUM_BYTES). This module therefore works like a
- * `DataNormalizer`, but instead of an accumulating per-beat offset it uses a
- * single, fixed barrel-shifter offset derived from the header length and merges
- * the wrapped bytes across beats in an output register.
+ * When the page carries levels it starts with a 4-byte length prefix followed
+ * by that many level bytes, i.e. the first `NUM_BYTES_OFFSET + <prefix>` bytes
+ * are levels that have to be discarded. Because everything after the header is
+ * dense, the only mismatch between input and output beats is a single, constant
+ * byte shift `h` (the header length modulo NUM_BYTES). This module therefore
+ * works like a `DataNormalizer`, but instead of an accumulating per-beat offset
+ * it uses a single, fixed barrel-shifter offset derived from the header length
+ * and merges the wrapped bytes across beats in an output register.
+ *
+ * A page from a REQUIRED Parquet column (max_definition_level == 0 and
+ * max_repetition_level == 0) has no levels and therefore no length prefix: its
+ * body is values only. Such a page must pass through untouched, which the
+ * `levels` stream signals per page. Stripping it anyway would consume
+ * `4 + <first four value bytes read as a length>` bytes of real data, and the
+ * resulting short stream makes TypedNormalizeUntil swallow the chunk's `last`
+ * (see the assertion there).
  */
 module StripLevels #(
     parameter NUM_BYTES = AXI_DATA_BITS / 8
 ) (
     input logic clk,
     input logic rst_n,
+
+    ready_valid_i.s levels,  // #(logic)
 
     ndata_i.s in,            // #(data8_t, NUM_BYTES)
     ndata_i.m out            // #(data8_t, NUM_BYTES)
@@ -65,9 +75,11 @@ always_ff @(posedge clk) begin
     end else begin
         case (state)
             ST_WAIT: begin
-                if (in.valid) begin
-                    // 4 prefix bytes + the level length encoded in those bytes.
-                    automatic header_offset_t actual_offset = NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0];
+                if (in.valid && levels.valid) begin
+                    // 4 prefix bytes + the level length encoded in those bytes,
+                    // or nothing at all when this page carries no levels.
+                    automatic header_offset_t actual_offset =
+                        levels.data ? (NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0]) : '0;
 
                     remaining_offset <= actual_offset;
                     shift_offset     <= (NUM_BYTES - actual_offset[OFFSET_WIDTH - 1:0]) % NUM_BYTES;
@@ -97,6 +109,13 @@ always_ff @(posedge clk) begin
 end
 
 assign in.ready = (state == ST_CONSUME) || (state == ST_PIPE && shifter_in.ready);
+
+// The first beat of a page is held (not consumed) while ST_WAIT samples the
+// prefix, so the page's `levels` beat retires on the cycle we leave ST_WAIT.
+// Contract: every page owes exactly one `levels` beat, and a page is expected
+// to carry at least one payload beat -- an empty page would leave both this
+// stream and the page's `last` outstanding.
+assign levels.ready = (state == ST_WAIT) && in.valid;
 
 // ------- Masking + barrel shifter ---------------
 ndata_i #(data8_t, NUM_BYTES) shifter_in(clk, reset_synced), shifter_out(clk, reset_synced);

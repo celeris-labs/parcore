@@ -80,6 +80,10 @@ typedef enum logic [1:0] {
 } page_type_t;
 
 typedef struct packed {
+    // Whether this chunk's data pages carry a repetition-level section and/or a
+    // definition-level section.
+    logic         has_rep_levels;
+    logic         has_def_levels;
     compression_t compression;
     data32_t      num_values;
     type_t        typ;
@@ -90,6 +94,15 @@ typedef struct packed {
     data32_t    num_values;
     logic       last;
 } page_conf_t;
+
+// Per-page configuration for the HybridPageDecoder. Only carries
+// has_def_levels: the repetition-level section (if any) is stripped by a
+// StripLevels instance upstream of HybridPageDecoder, so by the time this
+// module sees the data only a definition-level section can remain.
+typedef struct packed {
+    logic    has_def_levels;
+    data32_t num_values;
+} hybrid_page_conf_t;
 
 typedef struct packed {
     stream_profile_t in;
