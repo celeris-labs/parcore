@@ -35,6 +35,8 @@ module ColumnChunkDecoderConfig #(
     decoder_profile_i.s profile[NUM_DECODERS]
 );
 
+localparam MAX_NUM_ENQUEUED_BUFFERS = COLUMN_CHUNK_DECODER_MAX_ENQUEUED_CONFIGS;
+
 // Info registers followed by the per-decoder profiling counters. Each decoder
 // contributes 8 counters (4 input + 4 output stream profile counters).
 localparam NUM_INFO_REGS    = COLUMN_CHUNK_DECODER_INFO_REGS;
@@ -47,7 +49,7 @@ localparam NUM_READ_REGS    = COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS);
 logic[AXIL_DATA_BITS - 1:0] values[NUM_READ_REGS];
 assign values[0] = COLUMN_CHUNK_DECODER_CONFIG_ID;
 assign values[1] = NUM_DECODERS;
-assign values[2] = COLUMN_CHUNK_DECODER_MAX_ENQUEUED_CONFIGS;
+assign values[2] = MAX_NUM_ENQUEUED_BUFFERS;
 
 decoder_profile_t registered_counters[NUM_DECODERS];
 
