@@ -100,6 +100,11 @@ parameter longint unsigned PARCORE_SYSTEM_ID = 64'hfd888c49aec6e141;
 
 parameter longint unsigned COLUMN_CHUNK_DECODER_CONFIG_ID = 64'h5c19f934407065bd;
 
+// Column chunk configs that can be enqueued per decoder, i.e. flows in flight per decoder stream
+// (reported to software, which bounds its pipeline depth with it). Other per-flow config queues on a
+// decoder stream (e.g. a stream select behind the decoder) have to be at least this deep.
+parameter int COLUMN_CHUNK_DECODER_MAX_ENQUEUED_CONFIGS = 64;
+
 // Read address space of the ColumnChunkDecoderConfig: 3 info registers plus
 // 8 profiling counters (4 input + 4 output) per decoder.
 parameter longint unsigned COLUMN_CHUNK_DECODER_INFO_REGS    = 3;
