@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from enum import IntEnum
-from coyote_test import fpga_test_case, fpga_register
+from coyote_test import fpga_test_case, fpga_register, simulation_time
 
 import pyarrow.parquet as pq
 
@@ -161,6 +161,64 @@ def _make_data_page_header_sparse_stats(
     h += b'\x15' + _encode_varint(encoding)            # inner fid2: encoding
     h += b'\x15' + _encode_varint(def_level_encoding)  # inner fid3: definition_level_encoding
     h += b'\x15' + _encode_varint(rep_level_encoding)  # inner fid4: repetition_level_encoding
+    h += b'\x1c'                                       # inner fid5: statistics STRUCT (delta=1)
+    h += stats
+    h += b'\x00'                                       # inner STOP (DataPageHeader)
+    h += b'\x00'                                       # outer STOP (PageHeader)
+    return h
+
+
+def _encode_uleb128(n: int) -> bytearray:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            break
+    return out
+
+def _encode_i64(n: int) -> bytearray:
+    """Thrift compact i64 field value: 64-bit zigzag + ULEB128."""
+    return _encode_uleb128((n << 1) ^ (n >> 63))
+
+def _make_data_page_header_i64_stats(
+    num_values: int,
+    uncompressed_size: int,
+    compressed_size: int,
+    encoding: int,
+    stats_max: bytes,
+    stats_min: bytes,
+    stats_null_count: int,
+    stats_distinct_count: int,
+    stats_max_value: bytes,
+    stats_min_value: bytes,
+) -> bytearray:
+    """DataPageHeader with Statistics as written by parquet-cpp (e.g. ClickBench hits.parquet).
+
+    null_count and distinct_count are Thrift i64 fields, so their tag bytes carry compact type 6
+    (0x16) rather than the i32 type 5 (0x15) used everywhere else in the page header.
+    """
+    stats = bytearray()
+    stats += b'\x18' + _encode_binary(stats_max)           # fid1: max (binary)
+    stats += b'\x18' + _encode_binary(stats_min)           # fid2: min (binary)
+    stats += b'\x16' + _encode_i64(stats_null_count)       # fid3: null_count (i64)
+    stats += b'\x16' + _encode_i64(stats_distinct_count)   # fid4: distinct_count (i64)
+    stats += b'\x18' + _encode_binary(stats_max_value)     # fid5: max_value (binary)
+    stats += b'\x18' + _encode_binary(stats_min_value)     # fid6: min_value (binary)
+    stats += b'\x00'                                        # STOP
+
+    h = bytearray()
+    h += b'\x15' + _encode_varint(0)                  # fid1: page_type=DATA_PAGE(0)
+    h += b'\x15' + _encode_varint(uncompressed_size)  # fid2: uncompressed_page_size
+    h += b'\x15' + _encode_varint(compressed_size)    # fid3: compressed_page_size
+    h += b'\x2c'                                       # fid5: data_page_header STRUCT (delta=2)
+    h += b'\x15' + _encode_varint(num_values)          # inner fid1: num_values
+    h += b'\x15' + _encode_varint(encoding)            # inner fid2: encoding
+    h += b'\x15' + _encode_varint(3)                   # inner fid3: definition_level_encoding=RLE
+    h += b'\x15' + _encode_varint(3)                   # inner fid4: repetition_level_encoding=RLE
     h += b'\x1c'                                       # inner fid5: statistics STRUCT (delta=1)
     h += stats
     h += b'\x00'                                       # inner STOP (DataPageHeader)
@@ -488,6 +546,84 @@ def _data_page_sparse_stats_case() -> _TestCase:
     )
 
 
+# Real column chunk 5 (EventDate, INT32) of row group 0 of ClickBench hits.parquet (written by
+# parquet-cpp 1.5.1). 62 bytes: 14-byte dictionary page header + 6-byte Snappy payload, then a
+# 35-byte data page header + 7-byte Snappy payload. The data page Statistics struct starts with
+# `36 00`: null_count (fid 3, delta 3) is a Thrift i64, i.e. compact type 6, with value 0.
+_CLICKBENCH_EVENT_DATE_CHUNK = bytes.fromhex(
+    '15041508150c4c15021504120000'                                          # dict page header
+    '040c1d3e0000'                                                          # dict payload
+    '1500150a150e2c158080371504150615061c360028041d3e000018041d3e0000000000'  # data page header
+    '05100180803700'                                                        # data payload
+)
+
+def _clickbench_event_date_case() -> _TestCase:
+    return _TestCase(
+        chunk_num_values = 450560,
+        chunk_bytes      = bytearray(_CLICKBENCH_EVENT_DATE_CHUNK),
+        pages            = [
+            _ExpectedPage(
+                page_type  = _PageType.DICT,
+                num_values = 1,
+                last       = False,
+                payload    = bytearray(_CLICKBENCH_EVENT_DATE_CHUNK[14:20]),
+            ),
+            _ExpectedPage(
+                page_type  = _PageType.HYBRID, # PLAIN_DICTIONARY
+                num_values = 450560,
+                last       = True,
+                payload    = bytearray(_CLICKBENCH_EVENT_DATE_CHUNK[55:]),
+            ),
+        ],
+    )
+
+
+def _i64_statistics_sweep_case() -> _TestCase:
+    """64 data pages with parquet-cpp style i64 Statistics (`16 00` null_count and a 6-byte
+    distinct_count varint). Every page is 129 bytes (= 1 mod 64), so page i starts at offset i
+    within a 64-byte AXI beat and every header byte is hit at every buffer alignment, including
+    the refill cycles in the middle of a varint.
+    """
+    num_pages  = 64
+    num_values = 1000
+    page_size  = 2 * 64 + 1
+
+    def header(payload_size: int) -> bytearray:
+        return _make_data_page_header_i64_stats(
+            num_values           = num_values,
+            uncompressed_size    = payload_size,
+            compressed_size      = payload_size,
+            encoding             = 0,  # PLAIN
+            stats_max            = b'\xff\xff\xff\xff\xff\xff\xff\x7f',
+            stats_min            = b'\x00\x00\x00\x00\x00\x00\x00\x80',
+            stats_null_count     = 0,
+            stats_distinct_count = 1 << 40,
+            stats_max_value      = b'\xff\xff\xff\xff\xff\xff\xff\x7f',
+            stats_min_value      = b'\x00\x00\x00\x00\x00\x00\x00\x80',
+        )
+
+    payload_size = next(n for n in range(page_size) if len(header(n)) + n == page_size)
+    hdr          = header(payload_size)
+
+    chunk = bytearray()
+    pages = []
+    for i in range(num_pages):
+        payload = bytearray((i + j) & 0xFF for j in range(payload_size))
+        chunk += hdr + payload
+        pages.append(_ExpectedPage(
+            page_type  = _PageType.PLAIN,
+            num_values = num_values,
+            last       = i == num_pages - 1,
+            payload    = payload,
+        ))
+
+    return _TestCase(
+        chunk_num_values = num_pages * num_values,
+        chunk_bytes      = chunk,
+        pages            = pages,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Build test cases from nation.parquet
 # ---------------------------------------------------------------------------
@@ -681,6 +817,8 @@ _SYNTHETIC_CASES = [
     _data_page_sparse_stats_case(),
     _deep_header_small_payload_case(),
     _page_boundary_aligned_case(),
+    _clickbench_event_date_case(),
+    _i64_statistics_sweep_case(),
 ]
 
 _PARQUET_CASES = _extract_parquet_column_chunks(_PARQUET_PATH)
@@ -694,7 +832,11 @@ class PageHeaderParserTestCase(fpga_test_case.FPGATestCase):
     alternative_vfpga_top_file = "vfpga_tops/page_header_parser_test.sv"
     debug_mode = True
 
-    def _run(self, tcs: list[_TestCase]) -> None:
+    def _run(self, tcs: list[_TestCase], sim_time_us: int | None = None) -> None:
+        if sim_time_us is not None:
+            self.overwrite_simulation_time(simulation_time.SimulationTime.fixed_time(
+                sim_time_us, simulation_time.SimulationTimeUnit.MICROSECONDS))
+
         for tc in tcs:
             self.write_register(fpga_register.vFPGARegister(3, _chunk_conf_register(tc.chunk_num_values)))
 
@@ -767,3 +909,13 @@ class PageHeaderParserTestCase(fpga_test_case.FPGATestCase):
         payload 50 = 64) and the following page header starts at byte 0 of the next beat. In that 
         alignment the parser used to get misaligned."""
         self._run([_SYNTHETIC_CASES[7]])
+
+    def test_clickbench_i64_statistics(self):
+        """Real ClickBench column chunk whose Statistics carry an i64 null_count (tag 0x36,
+        compact type 6). The parser used to only skip i32 varints (type 5) and misread the
+        null_count value 0x00 as a struct STOP."""
+        self._run([_SYNTHETIC_CASES[8]])
+
+    def test_i64_statistics_all_alignments(self):
+        """parquet-cpp style i64 Statistics fields at every offset within a 64-byte AXI beat."""
+        self._run([_SYNTHETIC_CASES[9]], sim_time_us=40)

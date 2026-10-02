@@ -256,7 +256,8 @@ always_comb begin
             if (skip_bytes == 0 && remaining_bytes != 3) begin
                 if (buffer_data[0][3:0] == 4'h1 || buffer_data[0][3:0] == 4'h2) begin // bool
                     // Do nothing
-                end else if (buffer_data[0][3:0] == 4'h5) begin // varint
+                end else if (buffer_data[0][3:0] == 4'h4 || buffer_data[0][3:0] == 4'h5 ||
+                             buffer_data[0][3:0] == 4'h6) begin // i16, i32, i64 varint
                     n_next_state = IS_END;
                     n_state      = SKIP_VARINT;
                 end else if (buffer_data[0][3:0] == 4'h8) begin // binary
@@ -274,7 +275,8 @@ always_comb begin
             end
         end
         SKIP_VARINT: begin
-            if (!buffer_data[0][7]) begin
+            // Only leave once the last varint byte is actually consumed, not in a refill cycle
+            if (remaining_bytes != 3 && !buffer_data[0][7]) begin
                 n_state = next_state;
             end
         end
