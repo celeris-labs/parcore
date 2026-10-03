@@ -19,6 +19,7 @@ struct StreamProfile {
     uint64_t starved_cycles;
     uint64_t stalled_cycles;
     uint64_t idle_cycles;
+    uint64_t last_handshakes;
 };
 
 struct DecoderProfile {
