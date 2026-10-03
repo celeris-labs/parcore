@@ -19,13 +19,22 @@ class _ColumnChunk:
     num_values: int
     chunk_bytes: bytearray   # full column-chunk: thrift headers + payloads concatenated
     stream_type: "fpga_stream.StreamType" = fpga_stream.StreamType.SIGNED_INT_64
+    # Whether the data page bodies open with a definition-level and/or repetition-level length
+    # prefix. The two are independent (wire format is [rep levels][def levels][values]). 
+    # has_rep_levels is always False, since such complex columns are not yet supported.
+    has_def_levels: bool = True
+    has_rep_levels: bool = False
 
     def _register(self) -> bytearray:
         type_t = stream_type_to_libstf_type_t(self.stream_type)
         # column_chunk_conf_t packs (MSB -> LSB) as:
-        #   compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
+        #   has_rep_levels [1 bit] | has_def_levels [1 bit] | compression_t [1 bit]
+        #   | num_values [32 bits] | type_t [3 bits]
         compression = 1 if self.compression else 0
-        packed = (compression << 35) | ((self.num_values & 0xFFFFFFFF) << 3) | (type_t & 0x7)
+        has_def_levels = 1 if self.has_def_levels else 0
+        has_rep_levels = 1 if self.has_rep_levels else 0
+        packed = ((has_rep_levels << 37) | (has_def_levels << 36) | (compression << 35) |
+                  ((self.num_values & 0xFFFFFFFF) << 3) | (type_t & 0x7))
         return bytearray(packed.to_bytes(8, 'little'))
 
 
@@ -75,11 +84,22 @@ def _make_def_levels(num_values: int) -> bytes:
     return len(rle_body).to_bytes(4, 'little') + rle_body
 
 
-def make_plain_data(items: list[int]) -> _ColumnChunk:
+def _strip_levels_prefix(body: bytearray) -> bytearray:
+    """Drop the 4-byte def-level length prefix and the level bytes it covers.
+
+    Converts a fixture page body written for an OPTIONAL column into the body a
+    REQUIRED column would have: bit_width/values first, with no prefix at all.
+    """
+    n = int.from_bytes(bytes(body[:4]), 'little')
+    return bytearray(body[4 + n:])
+
+
+def make_plain_data(items: list[int], has_def_levels: bool = True) -> _ColumnChunk:
     stream = fpga_stream.Stream(fpga_stream.StreamType.SIGNED_INT_64, items)
     values = stream.data_to_bytearray()
-    def_levels = _make_def_levels(len(items))
-    payload = bytearray(def_levels) + bytearray(values)
+    payload = bytearray(values)
+    if has_def_levels:
+        payload = bytearray(_make_def_levels(len(items))) + payload
     hdr = _make_data_page_header(
         num_values=len(items),
         uncompressed_size=len(payload),
@@ -91,6 +111,7 @@ def make_plain_data(items: list[int]) -> _ColumnChunk:
         compression=False,
         num_values=len(items),
         chunk_bytes=chunk,
+        has_def_levels=has_def_levels,
     )
 
 
@@ -110,8 +131,11 @@ def make_tricky(
     stream_type: "fpga_stream.StreamType" = fpga_stream.StreamType.SIGNED_INT_64,
     dict_values: list[int] = list(range(10, 20)),
     trailing_plain: bool = True,
+    has_def_levels: bool = True,
 ) -> _ColumnChunk:
     hybrid_body = read_bytes(filename + '_chunk_decompressed.bin')
+    if not has_def_levels:
+        hybrid_body = _strip_levels_prefix(hybrid_body)
 
     chunk = bytearray()
 
@@ -124,9 +148,10 @@ def make_tricky(
     )
     chunk += dict_body
 
-    # `factor` HYBRID pages. Each body already carries its 4-byte def_levels
-    # length prefix + def_levels + RLE/BPE-encoded payload — PageHeaderParser's
-    # SKIP_DEF_LEVELS state will strip the def_levels prefix at runtime.
+    # `factor` HYBRID pages. With has_def_levels the body carries its 4-byte
+    # def_levels length prefix + def_levels + RLE/BPE-encoded payload, and
+    # HybridPageDecoder skips the prefix to find the bit_width byte; without it
+    # the body opens directly on the bit_width byte.
     for _ in range(factor):
         chunk += _make_data_page_header(
             num_values=num_values,
@@ -142,8 +167,9 @@ def make_tricky(
     # path to be reset via the injected dummy beat (see ColumnChunkDecoder).
     if trailing_plain:
         plain_values = fpga_stream.Stream(stream_type, items).data_to_bytearray()
-        plain_def_levels = _make_def_levels(len(items))
-        plain_body = bytearray(plain_def_levels) + bytearray(plain_values)
+        plain_body = bytearray(plain_values)
+        if has_def_levels:
+            plain_body = bytearray(_make_def_levels(len(items))) + plain_body
         chunk += _make_data_page_header(
             num_values=len(items),
             uncompressed_size=len(plain_body),
@@ -158,6 +184,7 @@ def make_tricky(
         num_values=total_num_values,
         chunk_bytes=chunk,
         stream_type=stream_type,
+        has_def_levels=has_def_levels,
     )
 
 
@@ -268,3 +295,47 @@ class ColumnChunkDecoderTestCase(fpga_test_case.FPGATestCase):
             [chunk_a, chunk_b],
             [_RLE_OUTPUT + _PLAIN_OUTPUT, _RLE_OUTPUT],
         )
+
+    
+    # -- REQUIRED columns (no repetition/definition levels) -----------------
+    #
+    # A Parquet column with max_definition_level == 0 and
+    # max_repetition_level == 0 writes no levels, so its page bodies have no
+    # 4-byte level length prefix.
+    
+    def test_plain_page_without_levels(self):
+        items = list(range(1, 11))
+        self.run_chunks([make_plain_data(items, has_def_levels=False)], [items])
+
+    def test_plain_page_without_levels_many_beats(self):
+        self.run_chunks(
+            [make_plain_data(_PLAIN_OUTPUT, has_def_levels=False)],
+            [_PLAIN_OUTPUT],
+        )
+
+    def test_hybrid_page_without_levels(self):
+        chunk = make_tricky(
+            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 1,
+            trailing_plain=False,
+            has_def_levels=False,
+        )
+        self.run_chunks([chunk], [_RLE_OUTPUT])
+
+    def test_plain_after_hybrid_without_levels(self):
+        chunk = make_tricky(
+            'rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1,
+            has_def_levels=False,
+        )
+        self.run_chunks([chunk], [_RLE_OUTPUT + _PLAIN_OUTPUT])
+
+    def test_mixed_levels_across_chunks(self):
+        items = list(range(1, 11))
+        self.run_chunks(
+            [
+                _parquet_chunk('rle_data.parquet'),
+                make_plain_data(items, has_def_levels=False),
+                make_plain_data(_PLAIN_OUTPUT, has_def_levels=True),
+            ],
+            [_RLE_OUTPUT, items, _PLAIN_OUTPUT],
+        )
+

@@ -33,6 +33,10 @@ struct ColumnChunk {
   Compression compression;
   uint64_t offset;
   uint64_t total_compressed_size;
+  // Whether this column's data pages carry a repetition-level section and/or a
+  // definition-level section.
+  bool has_rep_levels = true;
+  bool has_def_levels = true;
 
   static ColumnChunk from(std::istream &is);
   bool operator==(const ColumnChunk &rhs) const;
@@ -96,6 +100,8 @@ template <> struct hash<parcore::metadata::ColumnChunk> {
     hash_combine(seed, cc.compression);
     hash_combine(seed, cc.offset);
     hash_combine(seed, cc.total_compressed_size);
+    hash_combine(seed, cc.has_rep_levels);
+    hash_combine(seed, cc.has_def_levels);
 
     return seed;
   }

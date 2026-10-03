@@ -71,8 +71,15 @@ AXIToNData #(data8_t, 64) inst_axi_to_ndata (
 // Wrap the per-page num_values config into the data_i conf interface. Each
 // configured page is treated as its own hybrid-page group (keep=1, last=1),
 // so the decoder emits one last per page.
-data_i #(data32_t) hp_conf(clk, rst_n);
-assign hp_conf.data    = conf.data;
+//
+// Every fixture driven through this top carries definition levels, so
+// has_def_levels is tied high here. The levels-free page layout (and the
+// independent repetition-level flag, stripped upstream of HybridPageDecoder
+// in column_chunk_decoder.sv, not exercised by this standalone top) is
+// covered end-to-end by column_chunk_decoder_test.py, which configures both
+// flags through column_chunk_conf_t.
+data_i #(hybrid_page_conf_t) hp_conf(clk, rst_n);
+assign hp_conf.data    = '{has_def_levels: 1'b1, num_values: conf.data};
 assign hp_conf.keep    = 1'b1;
 assign hp_conf.last    = 1'b1;
 assign hp_conf.valid   = conf.valid;

@@ -19,6 +19,7 @@ struct StreamProfile {
     uint64_t starved_cycles;
     uint64_t stalled_cycles;
     uint64_t idle_cycles;
+    uint64_t last_handshakes;
 };
 
 struct DecoderProfile {
@@ -41,13 +42,18 @@ class ColumnChunkDecoderConfig : public libstf::Config {
     /**
      * Configures the ColumnChunkDecoder to process the provided column chunk.
      *
-     * @param decoder     The decoder to configure.
-     * @param compression Whether this chunk is SNAPPY compressed or not.
-     * @param num_values  The total number of values in this chunk.
-     * @param typ         The type of values in this chunk.
+     * @param decoder        The decoder to configure.
+     * @param compression    Whether this chunk is SNAPPY compressed or not.
+     * @param num_values     The total number of values in this chunk.
+     * @param typ            The type of values in this chunk.
+     * @param has_def_levels Whether this chunk's data pages carry a definition-level section, i.e.
+     *                       whether the column's Parquet schema has max_definition_level > 0.
+     * @param has_rep_levels Whether this chunk's data pages carry a repetition-level section, i.e.
+     *                       whether the column's Parquet schema has max_repetition_level > 0.
      */
     void enqueue_column_chunk(libstf::stream_t decoder, metadata::Compression compression,
-                              uint64_t num_values, libstf::type_t typ);
+                              uint64_t num_values, libstf::type_t typ, bool has_def_levels,
+                              bool has_rep_levels);
 
     const libstf::stream_t num_decoders() const;
     const size_t           maximum_num_enqueued_configs() const;

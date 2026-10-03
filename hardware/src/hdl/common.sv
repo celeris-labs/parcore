@@ -80,6 +80,10 @@ typedef enum logic [1:0] {
 } page_type_t;
 
 typedef struct packed {
+    // Whether this chunk's data pages carry a repetition-level section and/or a
+    // definition-level section.
+    logic         has_rep_levels;
+    logic         has_def_levels;
     compression_t compression;
     data32_t      num_values;
     type_t        typ;
@@ -91,6 +95,15 @@ typedef struct packed {
     logic       last;
 } page_conf_t;
 
+// Per-page configuration for the HybridPageDecoder. Only carries
+// has_def_levels: the repetition-level section (if any) is stripped by a
+// StripLevels instance upstream of HybridPageDecoder, so by the time this
+// module sees the data only a definition-level section can remain.
+typedef struct packed {
+    logic    has_def_levels;
+    data32_t num_values;
+} hybrid_page_conf_t;
+
 typedef struct packed {
     stream_profile_t in;
     stream_profile_t out;
@@ -99,6 +112,11 @@ typedef struct packed {
 parameter longint unsigned PARCORE_SYSTEM_ID = 64'hfd888c49aec6e141;
 
 parameter longint unsigned COLUMN_CHUNK_DECODER_CONFIG_ID = 64'h5c19f934407065bd;
+
+// Column chunk configs that can be enqueued per decoder, i.e. flows in flight per decoder stream
+// (reported to software, which bounds its pipeline depth with it). Other per-flow config queues on a
+// decoder stream (e.g. a stream select behind the decoder) have to be at least this deep.
+parameter int COLUMN_CHUNK_DECODER_MAX_ENQUEUED_CONFIGS = 64;
 
 // Read address space of the ColumnChunkDecoderConfig: 3 info registers plus
 // 8 profiling counters (4 input + 4 output) per decoder.

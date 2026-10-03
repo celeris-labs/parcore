@@ -14,6 +14,13 @@ import parcore::*;
 // parsed as the bit_width. The metadata (bit_width, offest, num_values) is
 // then piped to the RunDecoder component, along with the input (including
 // current databeat). Num values comes from the conf stream.
+//
+// The leading length prefix only exists when the page carries definition
+// levels: conf.has_def_levels selects an offset of 0 (bit_width is the first
+// byte) when there are none. The repetition-level section, if the page has
+// one, is stripped by a separate StripLevels instance upstream of this
+// module (see column_chunk_decoder.sv), so by the time data reaches here at
+// most one section -- the definition-level one -- can remain.
 module HybridPageDecoder #(
     parameter type data_t,
     parameter NUM_ELEMENTS,
@@ -22,7 +29,7 @@ module HybridPageDecoder #(
     input logic clk,
     input logic rst_n,
 
-    data_i.s conf,           // #(data32_t) for num_values
+    data_i.s conf,           // #(hybrid_page_conf_t) for num_values + has_def_levels
 
     ndata_i.s in,            // #(data8_t, NUM_BYTES)
     ndata_i.m out            // #(data_t, NUM_ELEMENTS)
@@ -95,8 +102,16 @@ offset_t bit_width_offset;
 valid_i #(bit_width_t) keep_bit_width(clk, reset_synced);
 assign bit_width = keep_bit_width.valid ? keep_bit_width.data : in.data[bit_width_offset];
 
+// `has_def_levels` of the page currently being set up. process_first_databeat()
+// can run in the very cycle the conf beat is accepted (ST_IDLE), when the
+// registered copy is not updated yet, so take it straight off the wire there;
+// from ST_WAIT onwards the conf beat is gone and the registered copy is the
+// only source.
+logic page_has_def_levels, cur_has_def_levels;
+assign cur_has_def_levels = (state == ST_IDLE) ? conf.data.has_def_levels : page_has_def_levels;
+
 offset_t actual_offset, next_offset;
-assign actual_offset = NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0];
+assign actual_offset = cur_has_def_levels ? (NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0]) : '0;
 assign next_offset = offset - NUM_BYTES;
 assign next_num_values = num_values - out_num_values;
 
@@ -137,13 +152,14 @@ always_ff @(posedge clk) begin
         case (state)
             ST_IDLE: begin
                 if (conf.valid) begin
-                    page_last <= conf.last;
+                    page_last           <= conf.last;
+                    page_has_def_levels <= conf.data.has_def_levels;
 
                     if (!conf.keep) begin
                         // Emit a single empty data beat with the last set high to end the stream.
                         state <= ST_DUMMY;
                     end else begin
-                        num_values <= conf.data;
+                        num_values <= conf.data.num_values;
 
                         if (in.valid) begin
                             process_first_databeat();

@@ -79,6 +79,14 @@ template <typename Enum> static void read_enum(std::istream &is, Enum *dst) {
   *dst = static_cast<Enum>(val);
 }
 
+static void read_bool(std::istream &is, bool *dst) {
+  uint8_t val;
+  if (!is.read(reinterpret_cast<char *>(&val), 1))
+    throw std::runtime_error("unexpected EOF reading bool");
+
+  *dst = val != 0;
+}
+
 std::string read_string(std::istream &is) {
   uint32_t n;
   read_exact(is, &n, sizeof(uint32_t));
@@ -96,6 +104,8 @@ ColumnChunk ColumnChunk::from(std::istream &is) {
   read_enum(is, &c.compression);
   read_exact(is, &c.offset, sizeof(c.offset));
   read_exact(is, &c.total_compressed_size, sizeof(c.total_compressed_size));
+  read_bool(is, &c.has_rep_levels);
+  read_bool(is, &c.has_def_levels);
 
   return c;
 }
@@ -103,7 +113,8 @@ ColumnChunk ColumnChunk::from(std::istream &is) {
 bool ColumnChunk::operator==(const ColumnChunk &rhs) const {
   return type == rhs.type && num_values == rhs.num_values &&
          compression == rhs.compression && offset == rhs.offset &&
-         total_compressed_size == rhs.total_compressed_size;
+         total_compressed_size == rhs.total_compressed_size &&
+         has_rep_levels == rhs.has_rep_levels && has_def_levels == rhs.has_def_levels;
 }
 
 RowGroup RowGroup::from(std::istream &is) {
