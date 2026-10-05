@@ -100,7 +100,27 @@ DataDemultiplexer #(NUM_IN) inst_multiplexer (
 );
 
 // ------ Hybrid decoder + dictionary wiring ------
-data_i #(data32_t) hybrid_conf(clk, reset_synced);
+data_i #(hybrid_page_conf_t) hybrid_conf(clk, reset_synced);
+
+// Repetition levels (if any) come before definition levels in the wire
+// format, and this is the only decoder that needs both: strip the
+// repetition-level section here, upstream, so HybridPageDecoder (which
+// strips the definition-level section internally, see hybrid_conf below)
+// only ever has to deal with one section.
+ready_valid_i #(logic) hybrid_rep_levels(clk, reset_synced);
+ndata_i #(data8_t, DATABEAT_SIZE) hybrid_rep_stripped(clk, reset_synced);
+
+StripLevels #(
+    .NUM_BYTES(DATABEAT_SIZE)
+) inst_strip_hybrid_rep_levels (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .levels(hybrid_rep_levels),
+
+    .in(ins[IN_HYBRID]),
+    .out(hybrid_rep_stripped)
+);
 
 ndata_i #(id_t, NUM_IDS) dict_ids(clk, reset_synced);
 HybridPageDecoder #(
@@ -112,7 +132,7 @@ HybridPageDecoder #(
     .rst_n(reset_synced),
 
     .conf(hybrid_conf),
-    .in(ins[IN_HYBRID]),
+    .in(hybrid_rep_stripped),
 
     .out(dict_ids)
 );
@@ -162,7 +182,14 @@ TypedRewriteLast #(
 
 // ------ Plain wiring ----------------------------
 ready_valid_i #(type_t) plain_type(clk, reset_synced);
+// One beat per plain page each: whether its body opens with a repetition-level
+// length prefix, and (once that section, if any, is stripped) a
+// definition-level length prefix. Chained in wire-format order:
+// [rep levels][def levels][values].
+ready_valid_i #(logic)  plain_rep_levels(clk, reset_synced);
+ready_valid_i #(logic)  plain_def_levels(clk, reset_synced);
 ndata_i #(data8_t, DATABEAT_SIZE) plain_in(clk, reset_synced);
+ndata_i #(data8_t, DATABEAT_SIZE) plain_rep_stripped(clk, reset_synced);
 ndata_i #(data8_t, DATABEAT_SIZE) plain_stripped(clk, reset_synced), plain_out(clk, reset_synced);
 
 NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_plain_in_skid_buffer (
@@ -175,11 +202,25 @@ NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_plain_in_skid_buffer (
 
 StripLevels #(
     .NUM_BYTES(DATABEAT_SIZE)
-) inst_strip_levels (
+) inst_strip_plain_rep_levels (
     .clk(clk),
     .rst_n(reset_synced),
 
+    .levels(plain_rep_levels),
+
     .in(plain_in),
+    .out(plain_rep_stripped)
+);
+
+StripLevels #(
+    .NUM_BYTES(DATABEAT_SIZE)
+) inst_strip_plain_def_levels (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .levels(plain_def_levels),
+
+    .in(plain_rep_stripped),
     .out(plain_stripped)
 );
 
@@ -243,6 +284,16 @@ state_t state;
 type_t typ;
 logic last_page;
 
+// Whether this chunk's pages carry a repetition-level section and/or a
+// definition-level section, latched from the chunk configuration and
+// forwarded per page to whichever StripLevels instance (or, for the
+// definition-level section of hybrid pages, HybridPageDecoder itself) needs
+// to skip that section's length prefix. The two are independent -- a page can
+// have either, both, or neither. Dictionary pages never carry levels of any
+// kind, so the dict path does not need either flag.
+logic has_def_levels;
+logic has_rep_levels;
+
 // Whether this chunk has had a dictionary page (and thus whether the dictionary path needs a last 
 // data beat) for the TypedDictionary to reset it's internal state.
 logic dict_seen;
@@ -253,11 +304,14 @@ always_ff @(posedge clk) begin
         num_values.valid        <= 1'b0;
         hybrid_num_values.valid <= 1'b0;
 
-        hybrid_conf.valid <= 1'b0;
-        dict_type.valid   <= 1'b0;
-        plain_type.valid  <= 1'b0;
-        in_select.valid   <= 1'b0;
-        out_select.valid  <= 1'b0;
+        hybrid_conf.valid       <= 1'b0;
+        dict_type.valid         <= 1'b0;
+        plain_type.valid        <= 1'b0;
+        plain_rep_levels.valid  <= 1'b0;
+        plain_def_levels.valid  <= 1'b0;
+        hybrid_rep_levels.valid <= 1'b0;
+        in_select.valid         <= 1'b0;
+        out_select.valid        <= 1'b0;
 
         typ       <= BYTE_T;
         last_page <= 'X;
@@ -271,9 +325,11 @@ always_ff @(posedge clk) begin
                     num_values.data  <= chunk_confs[0].data.num_values;
                     num_values.valid <= 1'b1;
 
-                    typ       <= chunk_confs[0].data.typ;
-                    dict_seen <= 1'b0;
-                    state     <= ST_CONFIGURED;
+                    typ            <= chunk_confs[0].data.typ;
+                    has_def_levels <= chunk_confs[0].data.has_def_levels;
+                    has_rep_levels <= chunk_confs[0].data.has_rep_levels;
+                    dict_seen      <= 1'b0;
+                    state          <= ST_CONFIGURED;
                 end
             end
             ST_CONFIGURED: begin
@@ -294,10 +350,18 @@ always_ff @(posedge clk) begin
                         PAGE_TYPE_HYBRID: begin
                             in_select.data <= IN_HYBRID;
 
-                            hybrid_conf.data  <= page_conf.data.num_values;
-                            hybrid_conf.keep  <= 1'b1;
-                            hybrid_conf.last  <= page_conf.data.last;
-                            hybrid_conf.valid <= 1'b1;
+                            // Repetition levels (if any) are stripped ahead of
+                            // this decoder by inst_strip_hybrid_rep_levels;
+                            // definition levels (if any) are stripped
+                            // internally by HybridPageDecoder via hybrid_conf.
+                            hybrid_rep_levels.data  <= has_rep_levels;
+                            hybrid_rep_levels.valid <= 1'b1;
+
+                            hybrid_conf.data.num_values     <= page_conf.data.num_values;
+                            hybrid_conf.data.has_def_levels <= has_def_levels;
+                            hybrid_conf.keep                <= 1'b1;
+                            hybrid_conf.last                <= page_conf.data.last;
+                            hybrid_conf.valid               <= 1'b1;
 
                             hybrid_num_values.data  <= page_conf.data.num_values;
                             hybrid_num_values.valid <= 1'b1;
@@ -318,6 +382,12 @@ always_ff @(posedge clk) begin
 
                             plain_type.data  <= typ;
                             plain_type.valid <= 1'b1;
+
+                            plain_rep_levels.data  <= has_rep_levels;
+                            plain_rep_levels.valid <= 1'b1;
+
+                            plain_def_levels.data  <= has_def_levels;
+                            plain_def_levels.valid <= 1'b1;
 
                             out_select.data  <= OUT_PLAIN;
                             out_select.valid <= 1'b1;
@@ -351,6 +421,18 @@ always_ff @(posedge clk) begin
                     plain_type.valid <= 1'b0;
                 end
 
+                if (plain_rep_levels.ready) begin
+                    plain_rep_levels.valid <= 1'b0;
+                end
+
+                if (plain_def_levels.ready) begin
+                    plain_def_levels.valid <= 1'b0;
+                end
+
+                if (hybrid_rep_levels.ready) begin
+                    hybrid_rep_levels.valid <= 1'b0;
+                end
+
                 if (in_select.ready) begin
                     in_select.valid <= 1'b0;
                 end
@@ -371,7 +453,7 @@ always_ff @(posedge clk) begin
                 //   a new column chunk configuration next.
                 // - CONFIGURED if this was not the last page and this column
                 //   chunk has more pages to be fully decoded.
-                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !plain_type.valid && !in_select.valid && !out_select.valid) begin
+                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !plain_type.valid && !plain_rep_levels.valid && !plain_def_levels.valid && !hybrid_rep_levels.valid && !in_select.valid && !out_select.valid) begin
                     if (last_page) begin
                         state <= ST_IDLE;
                     end else begin
