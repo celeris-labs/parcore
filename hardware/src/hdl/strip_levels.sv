@@ -12,6 +12,9 @@ import parcore::*;
  * This module strips the repetition and definition levels from the start of a
  * page and emits a normalized stream.
  *
+ * `conf` carries one is_required flag per page. Pages of REQUIRED columns have
+ * no levels and are forwarded unchanged.
+ *
  * A page starts with a 4-byte length prefix followed by that many level bytes,
  * i.e. the first `NUM_BYTES_OFFSET + <prefix>` bytes are levels that have to be
  * discarded. Because everything after the header is dense, the only mismatch
@@ -26,6 +29,8 @@ module StripLevels #(
 ) (
     input logic clk,
     input logic rst_n,
+
+    ready_valid_i.s conf,    // #(logic) is_required
 
     ndata_i.s in,            // #(data8_t, NUM_BYTES)
     ndata_i.m out            // #(data8_t, NUM_BYTES)
@@ -47,7 +52,7 @@ ndata_i #(data8_t, NUM_BYTES) out_inner(clk, reset_synced);
 // has its leading `remaining_offset` bytes masked out of `keep` and feeds the barrel shifter, which 
 // rotates the remaining data so it becomes front-packed.
 typedef enum logic[1:0] {
-    ST_WAIT,    // Reading the length prefix of a new page
+    ST_WAIT,    // Waiting for the page conf and reading the length prefix of a new page
     ST_CONSUME, // Dropping whole beats while remaining_offset >= NUM_BYTES
     ST_PIPE     // Forwarding (masked) beats into the normalizer
 } state_t;
@@ -65,13 +70,20 @@ always_ff @(posedge clk) begin
     end else begin
         case (state)
             ST_WAIT: begin
-                if (in.valid) begin
-                    // 4 prefix bytes + the level length encoded in those bytes.
-                    automatic header_offset_t actual_offset = NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0];
+                if (conf.valid && conf.ready) begin
+                    if (conf.data) begin
+                        // REQUIRED column without levels: nothing to strip, forward the page as is.
+                        remaining_offset <= '0;
+                        shift_offset     <= '0;
+                        state            <= ST_PIPE;
+                    end else begin
+                        // 4 prefix bytes + the level length encoded in those bytes.
+                        automatic header_offset_t actual_offset = NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0];
 
-                    remaining_offset <= actual_offset;
-                    shift_offset     <= (NUM_BYTES - actual_offset[OFFSET_WIDTH - 1:0]) % NUM_BYTES;
-                    state            <= (actual_offset >= NUM_BYTES) ? ST_CONSUME : ST_PIPE;
+                        remaining_offset <= actual_offset;
+                        shift_offset     <= (NUM_BYTES - actual_offset[OFFSET_WIDTH - 1:0]) % NUM_BYTES;
+                        state            <= (actual_offset >= NUM_BYTES) ? ST_CONSUME : ST_PIPE;
+                    end
                 end
             end
             ST_CONSUME: begin
@@ -96,7 +108,9 @@ always_ff @(posedge clk) begin
     end
 end
 
-assign in.ready = (state == ST_CONSUME) || (state == ST_PIPE && shifter_in.ready);
+// The length prefix is only needed when the page has levels. conf.data is only defined while valid.
+assign conf.ready = (state == ST_WAIT) && (in.valid || (conf.valid && conf.data));
+assign in.ready   = (state == ST_CONSUME) || (state == ST_PIPE && shifter_in.ready);
 
 // ------- Masking + barrel shifter ---------------
 ndata_i #(data8_t, NUM_BYTES) shifter_in(clk, reset_synced), shifter_out(clk, reset_synced);

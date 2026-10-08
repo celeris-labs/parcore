@@ -33,6 +33,10 @@ struct ColumnChunk {
   Compression compression;
   uint64_t offset;
   uint64_t total_compressed_size;
+  // True for REQUIRED columns, i.e. max_definition_level == 0, whose data pages carry no definition
+  // levels. A REQUIRED leaf below an OPTIONAL group has definition levels and is thus not required.
+  // Not part of the binary format read by from(), which keeps the default.
+  bool is_required = false;
 
   static ColumnChunk from(std::istream &is);
   bool operator==(const ColumnChunk &rhs) const;

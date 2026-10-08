@@ -52,6 +52,13 @@ def custom_page_header(data: bytearray, size: int) -> bytearray:
     return new_header + data
 
 
+def strip_def_levels(data: bytearray) -> bytearray:
+    """Turns an OPTIONAL-column page body into a REQUIRED-column one by dropping
+    the 4-byte length prefix and the definition levels, leaving bit_width + runs."""
+    skip = int.from_bytes(data[:4], 'little')
+    return data[skip+4:]
+
+
 # Reference outputs shared across cases.
 _RLE_OUTPUT = [i - 10 for i in range(10, 20) for _ in range(i)]
 _BPE_OUTPUT = list(range(10 - 10, 20 - 10)) * 15
@@ -66,20 +73,27 @@ class HybridPageDecoderTestCase(fpga_test_case.FPGATestCase):
     debug_mode = True
     # verbose_logging = True
 
-    def run_pages(self, inputs: list[bytearray], outputs: list[list[int]]):
+    def run_pages(self, inputs: list[bytearray], outputs: list[list[int]],
+                  is_required: list[bool] | None = None):
         """Drive the decoder with one or more pages and assert their outputs.
 
-        Each page is streamed in and its num_values is written to the
-        per-page config register (offset 3); the expected outputs are asserted.
+        Each page is streamed in and its num_values plus is_required flag
+        (hybrid_page_conf_t: is_required at bit 32) is written to the per-page
+        config register (offset 3); the expected outputs are asserted. Pages are
+        of OPTIONAL columns (with definition levels) unless `is_required` says
+        otherwise.
         """
+        if is_required is None:
+            is_required = [False] * len(outputs)
         for input in inputs:
             self.set_stream_input(0, input)
-        for output in outputs:
+        for output, required in zip(outputs, is_required):
             self.set_expected_output(
                 0, fpga_stream.Stream(fpga_stream.StreamType.SIGNED_INT_32, output)
             )
+            conf = (int(required) << 32) | len(output)
             self.write_register(
-                fpga_register.vFPGARegister(3, bytearray(len(output).to_bytes(8, 'little')))
+                fpga_register.vFPGARegister(3, bytearray(conf.to_bytes(8, 'little')))
             )
 
         self.simulate_fpga()
@@ -152,4 +166,23 @@ class HybridPageDecoderTestCase(fpga_test_case.FPGATestCase):
              list(range(128 - 118, 256 - 118)) * 2 +
              [i - 10 for i in range(10, 20) for _ in range(i)] +
              list(range(128 - 118, 256 - 118)) * 2],
+        )
+
+    def test_required_rle_page(self):
+        # REQUIRED column: no definition levels, bit_width is the first byte.
+        self.run_pages(
+            [strip_def_levels(read_data('rle_data_rg0_col0_chunk_decompressed.bin'))],
+            [_RLE_OUTPUT],
+            is_required=[True],
+        )
+
+    def test_required_and_optional_pages(self):
+        # Alternate REQUIRED and OPTIONAL pages to check the flag is taken per page.
+        self.run_pages(
+            [strip_def_levels(read_data('rle_data_rg0_col0_chunk_decompressed.bin')),
+             read_data('bpe_data_rg0_col0_chunk_decompressed.bin'),
+             strip_def_levels(read_data('bpe_data_rg0_col0_chunk_decompressed.bin')),
+             read_data('rle_data_rg0_col0_chunk_decompressed.bin')],
+            [_RLE_OUTPUT, _BPE_OUTPUT, _BPE_OUTPUT, _RLE_OUTPUT],
+            is_required=[True, False, True, False],
         )

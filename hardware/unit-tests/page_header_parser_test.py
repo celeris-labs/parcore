@@ -794,11 +794,13 @@ def _chunk_conf_register(num_values: int) -> bytearray:
     """ColumnChunkDecoderConfig packed register value (single reg at offset 3).
 
     column_chunk_conf_t packs (MSB -> LSB) as:
-      compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
+      is_required [1 bit] | compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
     """
+    is_required = 0  # unused here
     compression = 0  # RAW
     type_t      = 2  # INT64 (unused here)
-    packed = (compression << 35) | ((num_values & 0xFFFFFFFF) << 3) | (type_t & 0x7)
+    packed = ((is_required << 36) | (compression << 35) |
+              ((num_values & 0xFFFFFFFF) << 3) | (type_t & 0x7))
     return bytearray(packed.to_bytes(8, 'little'))
 
 

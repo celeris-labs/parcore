@@ -103,7 +103,8 @@ ColumnChunk ColumnChunk::from(std::istream &is) {
 bool ColumnChunk::operator==(const ColumnChunk &rhs) const {
   return type == rhs.type && num_values == rhs.num_values &&
          compression == rhs.compression && offset == rhs.offset &&
-         total_compressed_size == rhs.total_compressed_size;
+         total_compressed_size == rhs.total_compressed_size &&
+         is_required == rhs.is_required;
 }
 
 RowGroup RowGroup::from(std::istream &is) {

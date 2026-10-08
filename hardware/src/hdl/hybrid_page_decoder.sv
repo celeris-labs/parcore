@@ -14,6 +14,8 @@ import parcore::*;
 // parsed as the bit_width. The metadata (bit_width, offest, num_values) is
 // then piped to the RunDecoder component, along with the input (including
 // current databeat). Num values comes from the conf stream.
+// Pages of REQUIRED columns (conf.data.is_required) have no definition levels,
+// so the bit_width is the very first byte of the page.
 module HybridPageDecoder #(
     parameter type data_t,
     parameter NUM_ELEMENTS,
@@ -22,7 +24,7 @@ module HybridPageDecoder #(
     input logic clk,
     input logic rst_n,
 
-    data_i.s conf,           // #(data32_t) for num_values
+    data_i.s conf,           // #(hybrid_page_conf_t)
 
     ndata_i.s in,            // #(data8_t, NUM_BYTES)
     ndata_i.m out            // #(data_t, NUM_ELEMENTS)
@@ -36,6 +38,7 @@ offset_t    offset;
 bit_width_t bit_width;
 data32_t    num_values, next_num_values;
 logic       page_last;
+logic       is_required;
 // Set once the input `last` beat for the current page has been consumed. Used
 // to decide whether the page still has trailing (padding) bytes to drain after
 // the RunDecoder has produced num_values.
@@ -95,8 +98,13 @@ offset_t bit_width_offset;
 valid_i #(bit_width_t) keep_bit_width(clk, reset_synced);
 assign bit_width = keep_bit_width.valid ? keep_bit_width.data : in.data[bit_width_offset];
 
+// The first databeat may be processed in the same cycle the conf is consumed (ST_IDLE), before
+// is_required is registered.
+logic cur_is_required;
+assign cur_is_required = state == ST_IDLE ? conf.data.is_required : is_required;
+
 offset_t actual_offset, next_offset;
-assign actual_offset = NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0];
+assign actual_offset = cur_is_required ? '0 : NUM_BYTES_OFFSET + in.data[NUM_BYTES_OFFSET - 1:0];
 assign next_offset = offset - NUM_BYTES;
 assign next_num_values = num_values - out_num_values;
 
@@ -143,7 +151,8 @@ always_ff @(posedge clk) begin
                         // Emit a single empty data beat with the last set high to end the stream.
                         state <= ST_DUMMY;
                     end else begin
-                        num_values <= conf.data;
+                        num_values  <= conf.data.num_values;
+                        is_required <= conf.data.is_required;
 
                         if (in.valid) begin
                             process_first_databeat();

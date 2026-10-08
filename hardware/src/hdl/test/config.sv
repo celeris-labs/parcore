@@ -14,7 +14,7 @@ module HybridPageDecoderConfig (
     write_config_i.s write_config,
     read_config_i.s  read_config,
 
-    ready_valid_i.m out // #(data32_t)
+    ready_valid_i.m out // #(hybrid_page_conf_t)
 );
 
 
@@ -35,7 +35,7 @@ ConfigReadRegisterFile #(
 );
 
 // -- Write ----------------------------------------------------------------------------------------
-ConfigWriteFIFO #(0, 8, data32_t) inst_num_values (clk, reset_synced, write_config, out);
+ConfigWriteFIFO #(0, 8, hybrid_page_conf_t) inst_page_conf (clk, reset_synced, write_config, out);
 
 endmodule
 
