@@ -82,6 +82,7 @@ Metadata from_file(const std::string &path) {
                                                : cc->data_page_offset());
       chunk.total_compressed_size =
           static_cast<uint64_t>(cc->total_compressed_size());
+      chunk.is_required = schema->Column(j)->max_definition_level() == 0;
       group.chunks.push_back(chunk);
     }
     meta.groups.push_back(std::move(group));

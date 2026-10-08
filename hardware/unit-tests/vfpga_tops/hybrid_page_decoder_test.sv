@@ -42,7 +42,7 @@ GlobalConfig #(
     .read_configs(read_configs)
 );
 
-ready_valid_i #(data32_t) conf(.*);
+ready_valid_i #(hybrid_page_conf_t) conf(.*);
 HybridPageDecoderConfig inst_hybrid_page_decoder_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -68,10 +68,10 @@ AXIToNData #(data8_t, 64) inst_axi_to_ndata (
 );
 
 /* -- DESIGN WIRING ----------------------------------------------------- */
-// Wrap the per-page num_values config into the data_i conf interface. Each
-// configured page is treated as its own hybrid-page group (keep=1, last=1),
-// so the decoder emits one last per page.
-data_i #(data32_t) hp_conf(clk, rst_n);
+// Wrap the per-page (num_values, is_required) config into the data_i conf
+// interface. Each configured page is treated as its own hybrid-page group
+// (keep=1, last=1), so the decoder emits one last per page.
+data_i #(hybrid_page_conf_t) hp_conf(clk, rst_n);
 assign hp_conf.data    = conf.data;
 assign hp_conf.keep    = 1'b1;
 assign hp_conf.last    = 1'b1;

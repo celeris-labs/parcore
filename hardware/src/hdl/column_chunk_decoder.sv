@@ -100,7 +100,7 @@ DataDemultiplexer #(NUM_IN) inst_multiplexer (
 );
 
 // ------ Hybrid decoder + dictionary wiring ------
-data_i #(data32_t) hybrid_conf(clk, reset_synced);
+data_i #(hybrid_page_conf_t) hybrid_conf(clk, reset_synced);
 
 ndata_i #(id_t, NUM_IDS) dict_ids(clk, reset_synced);
 HybridPageDecoder #(
@@ -162,6 +162,7 @@ TypedRewriteLast #(
 
 // ------ Plain wiring ----------------------------
 ready_valid_i #(type_t) plain_type(clk, reset_synced);
+ready_valid_i #(logic)  plain_required(clk, reset_synced); // is_required
 ndata_i #(data8_t, DATABEAT_SIZE) plain_in(clk, reset_synced);
 ndata_i #(data8_t, DATABEAT_SIZE) plain_stripped(clk, reset_synced), plain_out(clk, reset_synced);
 
@@ -178,6 +179,8 @@ StripLevels #(
 ) inst_strip_levels (
     .clk(clk),
     .rst_n(reset_synced),
+
+    .conf(plain_required),
 
     .in(plain_in),
     .out(plain_stripped)
@@ -241,6 +244,7 @@ typedef enum logic [1:0] {
 state_t state;
 
 type_t typ;
+logic is_required;
 logic last_page;
 
 // Whether this chunk has had a dictionary page (and thus whether the dictionary path needs a last 
@@ -253,15 +257,17 @@ always_ff @(posedge clk) begin
         num_values.valid        <= 1'b0;
         hybrid_num_values.valid <= 1'b0;
 
-        hybrid_conf.valid <= 1'b0;
-        dict_type.valid   <= 1'b0;
-        plain_type.valid  <= 1'b0;
-        in_select.valid   <= 1'b0;
-        out_select.valid  <= 1'b0;
+        hybrid_conf.valid    <= 1'b0;
+        dict_type.valid      <= 1'b0;
+        plain_type.valid     <= 1'b0;
+        plain_required.valid <= 1'b0;
+        in_select.valid      <= 1'b0;
+        out_select.valid     <= 1'b0;
 
-        typ       <= BYTE_T;
-        last_page <= 'X;
-        state     <= ST_IDLE;
+        typ         <= BYTE_T;
+        is_required <= 'X;
+        last_page   <= 'X;
+        state       <= ST_IDLE;
     end else begin
         case (state)
             ST_IDLE: begin
@@ -271,9 +277,10 @@ always_ff @(posedge clk) begin
                     num_values.data  <= chunk_confs[0].data.num_values;
                     num_values.valid <= 1'b1;
 
-                    typ       <= chunk_confs[0].data.typ;
-                    dict_seen <= 1'b0;
-                    state     <= ST_CONFIGURED;
+                    typ         <= chunk_confs[0].data.typ;
+                    is_required <= chunk_confs[0].data.is_required;
+                    dict_seen   <= 1'b0;
+                    state       <= ST_CONFIGURED;
                 end
             end
             ST_CONFIGURED: begin
@@ -294,10 +301,11 @@ always_ff @(posedge clk) begin
                         PAGE_TYPE_HYBRID: begin
                             in_select.data <= IN_HYBRID;
 
-                            hybrid_conf.data  <= page_conf.data.num_values;
-                            hybrid_conf.keep  <= 1'b1;
-                            hybrid_conf.last  <= page_conf.data.last;
-                            hybrid_conf.valid <= 1'b1;
+                            hybrid_conf.data.num_values  <= page_conf.data.num_values;
+                            hybrid_conf.data.is_required <= is_required;
+                            hybrid_conf.keep             <= 1'b1;
+                            hybrid_conf.last             <= page_conf.data.last;
+                            hybrid_conf.valid            <= 1'b1;
 
                             hybrid_num_values.data  <= page_conf.data.num_values;
                             hybrid_num_values.valid <= 1'b1;
@@ -318,6 +326,9 @@ always_ff @(posedge clk) begin
 
                             plain_type.data  <= typ;
                             plain_type.valid <= 1'b1;
+
+                            plain_required.data  <= is_required;
+                            plain_required.valid <= 1'b1;
 
                             out_select.data  <= OUT_PLAIN;
                             out_select.valid <= 1'b1;
@@ -351,6 +362,10 @@ always_ff @(posedge clk) begin
                     plain_type.valid <= 1'b0;
                 end
 
+                if (plain_required.ready) begin
+                    plain_required.valid <= 1'b0;
+                end
+
                 if (in_select.ready) begin
                     in_select.valid <= 1'b0;
                 end
@@ -371,7 +386,7 @@ always_ff @(posedge clk) begin
                 //   a new column chunk configuration next.
                 // - CONFIGURED if this was not the last page and this column
                 //   chunk has more pages to be fully decoded.
-                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !plain_type.valid && !in_select.valid && !out_select.valid) begin
+                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !plain_type.valid && !plain_required.valid && !in_select.valid && !out_select.valid) begin
                     if (last_page) begin
                         state <= ST_IDLE;
                     end else begin

@@ -19,13 +19,16 @@ class _ColumnChunk:
     num_values: int
     chunk_bytes: bytearray   # full column-chunk: thrift headers + payloads concatenated
     stream_type: "fpga_stream.StreamType" = fpga_stream.StreamType.SIGNED_INT_64
+    is_required: bool = False  # REQUIRED columns have no definition levels in their data pages
 
     def _register(self) -> bytearray:
         type_t = stream_type_to_libstf_type_t(self.stream_type)
         # column_chunk_conf_t packs (MSB -> LSB) as:
-        #   compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
+        #   is_required [1 bit] | compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
         compression = 1 if self.compression else 0
-        packed = (compression << 35) | ((self.num_values & 0xFFFFFFFF) << 3) | (type_t & 0x7)
+        is_required = 1 if self.is_required else 0
+        packed = ((is_required << 36) | (compression << 35) |
+                  ((self.num_values & 0xFFFFFFFF) << 3) | (type_t & 0x7))
         return bytearray(packed.to_bytes(8, 'little'))
 
 
@@ -75,10 +78,10 @@ def _make_def_levels(num_values: int) -> bytes:
     return len(rle_body).to_bytes(4, 'little') + rle_body
 
 
-def make_plain_data(items: list[int]) -> _ColumnChunk:
+def make_plain_data(items: list[int], is_required: bool = False) -> _ColumnChunk:
     stream = fpga_stream.Stream(fpga_stream.StreamType.SIGNED_INT_64, items)
     values = stream.data_to_bytearray()
-    def_levels = _make_def_levels(len(items))
+    def_levels = b'' if is_required else _make_def_levels(len(items))
     payload = bytearray(def_levels) + bytearray(values)
     hdr = _make_data_page_header(
         num_values=len(items),
@@ -91,6 +94,7 @@ def make_plain_data(items: list[int]) -> _ColumnChunk:
         compression=False,
         num_values=len(items),
         chunk_bytes=chunk,
+        is_required=is_required,
     )
 
 
@@ -110,8 +114,12 @@ def make_tricky(
     stream_type: "fpga_stream.StreamType" = fpga_stream.StreamType.SIGNED_INT_64,
     dict_values: list[int] = list(range(10, 20)),
     trailing_plain: bool = True,
+    is_required: bool = False,
 ) -> _ColumnChunk:
     hybrid_body = read_bytes(filename + '_chunk_decompressed.bin')
+    if is_required:
+        # REQUIRED column: drop the 4-byte length prefix + def_levels, keeping bit_width + runs.
+        hybrid_body = hybrid_body[int.from_bytes(hybrid_body[:4], 'little') + 4:]
 
     chunk = bytearray()
 
@@ -124,9 +132,9 @@ def make_tricky(
     )
     chunk += dict_body
 
-    # `factor` HYBRID pages. Each body already carries its 4-byte def_levels
-    # length prefix + def_levels + RLE/BPE-encoded payload — PageHeaderParser's
-    # SKIP_DEF_LEVELS state will strip the def_levels prefix at runtime.
+    # `factor` HYBRID pages. Unless the column is REQUIRED, each body carries its
+    # 4-byte def_levels length prefix + def_levels + RLE/BPE-encoded payload,
+    # which HybridPageDecoder skips at runtime.
     for _ in range(factor):
         chunk += _make_data_page_header(
             num_values=num_values,
@@ -142,7 +150,7 @@ def make_tricky(
     # path to be reset via the injected dummy beat (see ColumnChunkDecoder).
     if trailing_plain:
         plain_values = fpga_stream.Stream(stream_type, items).data_to_bytearray()
-        plain_def_levels = _make_def_levels(len(items))
+        plain_def_levels = b'' if is_required else _make_def_levels(len(items))
         plain_body = bytearray(plain_def_levels) + bytearray(plain_values)
         chunk += _make_data_page_header(
             num_values=len(items),
@@ -158,6 +166,7 @@ def make_tricky(
         num_values=total_num_values,
         chunk_bytes=chunk,
         stream_type=stream_type,
+        is_required=is_required,
     )
 
 
@@ -267,4 +276,32 @@ class ColumnChunkDecoderTestCase(fpga_test_case.FPGATestCase):
         self.run_chunks(
             [chunk_a, chunk_b],
             [_RLE_OUTPUT + _PLAIN_OUTPUT, _RLE_OUTPUT],
+        )
+
+    def test_required_plain_page(self):
+        self.run_chunks([make_plain_data(_PLAIN_OUTPUT, is_required=True)], [_PLAIN_OUTPUT])
+
+    def test_required_tricky_page(self):
+        tricky = make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 2,
+                             is_required=True)
+        self.run_chunks([tricky], [_RLE_OUTPUT * 2 + _PLAIN_OUTPUT])
+
+    def test_required_and_optional_chunks(self):
+        # The flag is per chunk: alternate REQUIRED and OPTIONAL chunks back to back, covering both
+        # the hybrid and the plain (StripLevels) path.
+        self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())
+        self.run_chunks(
+            [
+                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1,
+                            is_required=True),
+                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1),
+                make_plain_data(_PLAIN_OUTPUT, is_required=True),
+                _parquet_chunk('rle_data.parquet'),
+            ],
+            [
+                _RLE_OUTPUT + _PLAIN_OUTPUT,
+                _RLE_OUTPUT + _PLAIN_OUTPUT,
+                _PLAIN_OUTPUT,
+                _RLE_OUTPUT,
+            ],
         )
