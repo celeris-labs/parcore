@@ -127,5 +127,7 @@ OutputWriter inst_output_writer (
     .mem_config(mem_conf),
 
     .data_in(outputs),
-    .data_out(axis_host_send)
+    .data_out(axis_host_send),
+
+    .notify_count() // Unused
 );

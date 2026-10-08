@@ -10,15 +10,16 @@ namespace parcore {
 constexpr const uint64_t COLUMN_CHUNK_DECODER_CONFIG_ID = 0x5c19f934407065bd;
 
 // Read-side register layout of the ColumnChunkDecoderConfig: a few info
-// registers followed by 8 profiling counters per decoder (4 input + 4 output).
+// registers followed by 10 profiling counters per decoder (5 input + 5 output).
 constexpr const uint32_t COLUMN_CHUNK_DECODER_INFO_REGS    = 3;
-constexpr const uint32_t COLUMN_CHUNK_DECODER_PROFILE_REGS = 8;
+constexpr const uint32_t COLUMN_CHUNK_DECODER_PROFILE_REGS = 10;
 
 struct StreamProfile {
     uint64_t handshakes_cycles;
     uint64_t starved_cycles;
     uint64_t stalled_cycles;
     uint64_t idle_cycles;
+    uint64_t last_handshakes; // Number of handshakes with last set, i.e. completed streams
 };
 
 struct DecoderProfile {
