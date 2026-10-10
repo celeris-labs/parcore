@@ -93,9 +93,9 @@ int main(int argc, char *argv[]) {
       "Path to the parquet file to parse")(
       "start,s",
       boost::program_options::value<size_t>(&start)->default_value(0),
-      "The first page to process")(
+      "The first row group to process")(
       "end,e", boost::program_options::value<size_t>(&end)->default_value(0),
-      "The last page to process. 0 means to process all");
+      "The row group to stop before. 0 means to process all");
   boost::program_options::variables_map command_line_arguments;
   boost::program_options::store(
       boost::program_options::parse_command_line(argc, argv, runtime_options),

@@ -1,12 +1,6 @@
-[submodule "benchmarks/data_csv/dbgen"]
-	path = benchmarks/data_csv/dbgen
-	url = https://github.com/electrum/tpch-dbgen.git
-[submodule "arrow"]
-	path = arrow
-	url = https://github.com/apache/arrow.git
 [submodule "libstf"]
 	path = libstf
 	url = https://github.com/fpgasystems/libstf.git
 [submodule "vhsnunzip"]
 	path = vhsnunzip
-	url = https://github.com/lucat1/vhsnunzip
+	url = https://github.com/JonasDann/vhsnunzip.git

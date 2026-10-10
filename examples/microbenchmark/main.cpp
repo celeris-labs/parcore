@@ -18,8 +18,6 @@
 #include <libstf/tlb_manager.hpp>
 #include <parcore/adaptor.hpp>
 #include <parcore/column_chunk_decoder.hpp>
-#include <parcore/cpu/cpu.hpp>
-#include <parcore/cpu/cpu_reader.hpp>
 #include <parcore/metadata/utils.hpp>
 #include <parcore/multi_reader.hpp>
 #include <unistd.h>
@@ -29,15 +27,6 @@
 #define DEFAULT_VFPGA_ID 0
 #define N_REPS 10
 #define N_ENQUEUE 5
-
-const std::string separator = std::string(80, '-');
-
-void time(std::string path,
-          std::shared_ptr<parcore::MultiReader> hardware_reader,
-          std::shared_ptr<parcore::cpu::CPUReader> software_reader, size_t i,
-          size_t j, size_t values, size_t reps, bool print) {
-  std::chrono::high_resolution_clock::rep fpga_us = 0, cpu_us = 0;
-}
 
 std::shared_ptr<libstf::OutputBufferManager> obm;
 
@@ -60,8 +49,7 @@ static void handle_fpga_interrupt(int value) {
   obm->handle_fpga_interrupt(value);
 }
 
-void benchmark(std::string path, uint32_t num_decoders, size_t discard_reps,
-               size_t reps) {
+void benchmark(std::string path, uint32_t num_decoders, size_t reps) {
   auto meta = parcore::metadata::from_file(path);
   auto cthread = std::make_shared<coyote::cThread>(DEFAULT_VFPGA_ID, getpid(),
                                                    0, &handle_fpga_interrupt);
@@ -71,7 +59,7 @@ void benchmark(std::string path, uint32_t num_decoders, size_t discard_reps,
   auto pool = std::make_shared<libstf::HugePageMemoryPool>();
 #endif
   auto tlb = std::make_shared<libstf::TLBManager>(cthread, pool);
-#ifdef ENABLE_SIMULATION
+#ifndef ENABLE_SIMULATION
   tlb->ensure_tlb_mapping(pool->initial_address(), pool->total_capacity());
 #endif
 
@@ -174,7 +162,7 @@ void benchmark(std::string path, uint32_t num_decoders, size_t discard_reps,
 
 int main(int argc, char *argv[]) {
   std::vector<std::string> files;
-  size_t discard_reps, reps;
+  size_t reps;
   uint32_t num_decoders;
 
   boost::program_options::options_description runtime_options(
@@ -198,7 +186,7 @@ int main(int argc, char *argv[]) {
                "ratio,total_bytes,time,GiBps"
             << std::endl;
   for (auto file : files) {
-    benchmark(file, num_decoders, discard_reps, reps);
+    benchmark(file, num_decoders, reps);
   }
 
   return EXIT_SUCCESS;

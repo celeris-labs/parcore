@@ -10,7 +10,7 @@ from page_header_parser_test import (
     _extract_parquet_column_chunks,
 )
 
-from libstf_utils.common import stream_type_to_libstf_type_t
+from libstf_utils.fpga_configuration import stream_type_to_libstf_type_t
 
 
 @dataclass
