@@ -37,6 +37,12 @@ def _encode_lengths(strings: List[bytes]) -> bytearray:
     return buf
 
 
+def _expected_heap(strings: List[bytes]) -> bytearray:
+    """The heap: the payloads of the strings that do not fit inline, back to back
+    and without their length prefixes."""
+    return bytearray(b''.join(s for s in strings if len(s) > INLINE_LEN))
+
+
 def _expected_strings(strings: List[bytes], buffer_addr: int) -> List[int]:
     """The german_str_t records, serialised LSB-first as the hardware emits them.
 
@@ -46,13 +52,11 @@ def _expected_strings(strings: List[bytes], buffer_addr: int) -> List[int]:
       bytes  8..15 : payload  - inline bytes 4..11 (short) OR 8-byte LE buffer
                                 address (long, len > 12)
 
-    The buffer address advances by every string's length (all bytes are written
-    to the buffer), so a long string at logical offset `cum` stores
-    buffer_addr + cum.
+    Only long strings are in the heap (see _expected_heap), so a long string
+    stores buffer_addr plus the length of the long strings before it.
     """
     out = bytearray()
-    # Needs to start at 4 due to length prefixes, actual data starts at 4
-    element_offset = 4
+    heap_offset = 0
     for s in strings:
         n = len(s)
         rec = bytearray(16)
@@ -61,10 +65,9 @@ def _expected_strings(strings: List[bytes], buffer_addr: int) -> List[int]:
         if n <= INLINE_LEN:
             rec[8:16] = (s[4:12]).ljust(8, b'\x00')
         else:
-            rec[8:16] = (buffer_addr + element_offset).to_bytes(8, 'little')
+            rec[8:16] = (buffer_addr + heap_offset).to_bytes(8, 'little')
+            heap_offset += n
         out += rec
-        # + 4 for the length prefix
-        element_offset += n + 4
     return list(out)
 
 
@@ -72,7 +75,7 @@ def _expected_strings(strings: List[bytes], buffer_addr: int) -> List[int]:
 # Function which verifies that the generated input and output
 # data for the tests are correct
 # ---------------------------------------------------------------------------
-def verify_test_data(strings, encoded_input, german_strs, buffer_addr) -> List[int]:
+def verify_test_data(strings, heap, german_strs, buffer_addr) -> List[int]:
     assert len(german_strs) % 16 == 0, \
         f"Length of german string stream should \
         always be multiple of 16! len(german_str): {len(german_strs)}"
@@ -93,7 +96,7 @@ def verify_test_data(strings, encoded_input, german_strs, buffer_addr) -> List[i
         else:
             ptr = int.from_bytes(str_continuation_or_address, "little")
             ptr = ptr - buffer_addr
-            extracted_string_from_input = bytes(encoded_input[ptr:ptr+length])
+            extracted_string_from_input = bytes(heap[ptr:ptr+length])
             assert extracted_string_from_input == strings[i], \
                 f"extracted_string_from_input = {extracted_string_from_input} != {strings[i]} = strings[{i}]"
 
@@ -134,11 +137,12 @@ class PlainStringDecoderTest(fpga_test_case.FPGATestCase):
         german_strs = _expected_strings(strings, buffer_addr)
         self.set_stream_input(0, input)
 
-        self.set_expected_output(0, input)
+        heap = _expected_heap(strings)
+        self.set_expected_output(0, heap)
         self.set_expected_output(
             1, Stream(StreamType.UNSIGNED_INT_8, german_strs))
         
-        verify_test_data(strings, input, german_strs, buffer_addr)
+        verify_test_data(strings, heap, german_strs, buffer_addr)
 
         self.simulate_fpga()
         self.assert_simulation_output()

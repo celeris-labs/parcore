@@ -4,6 +4,7 @@
 `include "lynx_macros.svh"
 
 import lynxTypes::*;
+import libstf::*;
 import parcore::*;
 
 module PlainStringDecoder #(
@@ -15,7 +16,7 @@ module PlainStringDecoder #(
     ready_valid_i.s conf,           // #(plain_str_decoder_conf_t)
     ndata_i.s       in_data,        // #(data8_t, STREAM_WIDTH)
     data_i.m        out_strings,    // #(german_str_t)
-    ndata_i.m       out_data        // #(data8_t, STREAM_WIDTH)
+    ndata_i.m       out_data        // #(data8_t, STREAM_WIDTH) heap bytes selected by keep
 );
 
     // ---------------------------------------------------------------------
@@ -34,7 +35,7 @@ module PlainStringDecoder #(
     // ---------------------------------------------------------------------
     ndata_i #(data8_t, VIEW_WIDTH) in_extended (.*);
     ndata_i #(data8_t, VIEW_WIDTH) in (.*);
-    Lookahead #(
+    NDataLookahead #(
         .data_t       (data8_t),
         .NUM_ELEMENTS (STREAM_WIDTH),
         .PREVIEW_SIZE (VIEW_EXTENSION_WIDTH)
@@ -87,17 +88,16 @@ module PlainStringDecoder #(
 
     // ---------------------------------------------------------------------
     // Input side buffering
+    // The beat the cursor points into, followed by the first bytes of the next beat
     // ---------------------------------------------------------------------
-    ndata_i#(data8_t, VIEW_WIDTH) in_data_buffer (.clk(clk), .rst_n(rst_n));
-    assign in_data_buffer.ready = 1;
-    assign in_data_buffer.valid = 0;
+    data8_t [VIEW_WIDTH - 1:0]   buffer_data;
+    logic                        buffer_last;
 
     // ---------------------------------------------------------------------
     // Offset / length bookkeeping
     // ---------------------------------------------------------------------
     data32_t                    values_remaining;
     data32_t                    cursor;
-    data32_t                    cursor_after_prefix;
     logic[VIEW_BITS - 1 : 0]    view_cursor;
     data32_t                    length;
     data32_t                    cursor_n;
@@ -107,7 +107,7 @@ module PlainStringDecoder #(
     always_comb begin : extract_length
         length = '0;
         for (int i = 0; i < LENGTH_PREFIX_LEN; i++)
-            length[i*8 +: 8] = in_data_buffer.data[view_cursor + i];
+            length[i*8 +: 8] = buffer_data[view_cursor + i];
     end
 
 
@@ -123,8 +123,10 @@ module PlainStringDecoder #(
     logic bytes_left_in_next_beat;
 
     assign cursor_in_view = cursor < STREAM_WIDTH;
-    assign cursor_n_crosses = cursor_n > STREAM_WIDTH;
     assign last_val = values_remaining == 1;
+    // A record that ends exactly on the beat boundary also moves on to the next beat, unless it is
+    // the last one of the page, in which case there is no next beat to move to.
+    assign cursor_n_crosses = cursor_n > STREAM_WIDTH || (cursor_n == STREAM_WIDTH && !last_val);
     assign is_short = length <= INLINE_STR_BYTES;
     assign bytes_left_in_next_beat = cursor > STREAM_WIDTH;
 
@@ -133,11 +135,11 @@ module PlainStringDecoder #(
     // ---------------------------------------------------------------------
     logic [63:0]                    heap_addr;
     german_str_t                    german;
-    data8_t [INLINE_STR_BYTES:0]    str_bytes;
+    data8_t [INLINE_STR_BYTES-1:0]  str_bytes;
 
     always_comb begin : buildStr
         for (int i = 0; i < INLINE_STR_BYTES; i++)
-            str_bytes[i] = i < length ? in_data_buffer.data[view_cursor + i + LENGTH_PREFIX_LEN] : '0;
+            str_bytes[i] = i < length ? buffer_data[view_cursor + i + LENGTH_PREFIX_LEN] : '0;
     end
 
     always_comb begin : build_german
@@ -152,10 +154,45 @@ module PlainStringDecoder #(
     end
 
     task updateInputBuffer();
-        in_data_buffer.data <= in.data;
-        in_data_buffer.keep <= in.keep;
-        in_data_buffer.last <= in.last;
+        buffer_data <= in.data;
+        buffer_last <= in.last;
     endtask
+
+    // ---------------------------------------------------------------------
+    // Heap
+    // The heap only holds the payloads of the strings that do not fit inline, without their length
+    // prefixes. The buffered beat is emitted with a keep that selects these bytes and the
+    // HeapNormalizer compacts them.
+    // ---------------------------------------------------------------------
+    // Positions relative to the buffered beat, the largest is a payload start of
+    // STREAM_WIDTH - 1 + LENGTH_PREFIX_LEN
+    typedef logic[VIEW_BITS + 1:0]     pos_t;
+    typedef logic[STREAM_WIDTH - 1:0]  beat_keep_t;
+
+    function automatic pos_t clamp_to_beat(data32_t pos);
+        return pos > STREAM_WIDTH ? pos_t'(STREAM_WIDTH) : pos_t'(pos);
+    endfunction
+
+    // Bytes [lo, hi) of a beat
+    function automatic beat_keep_t byte_range(pos_t lo, pos_t hi);
+        for (int i = 0; i < STREAM_WIDTH; i++)
+            byte_range[i] = i >= lo && i < hi;
+    endfunction
+
+    pos_t       payload_start;
+    logic       carry_long;       // The record at the start of the buffered beat is a long string
+    beat_keep_t heap_keep;        // Heap bytes of the buffered beat found so far
+    beat_keep_t string_keep;      // Heap bytes of the current string in the buffered beat
+    beat_keep_t string_keep_next; // Heap bytes of the current string in the next beat
+    beat_keep_t carry_keep_next;  // Heap bytes of the next beat if it only continues the record
+
+    assign payload_start    = pos_t'(view_cursor) + LENGTH_PREFIX_LEN;
+    assign string_keep      = is_short ? '0 : byte_range(payload_start, clamp_to_beat(cursor_n));
+    assign string_keep_next = is_short ? '0 : byte_range(
+        payload_start > STREAM_WIDTH ? payload_start - STREAM_WIDTH : '0,
+        clamp_to_beat(cursor_n - STREAM_WIDTH)
+    );
+    assign carry_keep_next  = carry_long ? byte_range('0, clamp_to_beat(cursor - STREAM_WIDTH)) : '0;
 
     // ---------------------------------------------------------------------
     // FSM
@@ -166,11 +203,6 @@ module PlainStringDecoder #(
     always_ff @( posedge clk ) begin : length_extractor_fsm
     if ( !rst_n ) begin
         state <= WAIT_CONF;
-        cursor <= 0;
-        values_remaining <= 0;
-        in_data_buffer.data <= '0;
-        in_data_buffer.keep <= '0;
-        in_data_buffer.last <= 0;
     end else begin
         case (state)
             WAIT_CONF: begin
@@ -182,8 +214,9 @@ module PlainStringDecoder #(
                     cursor <= 0;
                     values_remaining <= conf.data.num_values;
                     if (conf.data.update_buffer_addr)
-                        heap_addr <= conf.data.buffer_addr + LENGTH_PREFIX_LEN;
-                    cursor_after_prefix <= LENGTH_PREFIX_LEN;
+                        heap_addr <= conf.data.buffer_addr;
+                    carry_long <= 1'b0;
+                    heap_keep  <= '0;
                     updateInputBuffer();
                 end
             end
@@ -196,23 +229,27 @@ module PlainStringDecoder #(
                 // Cursor update logic
                 if (!cursor_in_view) begin
                     if(out_data_internal.ready && in.valid) begin
-                        cursor <= cursor - STREAM_WIDTH;
+                        cursor    <= cursor - STREAM_WIDTH;
+                        heap_keep <= carry_keep_next;
                     end
                 end else if (out_strings_internal.ready) begin
                     if (cursor_n_crosses && out_data_internal.ready && in.valid) begin
-                        cursor <= cursor_n - STREAM_WIDTH;
-                        heap_addr <= heap_addr + LENGTH_PREFIX_LEN + length;
+                        cursor     <= cursor_n - STREAM_WIDTH;
+                        heap_addr  <= heap_addr + (is_short ? '0 : length);
+                        carry_long <= !is_short;
+                        heap_keep  <= string_keep_next;
                     end
                     else if (!cursor_n_crosses && (!last_val || out_data_internal.ready)) begin
-                        cursor <= cursor_n;
-                        heap_addr <= heap_addr + LENGTH_PREFIX_LEN + length;
+                        cursor    <= cursor_n;
+                        heap_addr <= heap_addr + (is_short ? '0 : length);
+                        heap_keep <= heap_keep | string_keep;
                     end
                 end
 
                 // Values are only updated when lengths are emitted
                 if(out_strings_internal.valid && out_strings_internal.ready)
                     values_remaining <= values_remaining - 1;
-                
+
                 // Input buffer update logic
                 if ((!cursor_in_view || (cursor_n_crosses && out_strings_internal.ready)) && out_data_internal.ready && in.valid) begin
                     updateInputBuffer();
@@ -228,15 +265,16 @@ module PlainStringDecoder #(
             end
             EMIT_STREAM: begin
                 if (out_data_internal.ready && (in.valid || !bytes_left_in_next_beat)) begin
-                    cursor <= cursor - STREAM_WIDTH;
+                    cursor    <= cursor - STREAM_WIDTH;
+                    heap_keep <= carry_keep_next;
                     updateInputBuffer();
                 end
 
                 if (!bytes_left_in_next_beat && out_data_internal.ready)
-                    state <= WAIT_CONF; 
+                    state <= WAIT_CONF;
             end
             default: begin
-                
+
             end
         endcase
     end
@@ -244,7 +282,8 @@ module PlainStringDecoder #(
 
     always_comb begin
         case (state)
-            WAIT_CONF: in.ready = 1;
+            // Only take the first beat of a page together with its configuration
+            WAIT_CONF: in.ready = conf.valid;
             WAIT_FIRST: in.ready = 1;
             EMIT_LENS_AND_STREAM: in.ready = out_data_internal.ready &&
                     (!cursor_in_view || (cursor_n_crosses && out_strings_internal.ready));
@@ -270,8 +309,10 @@ module PlainStringDecoder #(
                 (cursor_in_view && out_strings_internal.ready && ((cursor_n_crosses && in.valid) || (!cursor_n_crosses && last_val)))
             ) ||
             (state == EMIT_STREAM && (in.valid || !bytes_left_in_next_beat));
-    assign out_data_internal.data = in_data_buffer.data;
-    assign out_data_internal.keep = in_data_buffer.keep;
-    assign out_data_internal.last = in_data_buffer.last;
+    assign out_data_internal.data = buffer_data[STREAM_WIDTH - 1:0];
+    // A beat that is emitted together with a string also holds that string's heap bytes
+    assign out_data_internal.keep = heap_keep |
+            (state == EMIT_LENS_AND_STREAM && cursor_in_view ? string_keep : '0);
+    assign out_data_internal.last = buffer_last;
 
 endmodule

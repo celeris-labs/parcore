@@ -31,6 +31,10 @@ std::ostream &operator<<(std::ostream &os, Type typ);
  */
 bool is_libstf_type(const Type &typ);
 bool is_string_type(const Type &typ);
+// libstf has no string type, so german strings travel as its 128 bit type. Matches GERMAN_STR_T in
+// hardware/src/hdl/common.sv.
+constexpr libstf::type_t GERMAN_STR_T = libstf::type_t::INT128_T;
+
 libstf::type_t to_libstf_type(const Type &typ);
 
 struct ColumnChunk {

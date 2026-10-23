@@ -58,7 +58,7 @@ libstf::type_t to_libstf_type(const Type &typ) {
   case Type::DOUBLE_T:
     return libstf::type_t::DOUBLE_T;
   case Type::BYTE_ARRAY:
-    return libstf::type_t::GERMAN_STR_T;
+    return GERMAN_STR_T;
   default:
     throw std::runtime_error("cannot convert type to libstf::type_t");
   }

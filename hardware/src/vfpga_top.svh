@@ -240,9 +240,7 @@ PairedOutputWriter #(
     .mem_config(mem_conf),
 
     .data_in(outputs),
-    .data_out(axis_host_send),
-
-    .notify_count() // Unused
+    .data_out(axis_host_send)
 );
 
 `ifdef DEBUG

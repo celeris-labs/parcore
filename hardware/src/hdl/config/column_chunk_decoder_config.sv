@@ -101,6 +101,8 @@ end
 // -- Write ----------------------------------------------------------------------------------------
 for (genvar I = 0; I < NUM_DECODERS; I++) begin
 
+    ready_valid_i #(column_chunk_conf_t) cc_conf (clk , reset_synced);
+
     ready_valid_i #(data64_t) column_chunk_conf_cc_info (clk , reset_synced);
     ConfigWriteFIFO #(
         2 * I,                      // internal address
@@ -147,8 +149,11 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
         .out    (heap_addr_skidded)
     );
 
+    // Same layout as column_chunk_conf_t without the heap address, which has its own register
     assign cc_conf.data = {
         string_heap_addr:   heap_addr_skidded.data[VADDR_BITS-1:0],
+        logical_typ:        cc_info_skidded.data[39:37],
+        is_required:        cc_info_skidded.data[36],
         compression:        cc_info_skidded.data[35],
         num_values:         cc_info_skidded.data[34:3],
         typ:                cc_info_skidded.data[2:0]
@@ -169,7 +174,6 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
     assign cc_info_skidded.ready   = cc_conf.valid && cc_conf.ready;
     assign heap_addr_skidded.ready = cc_conf.valid && cc_conf.ready && needs_heap_addr;
 
-    ready_valid_i #(column_chunk_conf_t) cc_conf (clk , reset_synced);
     SkidBuffer #(
         .data_t(column_chunk_conf_t)
     ) inst_cc_conf_skid (

@@ -59,31 +59,17 @@ const std::string prefix = "parcore::ColumnChunkDecoder";
 
 std::unique_ptr<ColumnChunkDecoder::Handle>
 ColumnChunkDecoder::decode_column_chunk(
-    const metadata::ColumnChunk &column_chunk) {
+    const metadata::ColumnChunk &column_chunk, uint64_t string_heap_address) {
   std::unique_lock lock(mtx);
   Profiler::open_regions({prefix + "decode_column_chunk"});
   assert(column_chunk_enqueued_configs_ + 1 <
          column_chunk_config_->maximum_num_enqueued_configs());
 
   auto type = metadata::to_libstf_type(column_chunk.type);
-  const bool is_string = type == libstf::type_t::GERMAN_STR_T;
+  const bool is_string = type == metadata::GERMAN_STR_T;
 
-  // Acquiring the handle is what commits the output buffers to the hardware, so
-  // it has to happen before the chunk config is written: the decoder needs the
-  // heap's base address up front to fill in the addresses of long strings.
   auto output_handle =
       output_buffer_manager_->acquire_output_handle(decoder_mask(is_string));
-
-  uint64_t string_heap_address = 0;
-  if (is_string) {
-    // The decoder walks the heap linearly from this one base, so the whole
-    // chunk's string bytes must land in the buffer starting here. A chunk large
-    // enough to spill into the next buffer would produce records pointing at
-    // the wrong place; callers detect that by checking that the heap stream
-    // yielded a single buffer.
-    string_heap_address = reinterpret_cast<uint64_t>(
-        output_buffer_manager_->next_buffer_address(heap_stream()));
-  }
 
   column_chunk_config_->enqueue_column_chunk(
       decoder_, column_chunk.compression, column_chunk.num_values, type,

@@ -95,6 +95,18 @@ typedef struct packed {
     data32_t num_values;
 } hybrid_page_conf_t;
 
+// Umbra style string (german string). Strings of up to 12 bytes are stored inline, longer ones keep
+// their first 4 bytes in prefix and point to the full string in the heap. The layout in memory
+// matches DuckDB's string_t.
+typedef struct packed {
+    data8_t [7:0] short_str_or_addr;
+    data8_t [3:0] prefix;
+    data8_t [3:0] length;
+} german_str_t;
+
+// libstf has no string type, so german strings travel as its 128 bit type
+localparam type_t GERMAN_STR_T = INT128_T;
+
 typedef struct packed {
     logic update_buffer_addr;
     data32_t        num_values;

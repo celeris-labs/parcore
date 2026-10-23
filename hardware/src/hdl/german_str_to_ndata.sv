@@ -4,7 +4,7 @@
 
 import lynxTypes::AXI_DATA_BITS;
 import libstf::data8_t;
-import libstf::german_str_t;
+import parcore::german_str_t;
 
 // Packs the PlainStringDecoder's one-string-per-beat output into full data
 // beats. A german string is a fixed 16 bytes, so STRS_PER_BEAT of them tile a

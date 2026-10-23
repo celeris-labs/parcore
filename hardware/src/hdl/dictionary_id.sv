@@ -1,8 +1,10 @@
 `timescale 1ns / 1ps
 
 `include "libstf_macros.svh"
+`include "parcore_macros.svh"
 
 import libstf::*;
+import parcore::GERMAN_STR_T;
 
 /**
     Generates dictionary indices according to the incoming data_type

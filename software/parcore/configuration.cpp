@@ -79,7 +79,7 @@ void ColumnChunkDecoderConfig::enqueue_column_chunk(libstf::stream_t      decode
     write_register(libstf::ConfigRegister(2 * decoder, packed));
     // Writing this for any other type would desynchronise the two config FIFOs, since
     // the hardware only pops it for GERMAN_STR_T.
-    if (typ == libstf::type_t::GERMAN_STR_T)
+    if (typ == metadata::GERMAN_STR_T)
         write_register(libstf::ConfigRegister(2 * decoder + 1, string_heap_addr));
     Profiler::close_regions({column_config_prefix + "enqueue_column_chunk"});
 }

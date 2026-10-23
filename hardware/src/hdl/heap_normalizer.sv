@@ -1,6 +1,7 @@
 `timescale 1ns / 1ps
 
 `include "libstf_macros.svh"
+`include "parcore_macros.svh"
 
 import libstf::*;
 
@@ -9,6 +10,7 @@ import libstf::*;
 */
 module HeapNormalizer #(
     parameter NUM_BYTES = AXI_DATA_BITS / 8,
+    parameter COMPACTOR_REGISTER_LEVELS = 8,
     parameter BARREL_SHIFTER_REGISTER_LEVELS = 2
 ) (
     input logic clk,
@@ -80,7 +82,9 @@ assign _in.ready = state == PASSTHROUGH && to_normalizer.ready;
 DataNormalizer #(
     .data_t(data8_t),
     .NUM_ELEMENTS(NUM_BYTES),
-    .ENABLE_COMPACTOR(0),
+    // The PlainStringDecoder only keeps the heap bytes of every beat
+    .ENABLE_COMPACTOR(1),
+    .COMPACTOR_REGISTER_LEVELS(COMPACTOR_REGISTER_LEVELS),
     .BARREL_SHIFTER_REGISTER_LEVELS(BARREL_SHIFTER_REGISTER_LEVELS)
 ) inst_normalizer (
     .clk(clk),
