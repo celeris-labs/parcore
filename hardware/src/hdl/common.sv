@@ -80,6 +80,9 @@ typedef enum logic [1:0] {
 } page_type_t;
 
 typedef struct packed {
+    // Buffer address at which raw string bytes will land. Used for german strings longer than 12
+    // bytes. The software writes it to its own register, the other fields share one.
+    vaddress_t    string_heap_addr;
     type_t        logical_typ;
     logic         is_required;
     compression_t compression;
@@ -92,11 +95,36 @@ typedef struct packed {
     data32_t num_values;
 } hybrid_page_conf_t;
 
+// Umbra style string (german string). Strings of up to 12 bytes are stored inline, longer ones keep
+// their first 4 bytes in prefix and point to the full string in the heap. The layout in memory
+// matches DuckDB's string_t.
+typedef struct packed {
+    data8_t [7:0] short_str_or_addr;
+    data8_t [3:0] prefix;
+    data8_t [3:0] length;
+} german_str_t;
+
+// libstf has no string type, so german strings travel as its 128 bit type
+localparam type_t GERMAN_STR_T = INT128_T;
+
+typedef struct packed {
+    logic update_buffer_addr;
+    data32_t        num_values;
+    // See column_chunk_conf_t.string_heap_addr
+    vaddress_t      buffer_addr;
+} plain_str_decoder_conf_t;
+
 typedef struct packed {
     page_type_t page_type;
-    data32_t    num_values;
     logic       last;
+    data32_t    num_values;
 } page_conf_t;
+
+typedef struct packed {
+    type_t      typ;
+    page_type_t ptyp;
+    logic last;
+} page_type_info_t;
 
 typedef struct packed {
     stream_profile_t in;

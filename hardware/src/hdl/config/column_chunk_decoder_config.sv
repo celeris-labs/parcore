@@ -100,7 +100,90 @@ end
 
 // -- Write ----------------------------------------------------------------------------------------
 for (genvar I = 0; I < NUM_DECODERS; I++) begin
-    ConfigWriteFIFO #(I, MAX_NUM_ENQUEUED_BUFFERS, column_chunk_conf_t) inst_conf (clk, reset_synced, write_config, out[I]);
+
+    ready_valid_i #(column_chunk_conf_t) cc_conf (clk , reset_synced);
+
+    ready_valid_i #(data64_t) column_chunk_conf_cc_info (clk , reset_synced);
+    ConfigWriteFIFO #(
+        2 * I,                      // internal address
+        MAX_NUM_ENQUEUED_BUFFERS,
+        data64_t
+    ) inst_cc_info_write (
+        clk,
+        reset_synced,
+        write_config,
+        column_chunk_conf_cc_info
+    );
+
+    ready_valid_i #(data64_t) column_chunk_conf_heap_addr (clk , reset_synced);
+    ConfigWriteFIFO #(
+        2 * I + 1,                  // internal address
+        MAX_NUM_ENQUEUED_BUFFERS,
+        data64_t
+    ) inst_head_addr_write (
+        clk,
+        reset_synced,
+        write_config,
+        column_chunk_conf_heap_addr
+    );
+
+    ready_valid_i #(data64_t) cc_info_skidded (clk, reset_synced);
+    SkidBuffer #(
+        .data_t(data64_t)
+    ) inst_cc_info_skid (
+        .clk    (clk),
+        .rst_n  (reset_synced),
+
+        .in     (column_chunk_conf_cc_info),
+        .out    (cc_info_skidded)
+    );
+
+    ready_valid_i #(data64_t) heap_addr_skidded (clk, reset_synced);
+    SkidBuffer #(
+        .data_t(data64_t)
+    ) inst_heap_addr_skid (
+        .clk    (clk),
+        .rst_n  (reset_synced),
+
+        .in     (column_chunk_conf_heap_addr),
+        .out    (heap_addr_skidded)
+    );
+
+    // Same layout as column_chunk_conf_t without the heap address, which has its own register
+    assign cc_conf.data = {
+        string_heap_addr:   heap_addr_skidded.data[VADDR_BITS-1:0],
+        logical_typ:        cc_info_skidded.data[39:37],
+        is_required:        cc_info_skidded.data[36],
+        compression:        cc_info_skidded.data[35],
+        num_values:         cc_info_skidded.data[34:3],
+        typ:                cc_info_skidded.data[2:0]
+    };
+    // Only german string chunks carry a heap base address, written to a second
+    // register. For every other type that register is never written, so it must
+    // neither be waited on nor consumed.
+    logic needs_heap_addr;
+    assign needs_heap_addr = cc_info_skidded.data[2:0] == GERMAN_STR_T;
+
+    assign cc_conf.valid = cc_info_skidded.valid
+                        && (heap_addr_skidded.valid || !needs_heap_addr);
+
+    // needs_heap_addr is decoded from cc_info_skidded.data, which only carries a
+    // meaningful type while its valid is high, so both readies have to be
+    // qualified by that valid. Safe because cc_conf.ready comes from a skid
+    // buffer and is register-derived, so the dependency terminates.
+    assign cc_info_skidded.ready   = cc_conf.valid && cc_conf.ready;
+    assign heap_addr_skidded.ready = cc_conf.valid && cc_conf.ready && needs_heap_addr;
+
+    SkidBuffer #(
+        .data_t(column_chunk_conf_t)
+    ) inst_cc_conf_skid (
+        .clk    (clk),
+        .rst_n  (reset_synced),
+
+        .in     (cc_conf),
+        .out    (out[I])
+    );
+
 end
 
 endmodule

@@ -276,7 +276,7 @@ end
 // ------- State machine ---------
 function offset_t trim_offset(offset_t offset);
     // trim_offset = offset >= NUM_BYTES ? offset - NUM_BYTES : offset;
-    trim_offset = offset[$bits(offset_t) - 2:0];
+    trim_offset = offset % NUM_BYTES;
 endfunction
 
 task store_input();
