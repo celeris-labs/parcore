@@ -18,19 +18,20 @@ so no transfer and no interrupt are expected on it there.
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from coyote_test import constants, fpga_register, fpga_stream
+from coyote_test import constants, fpga_stream
 
 import libstf_utils.memory_manager as memory_manager
 
 from libstf_utils.common import MAX_SUPPORTED_N_STREAMS
 from libstf_utils.output_writer_test_case import OutputWriterTestCase
+from parcore_utils.fpga_configuration import ColumnChunkDecoderConfig, Compression
 
 from column_chunk_decoder_test import (
     _ColumnChunk,
     _PLAIN_OUTPUT,
     _RLE_OUTPUT,
-    _encode_strings,
     _german_records,
+    _heap_bytes,
     _parquet_chunk,
     make_plain_data,
     make_string_data,
@@ -43,8 +44,6 @@ from column_chunk_decoder_test import (
 # is the width of the interrupt's stream id field. Widening the guard is enough -
 # nothing else in the manager assumes one stream per channel.
 memory_manager.MAX_NUMBER_STREAMS = MAX_SUPPORTED_N_STREAMS
-
-COLUMN_CHUNK_DECODER_CONFIG_ID = 0x5C19F934407065BD
 
 # One decoder per physical AXI channel, mirroring N_STREAMS in the vfpga top.
 NUM_DECODERS = constants.MAX_NUMBER_STREAMS
@@ -86,7 +85,7 @@ def string_job(strings: "list[bytes]") -> _Job:
     def finish(heap_addr: int):
         return make_string_data(strings, heap_addr), _german_records(strings, heap_addr)
 
-    return _Job(finish=finish, heap_bytes=_encode_strings(strings))
+    return _Job(finish=finish, heap_bytes=_heap_bytes(strings))
 
 
 # Shorthands for the workloads used below.
@@ -102,12 +101,6 @@ class VFPGATopTestCase(OutputWriterTestCase):
     # Deliberately no alternative_vfpga_top_file: this drives hardware/src/vfpga_top.svh.
     debug_mode = True
 
-    def _column_chunk_config_offset(self) -> int:
-        assert self.global_config.has_config(COLUMN_CHUNK_DECODER_CONFIG_ID), (
-            "The design does not expose a ColumnChunkDecoderConfig"
-        )
-        return self.global_config.get_config_bounds(COLUMN_CHUNK_DECODER_CONFIG_ID)[0]
-
     def _heap_base_address(self, decoder: int) -> int:
         """The buffer the heap writer of `decoder` will fill.
 
@@ -117,7 +110,9 @@ class VFPGATopTestCase(OutputWriterTestCase):
         follow-up allocation would not be contiguous. Every workload here stays
         well inside one allocation.
         """
-        allocations = self.memory_manager.allocations[heap_stream(decoder)]
+        allocations = self.memory_manager.allocations.get(heap_stream(decoder), {})
+        if len(allocations) == 0:
+            return 0  # Nothing in the heap, e.g., because all strings are inline
         assert len(allocations) == 1, (
             f"Heap of decoder {decoder} spilled into {len(allocations)} allocations; "
             "the decoder assumes one contiguous heap buffer per column chunk."
@@ -137,14 +132,14 @@ class VFPGATopTestCase(OutputWriterTestCase):
                 f"decoder {decoder}: only one string chunk per run is supported"
             )
 
-        # Configuration discovery does blocking register reads, so the simulation
-        # has to be up before anything below can run.
-        self.simulate_fpga_non_blocking()
-        config_offset = self._column_chunk_config_offset()
+        self.jobs = jobs
+        self.simulate_fpga()
+        self.assert_simulation_output()
 
+    def configure(self):
         # Heap expectations first. They are address-independent, and registering
         # them is what allocates the buffers whose addresses the string chunks need.
-        for decoder, decoder_jobs in jobs.items():
+        for decoder, decoder_jobs in self.jobs.items():
             for job in decoder_jobs:
                 if job.is_string:
                     self.set_expected_output(
@@ -154,7 +149,8 @@ class VFPGATopTestCase(OutputWriterTestCase):
                         ),
                     )
 
-        for decoder, decoder_jobs in jobs.items():
+        config = self.config.get_config(ColumnChunkDecoderConfig)
+        for decoder, decoder_jobs in self.jobs.items():
             for job in decoder_jobs:
                 heap_addr = self._heap_base_address(decoder) if job.is_string else 0
                 chunk, values = job.finish(heap_addr)
@@ -166,27 +162,16 @@ class VFPGATopTestCase(OutputWriterTestCase):
                         fpga_stream.StreamType.UNSIGNED_INT_8, values
                     )
                 else:
-                    expected = fpga_stream.Stream(chunk.stream_type, values)
+                    expected = fpga_stream.Stream(chunk.output_type(), values)
                 self.set_expected_output(values_stream(decoder), expected)
 
-                self.write_register(
-                    fpga_register.vFPGARegister(
-                        config_offset + 2 * decoder, chunk._register()
-                    )
+                compression = Compression.SNAPPY if chunk.compression else Compression.RAW
+                config.enqueue_column_chunk(
+                    decoder, compression, chunk.num_values, chunk.data_type, chunk.is_required,
+                    chunk.logical_type if not chunk.is_string else None, chunk.heap_addr
                 )
-                # Only consumed for german strings - writing it otherwise would
-                # desynchronise the two config FIFOs.
-                if chunk.is_string:
-                    self.write_register(
-                        fpga_register.vFPGARegister(
-                            config_offset + 2 * decoder + 1, chunk._heap_register()
-                        )
-                    )
 
                 self.set_stream_input(decoder, chunk.chunk_bytes)
-
-        self.finish_fpga_simulation()
-        self.assert_simulation_output()
 
     # -- One decoder --------------------------------------------------------
 
@@ -308,7 +293,7 @@ class VFPGATopTestCase(OutputWriterTestCase):
         """Resizes the FPGA-initiated transfers, mirroring output_writer_test.py."""
         self.memory_manager = memory_manager.FPGAOutputMemoryManager(
             self.get_io_writer(),
-            self.global_config,
+            self.config,
             allocation_size,
             transfer_size,
             all_done_callback=self.memory_manager_all_done_callback_spawner,

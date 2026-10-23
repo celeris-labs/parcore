@@ -1,14 +1,16 @@
 `timescale 1ns / 1ps
 
 `include "libstf_macros.svh"
+`include "parcore_macros.svh"
 
 import lynxTypes::AXI_DATA_BITS;
 import libstf::data8_t;
 import libstf::data32_t;
 import libstf::type_t;
-import libstf::german_str_t;
+import libstf::INT16_T;
 import libstf::INT32_T;
-import libstf::GERMAN_STR_T;
+import libstf::INT64_T;
+import libstf::BYTE_T;
 import parcore::*;
 
 module ColumnChunkDecoder #(
@@ -112,11 +114,14 @@ NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_plain_in_skid_buffer (
     .out(plain_in)
 );
 
+ready_valid_i #(logic) plain_required_conf (clk, reset_synced); // is_required
 StripLevels #(
     .NUM_BYTES(DATABEAT_SIZE)
 ) inst_strip_levels (
     .clk(clk),
     .rst_n(reset_synced),
+
+    .conf(plain_required_conf),
 
     .in(plain_in),
     .out(plain_stripped)
@@ -223,7 +228,7 @@ DictionaryBody #(DATABEAT_SIZE) inst_dict_body (
 
 
 // ------ Dictionary Encoded Path ---------------
-data_i #(data32_t) hybrid_page_decoder_conf(clk, reset_synced);
+data_i #(hybrid_page_conf_t) hybrid_page_decoder_conf(clk, reset_synced);
 ndata_i #(id_t, NUM_DICT_ELEM) dict_ids_native (clk, reset_synced);
 HybridPageDecoder #(
     .data_t(id_t),
@@ -348,7 +353,51 @@ NormalizeUntil #(
     .out (per_cc_out)
 );
 
-`DATA_ASSIGN(per_cc_out, out)
+// 64 bit values cast to a narrower integer type are first narrowed to INT32_T, because the
+// TypedNDataCast narrows by at most one step. Both casts need the dense input the NormalizeUntil
+// provides.
+ready_valid_i #(type_t) physical_type_conf (clk, reset_synced);
+ready_valid_i #(type_t) path_type_conf (clk, reset_synced);
+ready_valid_i #(type_t) logical_type_conf (clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) per_cc_physical (clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) per_cc_narrowed (clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) per_cc_logical (clk, reset_synced);
+
+NDataToTypedNData #(DATABEAT_SIZE) inst_out_type (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in_type(physical_type_conf),
+    .in(per_cc_out),
+
+    .out(per_cc_physical)
+);
+
+TypedNDataCast #(
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_narrow_cast (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .out_type(path_type_conf),
+
+    .in(per_cc_physical),
+    .out(per_cc_narrowed)
+);
+
+TypedNDataCast #(
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_logical_cast (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .out_type(logical_type_conf),
+
+    .in(per_cc_narrowed),
+    .out(per_cc_logical)
+);
+
+`DATA_ASSIGN(per_cc_logical, out)
 
 // ------------------------------------------------------------------
 // ------ Config distribution ---------------------------------------
@@ -462,7 +511,7 @@ end
  * never reset and thus misconfigured for the next column chuk.
  */
 
-data_i #(data32_t) _hybrid_page_decoder_conf (clk, reset_synced);
+data_i #(hybrid_page_conf_t) _hybrid_page_decoder_conf (clk, reset_synced);
 // This condition is only true if a PLAIN fallback occured
 logic hybrid_flush;
 assign hybrid_flush = page_conf_r.last &&
@@ -480,11 +529,12 @@ always_ff @( posedge clk ) begin : configure_hybrid_page_decoder
     );
 
     // All these signals remain stable during configuration
-    _hybrid_page_decoder_conf.data <= hybrid_flush ? '0 : page_conf_r.num_values;
+    _hybrid_page_decoder_conf.data.num_values  <= hybrid_flush ? '0 : page_conf_r.num_values;
+    _hybrid_page_decoder_conf.data.is_required <= cc_conf_latched.is_required;
     _hybrid_page_decoder_conf.keep <= ~hybrid_flush;
     _hybrid_page_decoder_conf.last <= page_conf_r.last;
 end
-`SKID_DATA_SIGNAL(data32_t, clk, rst_n, _hybrid_page_decoder_conf, hybrid_page_decoder_conf)
+`SKID_DATA_SIGNAL(hybrid_page_conf_t, clk, rst_n, _hybrid_page_decoder_conf, hybrid_page_decoder_conf)
 
 // The Hybrid path routing needs to be once per hybrid pages group
 ready_valid_i #(type_t) _dict_id_conf (clk, rst_n);
@@ -602,6 +652,18 @@ always_ff @( posedge clk ) begin : configure_out_mux
 end
 `SKID_SIGNAL(logic, clk, rst_n, _out_mux_conf, out_mux_conf)
 
+// ------ Plain Data Page level configuration ---------------------------------------
+ready_valid_i #(logic) _plain_required_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_plain_required
+    _plain_required_conf.valid <= n_conf_valid(
+        _plain_required_conf.valid,
+        _plain_required_conf.ready,
+        page_conf_r.page_type == PAGE_TYPE_PLAIN
+    );
+    _plain_required_conf.data <= cc_conf_latched.is_required;
+end
+`SKID_SIGNAL(logic, clk, rst_n, _plain_required_conf, plain_required_conf)
+
 // ------ Column Chunk level configurations ---------------------------------------
 ready_valid_i #(data32_t) _normalize_until_conf (clk, rst_n);
 always_ff @( posedge clk ) begin : configure_normalize_until
@@ -615,6 +677,35 @@ always_ff @( posedge clk ) begin : configure_normalize_until
 end
 `SKID_SIGNAL(data32_t, clk, rst_n, _normalize_until_conf, normalize_until_conf)
 
+ready_valid_i #(type_t) _physical_type_conf (clk, reset_synced);
+ready_valid_i #(type_t) _path_type_conf (clk, reset_synced);
+ready_valid_i #(type_t) _logical_type_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_casts
+    _physical_type_conf.valid <= n_conf_valid(
+        _physical_type_conf.valid,
+        _physical_type_conf.ready,
+        first_page
+    );
+    _path_type_conf.valid <= n_conf_valid(
+        _path_type_conf.valid,
+        _path_type_conf.ready,
+        first_page
+    );
+    _logical_type_conf.valid <= n_conf_valid(
+        _logical_type_conf.valid,
+        _logical_type_conf.ready,
+        first_page
+    );
+    _physical_type_conf.data <= cc_conf_latched.typ;
+    _path_type_conf.data     <= cc_conf_latched.typ == INT64_T &&
+                                cc_conf_latched.logical_typ inside {INT32_T, INT16_T, BYTE_T} ?
+                                INT32_T : cc_conf_latched.typ;
+    _logical_type_conf.data  <= cc_conf_latched.logical_typ;
+end
+`SKID_SIGNAL(type_t, clk, rst_n, _physical_type_conf, physical_type_conf)
+`SKID_SIGNAL(type_t, clk, rst_n, _path_type_conf, path_type_conf)
+`SKID_SIGNAL(type_t, clk, rst_n, _logical_type_conf, logical_type_conf)
+
 assign all_modules_consumed_configs =
         !_decompressor_conf.valid &&
         !_data_page_path_conf.valid &&
@@ -626,7 +717,11 @@ assign all_modules_consumed_configs =
         !_plain_str_decoder_conf.valid &&
         !_rewrite_last_conf.valid &&
         !_out_mux_conf.valid &&
-        !_normalize_until_conf.valid;
+        !_normalize_until_conf.valid &&
+        !_plain_required_conf.valid &&
+        !_physical_type_conf.valid &&
+        !_path_type_conf.valid &&
+        !_logical_type_conf.valid;
 assign chunk_confs[0].ready = state == WAIT_FOR_CC_CONF;
 assign page_conf.ready = state == WAIT_FOR_PAGE_CONF;
 

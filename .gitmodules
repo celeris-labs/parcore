@@ -1,6 +1,6 @@
 [submodule "libstf"]
 	path = libstf
-	url = https://github.com/nightshiftallday/libstf.git
+	url = https://github.com/fpgasystems/libstf.git
 [submodule "vhsnunzip"]
 	path = vhsnunzip
 	url = https://github.com/JonasDann/vhsnunzip.git

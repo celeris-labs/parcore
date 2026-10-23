@@ -39,9 +39,8 @@ public:
     void add_chunk(const std::shared_ptr<libstf::Buffer> &buffer);
 
     /**
-     * Device address the string heap of this column chunk will be written to,
-     * and the base the addresses inside its german_str_t records are relative
-     * to. Zero for chunks that are not BYTE_ARRAY.
+     * The base the addresses inside the german_str_t records of this column
+     * chunk are relative to, as passed to decode_column_chunk.
      */
     [[nodiscard]] uint64_t string_heap_address() const;
 
@@ -57,8 +56,17 @@ public:
     bool chunk_written_;
   };
 
+  /**
+   * Configures the decoder for the column chunk. The german_str_t records of
+   * strings longer than 12 bytes hold string_heap_address plus the offset of the
+   * string in the chunk's heap. The heap buffers are managed by the
+   * OutputBufferManager, whose addresses are not known up front, so this
+   * defaults to 0, i.e., the records hold offsets into the heap. Callers that
+   * provide the heap buffer themselves pass its address to get pointers.
+   */
   [[nodiscard]] std::unique_ptr<Handle>
-  decode_column_chunk(const metadata::ColumnChunk &column_chunk);
+  decode_column_chunk(const metadata::ColumnChunk &column_chunk,
+                      uint64_t string_heap_address = 0);
 
   void
   finished_decoding_column_chunk(const metadata::ColumnChunk &column_chunk);

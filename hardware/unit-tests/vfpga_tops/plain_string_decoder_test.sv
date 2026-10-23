@@ -106,12 +106,28 @@ PlainStringDecoder #(DATABEAT_SIZE) plain_str_decoder (
     .out_data(values)
 );
 
+// The decoder only keeps the heap bytes of every beat, which the HeapNormalizer compacts in the
+// ColumnChunkDecoder
+ndata_i#(data8_t, DATABEAT_SIZE) heap (aclk, aresetn);
+DataNormalizer #(
+    .data_t(data8_t),
+    .NUM_ELEMENTS(DATABEAT_SIZE),
+    .ENABLE_COMPACTOR(1),
+    .COMPACTOR_REGISTER_LEVELS(8)
+) inst_heap_normalizer (
+    .clk(aclk),
+    .rst_n(aresetn),
+
+    .in(values),
+    .out(heap)
+);
+
 AXI4S values_to_host (.aclk(aclk), .aresetn(aresetn));
 NDataToAXI#(data8_t, DATABEAT_SIZE) val_ndata_to_axi (
     .clk(aclk),
     .rst_n(aresetn),
 
-    .in(values),
+    .in(heap),
     .out(values_to_host)
 );
 `AXIS_ASSIGN(values_to_host, axis_host_send[0]);

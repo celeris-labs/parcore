@@ -15,7 +15,7 @@ INT32_T = 1
 INT64_T = 2
 FLOAT_T = 3
 DOUBLE_T = 4
-GERMAN_STR_T = 5
+GERMAN_STR_T = 6  # INT128_T, see GERMAN_STR_T in hardware/src/hdl/common.sv
 
 BEAT_SIZE = 64
 

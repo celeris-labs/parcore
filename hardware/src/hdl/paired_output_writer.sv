@@ -89,9 +89,12 @@ for (genvar I = 0; I < N_CHANNELS; I++) begin : gen_pairs
     AXI4SR data_pair[2](.aclk(clk), .aresetn(reset_synced));
 
     for (genvar J = 0; J < 2; J++) begin : gen_writers
+        stream_writer_notify_i stream_notify (.clk(clk), .rst_n(reset_synced));
+        stream_writer_notify_i stream_issued (.clk(clk), .rst_n(reset_synced));
+        always_comb stream_issued.tie_off_s(); // Unused
+
         StreamWriter #(
             .AXI_STRM_ID(I),
-            .IRQ_STREAM_ID(2 * I + J),
             .TRANSFER_LENGTH_BYTES(TRANSFER_SIZE_BYTES)
         ) inst_stream_writer (
             .clk(clk),
@@ -99,12 +102,21 @@ for (genvar I = 0; I < N_CHANNELS; I++) begin : gen_pairs
 
             .sq_wr(sq_wr_pair[J]),
             .cq_wr(cq_wr_pair[J]),
-            .notify(notify_strm[2 * I + J]),
+            .notify(stream_notify),
+            .issued(stream_issued),
 
             .mem_config(mem_config[2 * I + J]),
 
             .input_data(data_in[2 * I + J]),
             .output_data(data_pair[J])
+        );
+
+        // The interrupt carries the stream id, not the physical channel
+        NotifyMetaIntfAdapter #(
+            .AXI_STRM_ID(2 * I + J)
+        ) inst_notify_adapter (
+            .in(stream_notify),
+            .out(notify_strm[2 * I + J])
         );
     end
 

@@ -1,6 +1,7 @@
 `timescale 1ns / 1ps
 
 `include "libstf_macros.svh"
+`include "parcore_macros.svh"
 
 import libstf::*;
 import parcore::*;

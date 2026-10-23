@@ -188,7 +188,8 @@ parcore::metadata::Metadata read_metadata(std::shared_ptr<arrow::io::RandomAcces
 
 // ParCore does not strip repetition levels, so columns that have them are not supported.
 bool is_supported(const parcore::metadata::ColumnChunk &chunk, bool has_rep_levels) {
-    return !has_rep_levels && parcore::metadata::is_libstf_type(chunk.type);
+    return !has_rep_levels && (parcore::metadata::is_libstf_type(chunk.type) ||
+                               parcore::metadata::is_string_type(chunk.type));
 }
 
 std::shared_ptr<Buffer> load_chunk(std::shared_ptr<arrow::io::RandomAccessFile> file,
@@ -205,7 +206,31 @@ std::shared_ptr<Buffer> load_chunk(std::shared_ptr<arrow::io::RandomAccessFile> 
     return buffer;
 }
 
-using Output = std::vector<std::shared_ptr<Buffer>>;
+// The output of one column chunk. String chunks write their german_str_t records to the values
+// stream and the strings that do not fit inline to the heap stream.
+struct Output {
+    std::vector<std::shared_ptr<Buffer>> values;
+    std::vector<std::shared_ptr<Buffer>> heap;
+
+    size_t size() const {
+        size_t bytes = 0;
+        for (const auto *buffers : {&values, &heap}) {
+            for (const auto &buffer : *buffers) {
+                bytes += buffer->size;
+            }
+        }
+        return bytes;
+    }
+};
+
+std::vector<uint8_t> concatenate(const std::vector<std::shared_ptr<Buffer>> &buffers) {
+    std::vector<uint8_t> bytes;
+    for (const auto &buffer : buffers) {
+        auto data = static_cast<const uint8_t *>(buffer->ptr);
+        bytes.insert(bytes.end(), data, data + buffer->size);
+    }
+    return bytes;
+}
 
 // Passes the outputs to `on_output` in row group order.
 void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder>> &decoders,
@@ -237,8 +262,13 @@ void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder
         auto   p = std::move(pending.front());
         Output output;
         pending.pop_front();
-        while (p.output->stream_has_more_output(p.decoder->decoder())) {
-            output.push_back(p.output->get_next_stream_output(p.decoder->decoder()));
+        while (p.output->stream_has_more_output(p.decoder->values_stream())) {
+            output.values.push_back(p.output->get_next_stream_output(p.decoder->values_stream()));
+        }
+        if (parcore::metadata::is_string_type(p.chunk.type)) {
+            while (p.output->stream_has_more_output(p.decoder->heap_stream())) {
+                output.heap.push_back(p.output->get_next_stream_output(p.decoder->heap_stream()));
+            }
         }
         p.decoder->finished_decoding_column_chunk(p.chunk);
         in_flight[done % decoders.size()] -= 1;
@@ -269,10 +299,82 @@ std::vector<uint8_t> read_values(parquet::ColumnReader &reader, size_t num_value
     return std::vector<uint8_t>(bytes, bytes + total * sizeof(T));
 }
 
+std::vector<std::string> read_strings(parquet::ColumnReader &reader) {
+    auto &typed = static_cast<parquet::ByteArrayReader &>(reader);
+
+    constexpr int64_t               BATCH_SIZE = 1 << 16;
+    std::vector<int16_t>            def_levels(BATCH_SIZE);
+    std::vector<parquet::ByteArray> values(BATCH_SIZE);
+    std::vector<std::string>        strings;
+    while (typed.HasNext()) {
+        int64_t values_read = 0;
+        typed.ReadBatch(BATCH_SIZE, def_levels.data(), nullptr, values.data(), &values_read);
+        // The values point into the reader's page buffer, which the next batch overwrites
+        for (int64_t k = 0; k < values_read; ++k) {
+            strings.emplace_back(reinterpret_cast<const char *>(values[k].ptr), values[k].len);
+        }
+    }
+    return strings;
+}
+
+// Checks the german_str_t records of a string chunk against the strings Arrow decodes. A record is
+// laid out like DuckDB's string_t: the 4 byte length, then strings of up to 12 bytes inline and zero
+// padded, longer ones as their first 4 bytes and a pointer. The heap only holds the strings longer
+// than 12 bytes, back to back, of PLAIN pages per value and of a dictionary page once per entry. As
+// the OutputBufferManager decides where the heap lands, the chunk is configured with heap address 0,
+// which makes the pointers offsets into the heap.
+void verify_strings(size_t i, size_t j, const std::vector<std::string> &expected,
+                    const Output &output) {
+    constexpr size_t RECORD_BYTES = 16, INLINE_BYTES = 12, PREFIX_BYTES = 4;
+    auto             fail = [&](const std::string &msg) {
+        throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
+                                 ": " + msg);
+    };
+
+    auto records = concatenate(output.values);
+    auto heap    = concatenate(output.heap);
+    if (records.size() != expected.size() * RECORD_BYTES) {
+        fail("expected " + std::to_string(expected.size()) + " string records, got " +
+             std::to_string(records.size()) + " bytes");
+    }
+
+    for (size_t k = 0; k < expected.size(); ++k) {
+        const auto    &str    = expected[k];
+        const uint8_t *record = records.data() + k * RECORD_BYTES;
+
+        uint32_t length;
+        std::memcpy(&length, record, sizeof(length));
+
+        uint8_t expected_record[RECORD_BYTES] = {};
+        std::memcpy(expected_record, &length, sizeof(length));
+        if (str.size() <= INLINE_BYTES) {
+            std::memcpy(expected_record + 4, str.data(), str.size());
+        } else {
+            uint64_t heap_offset;
+            std::memcpy(&heap_offset, record + 8, sizeof(heap_offset));
+            std::memcpy(expected_record + 4, str.data(), PREFIX_BYTES);
+            std::memcpy(expected_record + 8, &heap_offset, sizeof(heap_offset));
+            if (heap_offset > heap.size() || str.size() > heap.size() - heap_offset ||
+                std::memcmp(heap.data() + heap_offset, str.data(), str.size()) != 0) {
+                fail("string " + std::to_string(k) + " is not in the heap at offset " +
+                     std::to_string(heap_offset));
+            }
+        }
+        if (length != str.size() || std::memcmp(record, expected_record, RECORD_BYTES) != 0) {
+            fail("record of string " + std::to_string(k) + " does not match");
+        }
+    }
+}
+
 // Returns false if the chunk can't be compared byte by byte.
 bool verify_chunk(parquet::ParquetFileReader &reader, size_t i, size_t j,
                   const parcore::metadata::ColumnChunk &chunk, const Output &output) {
     auto column = reader.RowGroup(i)->Column(j);
+
+    if (parcore::metadata::is_string_type(chunk.type)) {
+        verify_strings(i, j, read_strings(*column), output);
+        return true;
+    }
 
     std::vector<uint8_t> expected_bytes;
     switch (chunk.type) {
@@ -293,11 +395,7 @@ bool verify_chunk(parquet::ParquetFileReader &reader, size_t i, size_t j,
         return false;
     }
 
-    std::vector<uint8_t> actual_bytes;
-    for (const auto &buffer : output) {
-        auto bytes = static_cast<const uint8_t *>(buffer->ptr);
-        actual_bytes.insert(actual_bytes.end(), bytes, bytes + buffer->size);
-    }
+    auto actual_bytes = concatenate(output.values);
 
     if (actual_bytes.size() != expected_bytes.size()) {
         throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
@@ -462,11 +560,7 @@ int main(int argc, char *argv[]) {
             for (size_t rep = 0; rep < args.reps; ++rep) {
                 out_bytes = 0;
                 decode_column(decoders, meta, data, j, args.depth,
-                              [&](size_t, const Output &output) {
-                                  for (const auto &buffer : output) {
-                                      out_bytes += buffer->size;
-                                  }
-                              });
+                              [&](size_t, const Output &output) { out_bytes += output.size(); });
             }
             auto end = std::chrono::high_resolution_clock::now();
             auto us  = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() /
