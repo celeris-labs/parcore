@@ -165,8 +165,8 @@ assign current_varint_offset = (state == ST_DECODE_BPE && varint_offset <= offse
 data8_t[3:0] expected_varint_data;
 assign expected_varint_data = data[current_varint_offset +: 4];
 
-// Verilator does not support ==? with a signal on the right side. 
-// It is two-state, both sides read the same buffer, so == is enough there.
+// The right side of ==? must be a constant in Verilator. It is two-state and
+// both sides read the same buffer, so == is enough there.
 `ifdef VERILATOR
 assert property (@(posedge clk) disable iff (!rst_n) !varint_in.valid || (expected_varint_data == varint_in.data))
 `else
