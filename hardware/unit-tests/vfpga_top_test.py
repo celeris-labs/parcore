@@ -188,6 +188,11 @@ class VFPGATopTestCase(OutputWriterTestCase):
         on channel 0 without either transfer overtaking its own request."""
         self.run_jobs({0: [string_job([b"alpha", b"b" * 30, b"gamma"])]})
 
+    def test_single_decoder_page_ends_in_heap(self):
+        """The records fill whole beats and the page ends with heap bytes, so the decoder's last
+        strings beat has no strings."""
+        self.run_jobs({0: [string_job([bytes([i]) * 64 for i in range(256)])]})
+
     def test_single_decoder_all_inline_strings(self):
         """Every string fits inline, so the heap carries the raw page bytes but no
         record refers into it."""

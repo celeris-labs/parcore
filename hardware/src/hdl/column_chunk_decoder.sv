@@ -150,20 +150,21 @@ PlainRouter #(DATABEAT_SIZE) inst_values_router (
 
 ready_valid_i #(plain_str_decoder_conf_t) plain_str_decoder_conf (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_in (clk, rst_n);
-data_i #(german_str_t) psd_out_strings (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_strings_packed (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_out_heap (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) dict_body_to_str_decoder (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) str_decoder_to_dict_body (clk, rst_n);
-PlainStringDecoder #(DATABEAT_SIZE) inst_psd (
+ParallelStringDecoder #(
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_psd (
     .clk (clk),
     .rst_n (rst_n),
 
     .conf (plain_str_decoder_conf),
 
     .in_data (psd_in),
-    .out_strings (psd_out_strings),
-    .out_data (psd_out_heap)
+    .out_strings (psd_strings_packed),
+    .out_heap (psd_out_heap)
 );
 
 // The heap normalizer is used to pack the heap values across pages
@@ -183,16 +184,6 @@ HeapNormalizer #(
 );
 
 `DATA_ASSIGN(heap_packed, heap_out)
-
-GermanStrToNData #(
-    .DATABEAT_SIZE(DATABEAT_SIZE)
-) inst_psd_string_packer (
-    .clk (clk),
-    .rst_n (reset_synced),
-
-    .in (psd_out_strings),
-    .out (psd_strings_packed)
-);
 
 ready_valid_i #(page_type_info_t) str_router_conf (clk, rst_n);
 StringRouter #(DATABEAT_SIZE) inst_str_router (
@@ -228,6 +219,16 @@ DictionaryBody #(DATABEAT_SIZE) inst_dict_body (
 
 
 // ------ Dictionary Encoded Path ---------------
+// Registers the handover, so the RunDecoder's ready does not reach into the Decompressor
+ndata_i #(data8_t, DATABEAT_SIZE) hybrid_in(clk, reset_synced);
+NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_hybrid_in_skid_buffer (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in(ins[IN_HYBRID]),
+    .out(hybrid_in)
+);
+
 data_i #(hybrid_page_conf_t) hybrid_page_decoder_conf(clk, reset_synced);
 ndata_i #(id_t, NUM_DICT_ELEM) dict_ids_native (clk, reset_synced);
 HybridPageDecoder #(
@@ -240,7 +241,7 @@ HybridPageDecoder #(
 
     .conf(hybrid_page_decoder_conf),
 
-    .in(ins[IN_HYBRID]),
+    .in(hybrid_in),
     .out(dict_ids_native)
 );
 
@@ -764,7 +765,7 @@ StreamProfiler inst_profile_out (
 );
 
 // ------ Heap path instrumentation ---------------------------------------
-// Counts what the decoder puts on psd_out_heap, the PlainStringDecoder's heap
+// Counts what the decoder puts on psd_out_heap, the ParallelStringDecoder's heap
 // output as it enters HeapNormalizer. This is the last point before the packing
 // and last-rewriting, so comparing these against what the host receives says
 // whether a missing heap completion was never produced or was lost downstream.
@@ -786,9 +787,32 @@ always_ff @(posedge clk) begin
     end
 end
 
+// ParallelStringDecoder ports. The keeps are padded to the 64 bits of the IP.
+ila_string_decoder inst_ila_string_decoder (
+    .clk(clk),
+    .probe0(reset_synced),
+
+    .probe1(plain_str_decoder_conf.valid),
+    .probe2(plain_str_decoder_conf.ready),
+
+    .probe3(psd_in.valid),
+    .probe4(psd_in.ready),
+    .probe5(psd_in.last),
+
+    .probe6(psd_strings_packed.valid),
+    .probe7(psd_strings_packed.ready),
+    .probe8(psd_strings_packed.last),
+    .probe9(64'(psd_strings_packed.keep)),
+
+    .probe10(psd_out_heap.valid),
+    .probe11(psd_out_heap.ready),
+    .probe12(psd_out_heap.last),
+    .probe13(64'(psd_out_heap.keep))
+);
+
 `ifdef DEBUG
 // Every port of the five modules that can stall the pipeline on their own:
-// Decompressor, HybridPageDecoder, Dictionary, PlainStringDecoder and the
+// Decompressor, HybridPageDecoder, Dictionary, ParallelStringDecoder and the
 // output multiplexer. A blocked stream reads as valid=1 with ready=0, so
 // ready is captured alongside valid - without it the trace says something is
 // stuck but not which side is holding it up.
@@ -824,13 +848,13 @@ ila_cc_decoder inst_ila_cc_decoder (
     .probe18(dict_out_values.valid),
     .probe19(dict_out_values.ready),
 
-    // PlainStringDecoder
+    // ParallelStringDecoder
     .probe20(plain_str_decoder_conf.valid),
     .probe21(plain_str_decoder_conf.ready),
     .probe22(psd_in.valid),
     .probe23(psd_in.ready),
-    .probe24(psd_out_strings.valid),
-    .probe25(psd_out_strings.ready),
+    .probe24(psd_strings_packed.valid),
+    .probe25(psd_strings_packed.ready),
     .probe26(psd_out_heap.valid),
     .probe27(psd_out_heap.ready),
 

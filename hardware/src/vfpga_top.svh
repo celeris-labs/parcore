@@ -9,7 +9,7 @@ always_comb sq_rd.tie_off_m();
 always_comb cq_rd.tie_off_s();
 
 localparam N_STREAMS = N_STRM_AXI;
-localparam DATABEAT_SIZE = 32;
+localparam DATABEAT_SIZE = 64;
 localparam AXI_DATA_SIZE = 64;
 
 // Pipeline depth on every stream between the shell (SLR0) and a decoder. Matches
@@ -26,12 +26,15 @@ assign rst_n = aresetn;
 /* -- CONFIG ------------------------------------------------------------ */
 // Two output streams per decoder: values on stream 2I, heap on stream 2I+1.
 // Both share physical channel I (see PairedOutputWriter).
+// MemConfig has a write register per stream plus flush and 4 read registers.
+localparam MEM_CONFIG_REGS = 2*N_STREAMS+1 > 4 ? 2*N_STREAMS+1 : 4;
+
 write_config_i write_configs[2](.*);
 read_config_i  read_configs [2](.*);
 GlobalConfig #(
     .SYSTEM_ID(PARCORE_SYSTEM_ID),
     .NUM_CONFIGS(2),
-    .ADDR_SPACE_SIZES({2*N_STREAMS+1, COLUMN_CHUNK_DECODER_READ_REGS(N_STREAMS)})
+    .ADDR_SPACE_SIZES({MEM_CONFIG_REGS, COLUMN_CHUNK_DECODER_READ_REGS(N_STREAMS)})
 ) inst_config (
     .clk(clk),
     .rst_n(rst_n),

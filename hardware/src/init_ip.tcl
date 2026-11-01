@@ -265,3 +265,25 @@ set_property -dict [list \
     CONFIG.C_PROBE17_WIDTH {6} \
     CONFIG.C_PROBE18_WIDTH {32} \
 ] [get_ips ila_shell_io]
+
+# ParallelStringDecoder ports in the ColumnChunkDecoder. probe9 and probe13 are the keep of the
+# strings and heap beats, padded to 64 bits.
+create_ip {*}$ila_create_args -module_name ila_string_decoder
+set_property -dict [list \
+    CONFIG.C_NUM_OF_PROBES {14} \
+    CONFIG.C_EN_STRG_QUAL {1} \
+    CONFIG.C_PROBE0_WIDTH {1} \
+    CONFIG.C_PROBE1_WIDTH {1} \
+    CONFIG.C_PROBE2_WIDTH {1} \
+    CONFIG.C_PROBE3_WIDTH {1} \
+    CONFIG.C_PROBE4_WIDTH {1} \
+    CONFIG.C_PROBE5_WIDTH {1} \
+    CONFIG.C_PROBE6_WIDTH {1} \
+    CONFIG.C_PROBE7_WIDTH {1} \
+    CONFIG.C_PROBE8_WIDTH {1} \
+    CONFIG.C_PROBE9_WIDTH {64} \
+    CONFIG.C_PROBE10_WIDTH {1} \
+    CONFIG.C_PROBE11_WIDTH {1} \
+    CONFIG.C_PROBE12_WIDTH {1} \
+    CONFIG.C_PROBE13_WIDTH {64} \
+] [get_ips ila_string_decoder]
