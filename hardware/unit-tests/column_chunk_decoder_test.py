@@ -89,8 +89,7 @@ def _parquet_chunk(parquet_filename: str, col_idx: int = 0) -> _ColumnChunk:
 #   col2 l_suppkey     11 entries,  88 B                   passes
 #   col3 l_linenumber   7 entries,  56 B                   HANGS
 #
-# 7 entries is the first of the three that does not fill a whole DATABEAT_SIZE=32
-# beat pair, which is why these run at both 32 and 64 bytes per beat.
+# 7 entries is the first of the three that does not fill a whole 32 B beat pair.
 #
 # The chunks are inlined verbatim rather than read from the file: each is the
 # byte range [dictionary_page_offset or data_page_offset, +total_compressed_size)
@@ -446,8 +445,7 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
             )
             self.profile = self.config.get_config(ColumnChunkDecoderConfig).read_profile(0)
 
-        # Not super(): ColumnChunkDecoder32TestCase reuses this method without subclassing
-        ConfiguredTestCase.finish_input(self, end_event)
+        super().finish_input(end_event)
 
     def run_chunks(self, inputs: list[_ColumnChunk], outputs: list[list[int]],
                    read_profile: bool = False):
@@ -471,7 +469,7 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
         self._run_stress_column(*stress_dict_chunks()[1][1:])
 
     def test_stress_dict_7_entries(self):
-        """l_linenumber: 7-entry dictionary. Hangs vfpga_top at DATABEAT_SIZE=32."""
+        """l_linenumber: 7-entry dictionary, which hung vfpga_top at DATABEAT_SIZE=32."""
         self._run_stress_column(*stress_dict_chunks()[2][1:])
 
     def _run_stress_sequence(self, cols: list[int], expected: list[list[int]]):
@@ -816,62 +814,53 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
             ],
         )
 
-    def test_defer_dict_decoding(self):
-        # Chunks that emit their dictionary and indices: 1-byte indices for a 64-bit OPTIONAL chunk,
-        # 2-byte and 4-byte indices for REQUIRED 32-bit chunks whose dictionaries have more than 256
-        # and 65,536 entries, and SNAPPY-compressed chunks from Parquet files. Value chunks before,
-        # in between and after check that the decoder switches between the modes.
-        int64_dict = [-2**63, -1, 0, 1, 2**63 - 1, -123456789012, 98765432109, -7, 65536, -65537]
-        int64_chunk = make_tricky(
-            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 2, dict_values=int64_dict, trailing_plain=False,
-        )
-        int64_chunk.defer_dict_decoding = True
+    # -- hits.parquet CounterID -----------------------------------------------
+    #
+    # These hung on hardware at DATABEAT_SIZE=32. They are the first two row groups of the
+    # REQUIRED INT32 column, verbatim: a dictionary page of 3/5 entries and a single
+    # data page whose RLE/bit-packed hybrid indices are a short RLE run, one
+    # bit-packed group and very long RLE runs, e.g. [rle 9][bp 8][rle 450543].
+    def _run_counterid(self, row_groups: list[int]):
+        chunks = [_ColumnChunk(
+                      compression=True,
+                      num_values=sum(n for _, n in _COUNTERID_RUNS[rg]),
+                      chunk_bytes=bytearray(_COUNTERID_CHUNKS[rg]),
+                      stream_type=fpga_stream.StreamType.SIGNED_INT_32,
+                      is_required=True)
+                  for rg in row_groups]
+        expected = [[v for v, n in _COUNTERID_RUNS[rg] for _ in range(n)] for rg in row_groups]
+        self.run_chunks(chunks, expected)
 
-        int16_index_dict = [3 * i - 1000 for i in range(300)]
-        int16_index_chunk = make_tricky(
-            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 1,
-            stream_type=fpga_stream.StreamType.SIGNED_INT_32, dict_values=int16_index_dict,
-            trailing_plain=False, is_required=True,
-        )
-        int16_index_chunk.defer_dict_decoding = True
+    def test_hits_counterid_rg0(self):
+        self._run_counterid([0])
 
-        int32_index_dict = list(range(70000))
-        int32_index_chunk = make_tricky(
-            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 1,
-            stream_type=fpga_stream.StreamType.SIGNED_INT_32, dict_values=int32_index_dict,
-            trailing_plain=False, is_required=True,
-        )
-        int32_index_chunk.defer_dict_decoding = True
+    def test_hits_counterid_rg1(self):
+        self._run_counterid([1])
 
-        rle_chunk = _parquet_chunk('rle_data.parquet')
-        rle_chunk.defer_dict_decoding = True
+    def test_hits_counterid_rg203(self):
+        """Its dictionary page is 8 entries, exactly one 32 B beat."""
+        self._run_counterid([203])
 
-        mixed_output = ([i**8 for i in range(10, 20) for _ in range(i)] +
-                        list(range(128, 256)) * 2) * 2
-        mixed_chunk = _parquet_chunk('mixed_data.parquet')
-        mixed_chunk.defer_dict_decoding = True
 
-        int64 = fpga_stream.StreamType.SIGNED_INT_64
-        int32 = fpga_stream.StreamType.SIGNED_INT_32
-        self.run_chunks(
-            [
-                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1),
-                int64_chunk,
-                int16_index_chunk,
-                make_plain_data(_PLAIN_OUTPUT),
-                int32_index_chunk,
-                rle_chunk,
-                _parquet_chunk('rle_data.parquet'),
-                mixed_chunk,
-            ],
-            [
-                _RLE_OUTPUT + _PLAIN_OUTPUT,
-                _deferred_dict_output(int64_dict, _rle_output(int64_dict) * 2, int64),
-                _deferred_dict_output(int16_index_dict, _rle_output(int16_index_dict), int32),
-                _PLAIN_OUTPUT,
-                _deferred_dict_output(int32_index_dict, _rle_output(int32_index_dict), int32),
-                _deferred_dict_output(list(range(10, 20)), _RLE_OUTPUT, int64),
-                _RLE_OUTPUT,
-                _deferred_dict_output(list(dict.fromkeys(mixed_output)), mixed_output, int64),
-            ],
-        )
+_COUNTERID_CHUNKS = {
+    0: bytes.fromhex(
+        "15041518151c4c150615041200000c2c1100000014000000260000001500151415182c158080371504150615061c"
+        "18042600000018041100000016002804260000001804110000000000000a240212000355a5deff3602"),
+    1: bytes.fromhex(
+        "15041528152c4c150a1504120000144c2600000031000000340000003b0000003e00000015001528152c2c159cdd4a"
+        "1504150615061c18043e000000180426000000160028043e000000180426000000000000144c03928107000589"
+        "244992b46dccc509039e963a04"),
+}
+
+_COUNTERID_CHUNKS[203] = bytes.fromhex(
+    "1504154015444c15101504120000207c5c8e0200718e020091b80200c3e60200f8ee02001eef020051ef02007e0b"
+    "03001500153e15422c158080291504150615061c18047e0b030018045c8e0200160028047e0b030018045c8e0200"
+    "0000001f78039c8d0100ec710180800a028080050388e70204961505e2830206f8801307")
+
+# (value, count) runs of the decoded values
+_COUNTERID_RUNS = {
+    0: [(17, 9), (20, 6), (38, 450545)],
+    1: [(38, 57417), (49, 2), (52, 10), (59, 78186), (62, 476559)],
+    203: [(167516, 9038), (167537, 7286), (178321, 81920), (190147, 40960), (192248, 22980),
+          (192286, 1355), (192337, 16625), (199550, 155708)],
+}

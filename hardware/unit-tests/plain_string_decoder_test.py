@@ -311,6 +311,42 @@ class PlainStringDecoderTest(fpga_test_case.FPGATestCase):
             b"the quick brown fox jumps over the lazy dog",
         ])
 
+    # ------------------------------------------------------------------
+    # Several strings per cycle
+    # ------------------------------------------------------------------
+
+    def test_every_length_once(self):
+        """Lengths 0..40, so records start at every offset of a beat and groups mix short and long
+        strings."""
+        self._run([bytes([65 + i % 26]) * i for i in range(41)])
+
+    def test_empty_strings_many_per_beat(self):
+        """Empty strings are 4 bytes each, so a beat holds more records than one group."""
+        self._run([b""] * 45)
+
+    def _run_prefix_crosses_beat(self, split: int):
+        """A long string whose length prefix is split over two beats, so its payload starts split
+        bytes into the next beat, followed by more strings."""
+        self._run([b"p" * (BEAT_SIZE - 4 - (4 - split)), b"L" * 20, b"ab", b"cdefghijklmnop"])
+
+    def test_length_prefix_crosses_beat_1(self):
+        self._run_prefix_crosses_beat(1)
+
+    def test_length_prefix_crosses_beat_2(self):
+        self._run_prefix_crosses_beat(2)
+
+    def test_length_prefix_crosses_beat_3(self):
+        self._run_prefix_crosses_beat(3)
+
+    def test_random_short_and_long(self):
+        """Many strings, mostly short, some long."""
+        seed(0x5EED)
+        strings = []
+        for _ in range(300):
+            n = randint(0, 16) if randint(0, 9) else randint(13, 150)
+            strings.append(bytes(randint(0, 255) for _ in range(n)))
+        self._run(strings)
+
     def test_random_input(self):
         """A larger page mixing every category to cover all FSM paths together."""
         self.overwrite_simulation_time(simulation_time.SimulationTime.till_finished())

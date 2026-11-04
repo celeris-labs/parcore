@@ -10,7 +10,7 @@ import libstf::*;
 */
 module HeapNormalizer #(
     parameter NUM_BYTES = AXI_DATA_BITS / 8,
-    parameter COMPACTOR_REGISTER_LEVELS = 8,
+    parameter COMPACTOR_REGISTER_LEVELS = 3,
     parameter BARREL_SHIFTER_REGISTER_LEVELS = 2
 ) (
     input logic clk,
