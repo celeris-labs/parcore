@@ -6,8 +6,12 @@ import libstf::*;
 import parcore::*;
 import parcore_string::*;
 
-// Finds the length prefixes of a PLAIN encoded string page and extracts up to N lengths and their
-// positions per cycle. See docs/strings/length_extractor.md.
+// Finds the length prefixes of a PLAIN encoded string page and extracts up to 4 strings per cycle.
+//
+// Which bytes are prefixes depends on all prefixes before them, so they form a chain. To follow the
+// chain for 4 prefixes in one cycle, a table stores for every byte where the next prefix would be if
+// that byte was a prefix, and where the prefix after that would be. A beat with more prefixes than
+// fit into a cycle is repeated with duplicate set.
 module LengthExtractor #(
     parameter int BEAT_WIDTH   = STRING_BEAT_WIDTH,
     parameter int EXTEND_WIDTH = STRING_EXTEND_WIDTH,
@@ -22,270 +26,332 @@ module LengthExtractor #(
 
 `RESET_RESYNC // Reset pipelining
 
-localparam int VIEW_WIDTH    = BEAT_WIDTH + EXTEND_WIDTH;
-localparam int PREFIX_BYTES  = 4;
-localparam int POS_BITS      = $clog2(BEAT_WIDTH);
-localparam int NUM_PRE_STEPS = $clog2(N) + 1;
+localparam int VIEW_WIDTH   = BEAT_WIDTH + EXTEND_WIDTH;
+localparam int PREFIX_BYTES = STRING_PREFIX_BYTES;
+localparam int INLINE_BYTES = STRING_INLINE_BYTES;
+localparam int POS_BITS     = $clog2(BEAT_WIDTH);
 
-`ASSERT_ELAB(EXTEND_WIDTH >= PREFIX_BYTES - 1)
-`ASSERT_ELAB(N >= 1 && 2 ** $clog2(N) == N)
+`ASSERT_ELAB(EXTEND_WIDTH >= PREFIX_BYTES + INLINE_BYTES - 1)
+`ASSERT_ELAB(N == 4)
+`ASSERT_ELAB(2 ** POS_BITS == BEAT_WIDTH && POS_BITS < 8)
 `ASSERT_ELAB(in.NUM_ELEMENTS == VIEW_WIDTH)
 `ASSERT_ELAB(BEAT_WIDTH == STRING_BEAT_WIDTH && EXTEND_WIDTH == STRING_EXTEND_WIDTH && N == STRING_N)
 
-typedef logic[POS_BITS - 1:0] pos_t;  // Offset within the beat
-typedef logic[32:0]           dist_t; // Byte distance from the start of the beat
+typedef logic[POS_BITS - 1:0]      pos_t;   // Offset within the beat
+typedef logic[POS_BITS + 1:0]      sum_t;   // Offset plus prefix plus the low bits of a length
+typedef logic[32 - POS_BITS - 1:0] beats_t; // Number of beats
 
-// A position in the chain of length prefixes. pos is only meaningful if in_beat is set, except for
-// jump, where pos is the last length prefix in the beat if in_beat is not set.
+// Where the chain continues after a length prefix:
+// - in_beat set, pos >= PREFIX_BYTES: at pos of this beat
+// - in_beat not set:                  at pos of the next beat
+// - in_beat set, pos < PREFIX_BYTES:  past the next beat. A hop cannot end this early in a beat.
 typedef struct packed {
     logic in_beat;
     pos_t pos;
 } ptr_t;
 
-// Jump here denotes the cursor position of the length prefix, the cursor would jump to
-// after parsing N length prefixes
+typedef logic[POS_BITS:0] count_t; // Number of valid bytes of a beat
+
 typedef struct packed {
     data8_t[VIEW_WIDTH - 1:0] data;
-    logic  [VIEW_WIDTH - 1:0] keep;
+    count_t                   count;
     logic                     last;
-    ptr_t  [BEAT_WIDTH - 1:0] next;
-    ptr_t  [BEAT_WIDTH - 1:0] jump;
-} pre_beat_t;
+    ptr_t  [BEAT_WIDTH - 1:0] next; // One hop from each byte
+} first_beat_t;
 
 typedef struct packed {
-    data8_t [VIEW_WIDTH - 1:0] data;
-    logic   [VIEW_WIDTH - 1:0] keep;
-    logic                      last;
-    logic                      duplicate; // Whether this beat contains the same data
-                                          // as the previous beat. This can be the case
-                                          // if there are more then N length prefixes in a
-                                          // single beat
-    ptr_t   [BEAT_WIDTH - 1:0] next;
-    ptr_t                      sub;
-    data32_t[N - 1:0]          lengths;
-    pos_t   [N - 1:0]          positions;
-    logic   [N - 1:0]          length_keep;
-} ext_beat_t;
+    data8_t[VIEW_WIDTH - 1:0] data;
+    count_t                   count;
+    logic                     last;
+    ptr_t  [BEAT_WIDTH - 1:0] next;  // One hop from each byte
+    ptr_t  [BEAT_WIDTH - 1:0] next2; // Two hops from each byte, if the first hop stays in the beat
+    logic  [BEAT_WIDTH - 1:0] two_hops_stay; // Two hops from each byte stay in the beat
+} table_beat_t;
 
-function automatic data32_t read_length(data8_t[VIEW_WIDTH - 1:0] data, pos_t pos);
-    for (int i = 0; i < PREFIX_BYTES; i++) begin
-        read_length[i * 8+:8] = data[int'(pos) + i];
+typedef struct packed {
+    data8_t[VIEW_WIDTH - 1:0] data;
+    count_t                   count;
+    logic                     last;
+    logic                     duplicate;
+    pos_t  [N - 1:0]          positions;
+    logic  [N - 1:0]          length_keep;
+} position_beat_t;
+
+// The length prefix and the inline bytes after it
+typedef data8_t[PREFIX_BYTES + INLINE_BYTES - 1:0] window_t;
+
+// The bytes at pos with one shifter, so the bytes of a window share their multiplexers
+function automatic window_t read_window(data8_t[VIEW_WIDTH - 1:0] data, pos_t pos);
+    for (int i = POS_BITS - 1; i >= 0; i--) begin
+        if (pos[i]) begin
+            data = data >> (8 * 2 ** i);
+        end
     end
+    return window_t'(data);
 endfunction
 
-// ------- Preprocessing ---------
-pre_beat_t pre      [NUM_PRE_STEPS];
-logic      pre_valid[NUM_PRE_STEPS];
-pre_beat_t pre_first;
+// The bytes of a beat are consecutive, as positions are counted in full beats
+function automatic count_t count_bytes(logic[BEAT_WIDTH - 1:0] keep);
+    pos_t last_pos;
 
-data_i #(pre_beat_t) to_extraction(clk, reset_synced), extraction_in(clk, reset_synced);
+    last_pos = '0;
+    for (int i = POS_BITS - 1; i >= 0; i--) begin
+        if (keep[int'(last_pos) + 2 ** i]) begin
+            last_pos += 2 ** i;
+        end
+    end
+    return keep[last_pos] ? count_t'(last_pos) + 1 : '0;
+endfunction
 
-logic pre_enable;
-assign pre_enable = !pre_valid[NUM_PRE_STEPS - 1] || to_extraction.ready;
+function automatic logic stays_in_beat(ptr_t hop);
+    return hop.in_beat && hop.pos >= PREFIX_BYTES;
+endfunction
+
+// ------- Table ---------
+first_beat_t table_first;
+table_beat_t table_beat, table_beat_next;
+logic        table_valid;
+
+data_i #(first_beat_t) to_table(clk, reset_synced), table_in(clk, reset_synced);
+
+(* max_fanout = 64 *) logic table_enable;
 
 always_comb begin
-    pre_first.data = in.data;
-    pre_first.keep = in.keep;
-    pre_first.last = in.last;
+    // The bytes without keep are undefined in the last beat, so they are not used for the chain
+    data8_t[BEAT_WIDTH + PREFIX_BYTES - 2:0] table_data;
+    logic[BEAT_WIDTH + PREFIX_BYTES - 2:0]   byte_zero;
 
+    for (int i = 0; i < BEAT_WIDTH + PREFIX_BYTES - 1; i++) begin
+        table_data[i] = in.keep[i] ? in.data[i] : '0;
+        byte_zero[i]  = table_data[i] == '0;
+    end
+
+    table_first.data  = in.data;
+    table_first.count = count_bytes(in.keep[BEAT_WIDTH - 1:0]);
+    table_first.last  = in.last;
+
+    // Only the low bits of a length are added. The other bits only say that the chain leaves the beat.
     for (int b = 0; b < BEAT_WIDTH; b++) begin
-        dist_t next;
-        logic  next_in_beat;
+        sum_t sum;
+        logic upper_zero, past_next_beat;
 
-        next = dist_t'(b) + PREFIX_BYTES + read_length(in.data, pos_t'(b));
-        next_in_beat = next < BEAT_WIDTH && in.keep[next[POS_BITS - 1:0]];
+        sum            = sum_t'(b) + PREFIX_BYTES + table_data[b][POS_BITS - 1:0];
+        upper_zero     = byte_zero[b + 1] && byte_zero[b + 2] && byte_zero[b + 3];
+        past_next_beat = !upper_zero || (table_data[b] >> (POS_BITS + 1)) != '0 || sum[POS_BITS + 1] ||
+                         (table_data[b][POS_BITS] && sum[POS_BITS]);
 
-        pre_first.next[b]      = ptr_t'{in_beat: next_in_beat, pos: next[POS_BITS - 1:0]};
-        pre_first.jump[b]      = next_in_beat ? pre_first.next[b] : ptr_t'{in_beat: 1'b0, pos: pos_t'(b)};
+        table_first.next[b].in_beat = past_next_beat || (!table_data[b][POS_BITS] && !sum[POS_BITS]);
+        table_first.next[b].pos     = past_next_beat ? '0 : sum[POS_BITS - 1:0];
     end
 end
+
+assign to_table.data  = table_first;
+assign to_table.keep  = 1'b1;
+assign to_table.last  = in.last;
+assign to_table.valid = in.valid;
+assign in.ready       = to_table.ready;
+
+DataSkidBuffer #(first_beat_t) inst_table_skid_buffer (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in(to_table),
+    .out(table_in)
+);
+
+// A hop moves at least PREFIX_BYTES forward, so each byte only selects from the bytes after that.
+// next2 is not used if the first hop leaves the beat, which is outside of reachable.
+for (genvar B = 0; B < BEAT_WIDTH; B++) begin : gen_next2
+    if (B + PREFIX_BYTES < BEAT_WIDTH) begin : gen_reachable
+        ptr_t[BEAT_WIDTH - 1:B + PREFIX_BYTES] reachable;
+
+        assign reachable                = table_in.data.next[BEAT_WIDTH - 1:B + PREFIX_BYTES];
+        assign table_beat_next.next2[B] = reachable[table_in.data.next[B].pos];
+    end else begin : gen_unreachable
+        assign table_beat_next.next2[B] = '0;
+    end
+end
+
+// Whether a beat is repeated decides the enable of all registers before it, so it is read with two
+// lookups instead of following the chain.
+for (genvar B = 0; B < BEAT_WIDTH; B++) begin : gen_hops_stay
+    assign table_beat_next.two_hops_stay[B] = stays_in_beat(table_in.data.next[B]) &&
+                                              stays_in_beat(table_beat_next.next2[B]);
+end
+
+assign table_beat_next.data  = table_in.data.data;
+assign table_beat_next.count = table_in.data.count;
+assign table_beat_next.last  = table_in.data.last;
+assign table_beat_next.next  = table_in.data.next;
 
 always_ff @(posedge clk) begin
-    if (pre_enable) begin
-        pre[0] <= pre_first;
-    end
-end
-
-// Each step doubles the number of hops of jump
-for (genvar S = 1; S < NUM_PRE_STEPS; S++) begin : gen_pre_steps
-    // A hop moves at least PREFIX_BYTES forward, so an in-beat jump of byte B points to
-    // B + MIN_DISTANCE or later. Each byte only selects from these bytes.
-    localparam int MIN_DISTANCE = PREFIX_BYTES * 2 ** (S - 1);
-
-    pre_beat_t              doubled;
-    ptr_t[BEAT_WIDTH - 1:0] doubled_jump;
-
-    for (genvar B = 0; B < BEAT_WIDTH; B++) begin : gen_bytes
-        if (B + MIN_DISTANCE < BEAT_WIDTH) begin : gen_reachable
-            ptr_t[BEAT_WIDTH - 1:B + MIN_DISTANCE] reachable;
-
-            assign reachable       = pre[S - 1].jump[BEAT_WIDTH - 1:B + MIN_DISTANCE];
-            assign doubled_jump[B] = pre[S - 1].jump[B].in_beat ? reachable[pre[S - 1].jump[B].pos] :
-                                                                   pre[S - 1].jump[B];
-        end else begin : gen_unreachable
-            assign doubled_jump[B] = pre[S - 1].jump[B];
-        end
-    end
-
-    always_comb begin
-        doubled      = pre[S - 1];
-        doubled.jump = doubled_jump;
-    end
-
-    always_ff @(posedge clk) begin
-        if (pre_enable) begin
-            pre[S] <= doubled;
-        end
+    if (table_enable) begin
+        table_beat <= table_beat_next;
     end
 end
 
 always_ff @(posedge clk) begin
     if (!reset_synced) begin
-        for (int s = 0; s < NUM_PRE_STEPS; s++) begin
-            pre_valid[s] <= 1'b0;
-        end
-    end else if (pre_enable) begin
-        pre_valid[0] <= in.valid;
-        for (int s = 1; s < NUM_PRE_STEPS; s++) begin
-            pre_valid[s] <= pre_valid[s - 1];
-        end
+        table_valid <= 1'b0;
+    end else if (table_enable) begin
+        table_valid <= table_in.valid;
     end
 end
 
-assign in.ready = pre_enable;
+assign table_in.ready = table_enable;
 
-assign to_extraction.data  = pre[NUM_PRE_STEPS - 1];
-assign to_extraction.keep  = 1'b1;
-assign to_extraction.last  = pre[NUM_PRE_STEPS - 1].last;
-assign to_extraction.valid = pre_valid[NUM_PRE_STEPS - 1];
+// ------- Follow the chain ---------
+table_beat_t cur;
+pos_t        cursor;
+logic        skipping;   // The cursor is past this beat
+logic        load_skip;  // skipping was just set, so skip_beats is loaded from the length
+beats_t      skip_beats; // Beats left to skip after this one
 
-DataSkidBuffer #(pre_beat_t) inst_pre_skid_buffer (
-    .clk(clk),
-    .rst_n(reset_synced),
+logic           enable;
+position_beat_t positions, positions_next;
+logic           positions_valid;
+logic           length_valid;
 
-    .in(to_extraction),
-    .out(extraction_in)
-);
+ptr_t      hop1, hop2, hop3, hop4, leave;
+logic[N:0] found;
+logic      repeat_beat;
 
-// ------- Extraction ---------
-ext_beat_t ext      [N];
-logic      ext_valid[N];
-ext_beat_t ext_first;
+assign cur = table_beat;
 
-data_i #(length_beat_t) to_out(clk, reset_synced);
+assign hop1 = cur.next[cursor];
+assign hop2 = cur.next2[cursor];
+assign hop3 = cur.next[hop2.pos];
+assign hop4 = cur.next2[hop2.pos];
 
-pre_beat_t cur;
-dist_t     cursor, next_cursor;
-logic      cursor_in_beat, repeat_beat;
-pos_t      cursor_pos;
-ptr_t      cursor_jump;
+// The hops of the last beat can end in invalid bytes. These are removed when reading the lengths and
+// at most repeat the last beat once, as the cursor then is outside of the valid bytes.
+assign found[0] = !skipping && count_t'(cursor) < cur.count;
+assign found[1] = found[0] && stays_in_beat(hop1);
+assign found[2] = found[1] && stays_in_beat(hop2);
+assign found[3] = found[2] && stays_in_beat(hop3);
+assign found[4] = found[0] && cur.two_hops_stay[cursor] && cur.two_hops_stay[hop2.pos];
 
-logic ext_enable;
-assign ext_enable = !ext_valid[N - 1] || to_out.ready;
-
-assign cur            = extraction_in.data;
-assign cursor_pos     = cursor[POS_BITS - 1:0];
-assign cursor_in_beat = cursor < BEAT_WIDTH && cur.keep[cursor_pos];
-assign cursor_jump    = cur.jump[cursor_pos];
 // More than N length prefixes in this beat, so it is processed again in the next cycle
-assign repeat_beat    = extraction_in.valid && cursor_in_beat && cursor_jump.in_beat;
+assign repeat_beat = table_valid && found[4];
+assign leave       = found[3] ? hop4 : found[2] ? hop3 : found[1] ? hop2 : hop1;
+
+assign enable       = !length_valid || out.ready;
+assign table_enable = !table_valid || (enable && !repeat_beat);
 
 always_comb begin
-    if (cur.last && !repeat_beat) begin
-        next_cursor = '0;
-    end else if (cursor >= BEAT_WIDTH) begin
-        next_cursor = cursor - BEAT_WIDTH;
-    end else if (cursor_jump.in_beat) begin
-        next_cursor = dist_t'(cursor_jump.pos);
-    end else begin
-        // The chain leaves the beat after the length prefix at cursor_jump.pos
-        next_cursor = dist_t'(read_length(cur.data, cursor_jump.pos)) + cursor_jump.pos + PREFIX_BYTES
-                    - BEAT_WIDTH;
+    positions_next.data         = cur.data;
+    positions_next.count        = cur.count;
+    positions_next.last         = cur.last && !repeat_beat;
+    positions_next.duplicate    = repeat_beat;
+    positions_next.length_keep  = found[N - 1:0];
+    positions_next.positions[0] = found[0] ? cursor   : '0;
+    positions_next.positions[1] = found[1] ? hop1.pos : '0;
+    positions_next.positions[2] = found[2] ? hop2.pos : '0;
+    positions_next.positions[3] = found[3] ? hop3.pos : '0;
+end
+
+always_ff @(posedge clk) begin
+    if (enable) begin
+        positions <= positions_next;
     end
 end
 
 always_ff @(posedge clk) begin
     if (!reset_synced) begin
-        cursor <= '0;
-    end else if (ext_enable && extraction_in.valid) begin
-        cursor <= next_cursor;
+        positions_valid <= 1'b0;
+    end else if (enable) begin
+        positions_valid <= table_valid;
     end
 end
 
-assign extraction_in.ready = ext_enable && !repeat_beat;
+// ------- Read the lengths ---------
+length_beat_t     length_beat;
+logic             length_last;
+window_t[N - 1:0] windows;
 
-always_comb begin
-    ext_first = '0;
-
-    ext_first.data      = cur.data;
-    ext_first.keep      = cur.keep;
-    ext_first.last      = cur.last && !repeat_beat;
-    ext_first.duplicate = repeat_beat;
-    ext_first.next      = cur.next;
-
-    ext_first.lengths[0]     = read_length(cur.data, cursor_pos);
-    ext_first.positions[0]   = cursor_pos;
-    ext_first.length_keep[0] = cursor_in_beat;
-    ext_first.sub            = cursor_in_beat ? cur.next[cursor_pos] : '0;
+for (genvar I = 0; I < N; I++) begin : gen_windows
+    assign windows[I] = read_window(positions.data, positions.positions[I]);
 end
 
 always_ff @(posedge clk) begin
-    if (ext_enable) begin
-        ext[0] <= ext_first;
-    end
-end
-
-// Each step extracts the length prefix at the subcursor and moves the subcursor to its next
-for (genvar S = 1; S < N; S++) begin : gen_ext_steps
-    ext_beat_t extracted;
-
-    always_comb begin
-        extracted = ext[S - 1];
-
-        extracted.lengths[S]     = read_length(ext[S - 1].data, ext[S - 1].sub.pos);
-        extracted.positions[S]   = ext[S - 1].sub.pos;
-        extracted.length_keep[S] = ext[S - 1].sub.in_beat;
-        if (ext[S - 1].sub.in_beat) begin
-            extracted.sub = ext[S - 1].next[ext[S - 1].sub.pos];
-        end
-    end
-
-    always_ff @(posedge clk) begin
-        if (ext_enable) begin
-            ext[S] <= extracted;
+    if (enable) begin
+        length_beat.data        <= positions.data[BEAT_WIDTH - 1:0];
+        length_beat.positions   <= positions.positions;
+        length_beat.duplicate   <= positions.duplicate;
+        length_last             <= positions.last;
+        for (int i = 0; i < N; i++) begin
+            length_beat.length_keep[i]  <= positions.length_keep[i] &&
+                                           count_t'(positions.positions[i]) < positions.count;
+            length_beat.lengths[i]      <= data32_t'(windows[i]);
+            length_beat.inline_bytes[i] <= windows[i][PREFIX_BYTES + INLINE_BYTES - 1:PREFIX_BYTES];
         end
     end
 end
 
 always_ff @(posedge clk) begin
     if (!reset_synced) begin
-        for (int s = 0; s < N; s++) begin
-            ext_valid[s] <= 1'b0;
-        end
-    end else if (ext_enable) begin
-        ext_valid[0] <= extraction_in.valid;
-        for (int s = 1; s < N; s++) begin
-            ext_valid[s] <= ext_valid[s - 1];
-        end
+        length_valid <= 1'b0;
+    end else if (enable) begin
+        length_valid <= positions_valid;
     end
 end
 
-assign to_out.data.data        = ext[N - 1].data;
-assign to_out.data.data_keep   = ext[N - 1].keep;
-assign to_out.data.lengths     = ext[N - 1].lengths;
-assign to_out.data.positions   = ext[N - 1].positions;
-assign to_out.data.length_keep = ext[N - 1].length_keep;
-assign to_out.data.duplicate   = ext[N - 1].duplicate;
-assign to_out.keep             = 1'b1;
-assign to_out.last             = ext[N - 1].last;
-assign to_out.valid            = ext_valid[N - 1];
+assign out.data  = length_beat;
+assign out.keep  = 1'b1;
+assign out.last  = length_last;
+assign out.valid = length_valid;
 
-DataSkidBuffer #(length_beat_t) inst_out_skid_buffer (
-    .clk(clk),
-    .rst_n(reset_synced),
+// ------- Move the cursor ---------
+// A string that reaches past the next beat is only known to do so when its beat is taken. Its length
+// arrives one cycle later, while the next beat is skipped.
+data32_t          leaving_length;
+pos_t             leaving_pos;
+sum_t             leaving_sum;
+logic signed[2:0] skip_change;
+beats_t           skip_beats_next;
 
-    .in(to_out),
-    .out(out)
-);
+always_comb begin
+    int lane;
+
+    lane = positions.length_keep[3] ? 3 : positions.length_keep[2] ? 2 : positions.length_keep[1] ? 1 : 0;
+
+    leaving_length = data32_t'(windows[lane]);
+    leaving_pos    = positions.positions[lane];
+    leaving_sum    = sum_t'(leaving_pos) + PREFIX_BYTES + leaving_length[POS_BITS - 1:0];
+
+    skip_change = load_skip ? $signed(3'(leaving_sum[POS_BITS + 1:POS_BITS])) - 3'sd1 : 3'sd0;
+    if (table_valid) begin
+        skip_change = skip_change - 3'sd1;
+    end
+
+    skip_beats_next = (load_skip ? leaving_length[31:POS_BITS] : skip_beats) + beats_t'(skip_change);
+end
+
+always_ff @(posedge clk) begin
+    if (!reset_synced) begin
+        cursor    <= '0;
+        skipping  <= 1'b0;
+        load_skip <= 1'b0;
+    end else if (enable) begin
+        load_skip <= 1'b0;
+
+        if (table_valid && cur.last && !found[4]) begin
+            cursor   <= '0;
+            skipping <= 1'b0;
+        end else if (skipping) begin
+            skip_beats <= skip_beats_next;
+            skipping   <= skip_beats_next != '0;
+            if (load_skip) begin
+                cursor <= leaving_sum[POS_BITS - 1:0];
+            end
+        end else if (table_valid && found[0]) begin
+            cursor <= leave.pos;
+            if (leave.in_beat && leave.pos < PREFIX_BYTES) begin
+                skipping  <= 1'b1;
+                load_skip <= 1'b1;
+            end
+        end
+    end
+end
 
 endmodule

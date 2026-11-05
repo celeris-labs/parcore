@@ -133,7 +133,7 @@ for (genvar I = 0; I < N_CHANNELS; I++) begin : gen_pairs
         .data_out(data_out[I])
     );
 
-`ifdef SYNTHESIS
+`ifdef DEBUG
     // Both writers of the pair ([0] = values, [1] = heap) plus the merged
     // channel traffic. Each StreamWriter's FSM state is inferable from its
     // handshakes: buffer_ready high = WAIT_FOR_BUFFER, sq valid = REQUEST,

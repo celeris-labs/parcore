@@ -26,8 +26,8 @@ module GermanStringBuilder #(
 
 `RESET_RESYNC // Reset pipelining
 
-localparam int PREFIX_BYTES = 4;
-localparam int INLINE_BYTES = 12;
+localparam int PREFIX_BYTES = STRING_PREFIX_BYTES;
+localparam int INLINE_BYTES = STRING_INLINE_BYTES;
 localparam int POS_BITS     = $clog2(BEAT_WIDTH);
 
 `ASSERT_ELAB(EXTEND_WIDTH >= PREFIX_BYTES + INLINE_BYTES - 1)
@@ -100,16 +100,19 @@ always_comb begin
     for (int i = 0; i < N; i++) begin
         pos_t  pos;
         dist_t end_pos;
+        logic  length_fits; // Length is below 16, so inline bytes past it are compared
 
-        pos     = in_beat.positions[i];
-        end_pos = dist_t'(pos) + PREFIX_BYTES + in_beat.lengths[i];
+        pos         = in_beat.positions[i];
+        end_pos     = dist_t'(pos) + PREFIX_BYTES + in_beat.lengths[i];
+        length_fits = in_beat.lengths[i][31:4] == '0;
 
         lanes_a_next[i].valid   = in_beat.length_keep[i];
         lanes_a_next[i].length  = in_beat.lengths[i];
-        lanes_a_next[i].is_long = in_beat.length_keep[i] && in_beat.lengths[i] > INLINE_BYTES;
+        lanes_a_next[i].is_long = in_beat.length_keep[i] &&
+                                  (!length_fits || in_beat.lengths[i][3:0] > INLINE_BYTES);
         for (int k = 0; k < INLINE_BYTES; k++) begin
-            lanes_a_next[i].bytes[k] = k < in_beat.lengths[i] ?
-                in_beat.data[int'(pos) + PREFIX_BYTES + k] : '0;
+            lanes_a_next[i].bytes[k] = !length_fits || k < in_beat.lengths[i][3:0] ?
+                                       in_beat.inline_bytes[i][k] : '0;
         end
 
         lanes_a_next[i].beyond      = lanes_a_next[i].is_long && end_pos > BEAT_WIDTH;
@@ -134,7 +137,7 @@ end
 always_ff @(posedge clk) begin
     if (enable) begin
         lanes_a                <= lanes_a_next;
-        info_a.data            <= in_beat.data[BEAT_WIDTH - 1:0];
+        info_a.data            <= in_beat.data;
         info_a.last            <= in.last;
         info_a.duplicate       <= in_beat.duplicate;
         info_a.page_first      <= page_first;

@@ -199,7 +199,7 @@ assert property (@(posedge clk) disable iff (!rst_n)
 else $fatal(1, "StreamWriterPairArbiter received an ack with no outstanding request!");
 `endif
 
-`ifdef SYNTHESIS
+`ifdef DEBUG
 // Grant machinery and order-FIFO heads. The hang signatures to look for:
 // an ack arriving with cq_head_valid low (sim-only assertion above cannot
 // fire on hardware — here it shows as probe10 = 2'b10 while probe8[1] = 0),

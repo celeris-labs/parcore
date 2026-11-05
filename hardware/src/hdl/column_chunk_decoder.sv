@@ -787,6 +787,7 @@ always_ff @(posedge clk) begin
     end
 end
 
+`ifdef DEBUG
 // ParallelStringDecoder ports. The keeps are padded to the 64 bits of the IP.
 ila_string_decoder inst_ila_string_decoder (
     .clk(clk),
@@ -810,7 +811,6 @@ ila_string_decoder inst_ila_string_decoder (
     .probe13(64'(psd_out_heap.keep))
 );
 
-`ifdef DEBUG
 // Every port of the five modules that can stall the pipeline on their own:
 // Decompressor, HybridPageDecoder, Dictionary, ParallelStringDecoder and the
 // output multiplexer. A blocked stream reads as valid=1 with ready=0, so
