@@ -2,20 +2,10 @@ package parcore_string;
 
 import libstf::*;
 
-// Widths of the string decoding datapath, overridden by the defines in tests
-`ifndef PARCORE_STRING_BEAT_WIDTH
-`define PARCORE_STRING_BEAT_WIDTH 64
-`endif
-`ifndef PARCORE_STRING_EXTEND_WIDTH
-`define PARCORE_STRING_EXTEND_WIDTH 15
-`endif
-`ifndef PARCORE_STRING_N
-`define PARCORE_STRING_N 4
-`endif
-
-parameter int STRING_BEAT_WIDTH   = `PARCORE_STRING_BEAT_WIDTH;
-parameter int STRING_EXTEND_WIDTH = `PARCORE_STRING_EXTEND_WIDTH;
-parameter int STRING_N            = `PARCORE_STRING_N; // Strings per cycle
+// Widths of the string decoding datapath
+parameter int STRING_BEAT_WIDTH   = 64;
+parameter int STRING_EXTEND_WIDTH = 15; // Bytes of the next beat seen by the LengthExtractor
+parameter int STRING_N            = 4;  // Strings per cycle
 
 parameter int STRING_PREFIX_BYTES = 4;  // Length prefix of a PLAIN encoded string
 parameter int STRING_INLINE_BYTES = 12; // String bytes stored in a german string

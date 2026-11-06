@@ -6,6 +6,10 @@
 import libstf::*;
 import parcore::*;
 
+/**
+ * Routes the values of a PLAIN data page. String pages go to the string decoder (out_to_str_decoder,
+ * back on in_from_str_decoder); fixed-width values bypass it. Both leave on out_values.
+ */
 module PlainRouter #(
     parameter int DATABEAT_SIZE,
     parameter int FIXED_PATH_SKID_COUNT = 1

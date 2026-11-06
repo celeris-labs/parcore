@@ -6,6 +6,11 @@
 import libstf::*;
 import parcore::*;
 
+/**
+ * Shares the string decoder between PLAIN data pages (from the PlainRouter) and string dictionary
+ * pages (from the DictionaryBody), and returns its german strings to the side they came from. Pages
+ * that aren't PLAIN encoded strings consume their configuration without routing anything.
+ */
 module StringRouter #(
     parameter int DATABEAT_SIZE
 ) (
@@ -35,7 +40,7 @@ ndata_i #(data8_t, DATABEAT_SIZE) _out_to_str_decoder (.*);
 enum logic {
     STR_ROUTE_PLAIN_TO_STR_DEC,
     STR_ROUTE_DICT_TO_STR_DEC
-} demux_select_e;
+} mux_select_e;
 ready_valid_i #(logic) mux_select (.*);
 ready_valid_i #(logic) _mux_select (.*);
 `SKID_SIGNAL(logic, clk, rst_n, mux_select, _mux_select)

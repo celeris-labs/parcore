@@ -707,9 +707,9 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
     # -- German strings -----------------------------------------------------
     #
     # A PLAIN BYTE_ARRAY chunk takes the string path: StripLevels -> PlainRouter
-    # -> StringRouter -> PlainStringDecoder -> GermanStrToNData -> out. Values
-    # land on stream 0 as 16-byte german_str_t records and the raw bytes are
-    # echoed on heap_out (stream 1).
+    # -> StringRouter -> ParallelStringDecoder -> out. Values land on stream 0 as
+    # 16-byte german_str_t records, and the bytes of strings longer than 12 bytes
+    # on heap_out (stream 1).
 
     def _run_strings(self, strings: list[bytes], heap_addr: int = DEFAULT_HEAP_ADDR):
         chunk = make_string_data(strings, heap_addr)
@@ -734,8 +734,8 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
         self._run_strings([b'ab', b'c' * 40, b'defghijkl', b'm' * 13, b'', b'no'])
 
     def test_string_multi_beat(self):
-        # More than four records per 64-byte beat, forcing GermanStrToNData to
-        # emit several full beats plus a partial final one.
+        # More than four records per 64-byte beat, so the decoder emits several
+        # full beats plus a partial final one.
         strings = [bytes([0x41 + (i % 26)]) * (1 + i % 30) for i in range(37)]
         self._run_strings(strings)
 

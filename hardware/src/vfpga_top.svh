@@ -192,41 +192,6 @@ generate
             .out(dec_heap_resized)
         );
 
-`ifdef DEBUG
-        // Channel-level dataflow boundary: shows which hop of
-        // input -> decoder -> values/heap -> writer stops handshaking.
-        ila_cc_top inst_ila_cc_top (
-            .clk(clk),
-            .probe0(rst_n),
-
-            .probe1(column_chunk_conf[I].valid),
-            .probe2(column_chunk_conf[I].ready),
-
-            .probe3(axi_host_recv.tvalid),
-            .probe4(axi_host_recv.tready),
-            .probe5(axi_host_recv.tlast),
-
-            .probe6(in.valid),
-            .probe7(in.ready),
-            .probe8(in.last),
-
-            .probe9(dec_out.valid),
-            .probe10(dec_out.ready),
-            .probe11(dec_out.last),
-
-            .probe12(dec_heap.valid),
-            .probe13(dec_heap.ready),
-            .probe14(dec_heap.last),
-
-            .probe15(outputs[2*I].tvalid),
-            .probe16(outputs[2*I].tready),
-            .probe17(outputs[2*I].tlast),
-
-            .probe18(outputs[2*I+1].tvalid),
-            .probe19(outputs[2*I+1].tready),
-            .probe20(outputs[2*I+1].tlast)
-        );
-`endif
     end
 endgenerate
 
@@ -246,34 +211,3 @@ PairedOutputWriter #(
     .data_out(axis_host_send)
 );
 
-`ifdef DEBUG
-// Shell-facing writer traffic: every write request (address/length/dest),
-// every ack with its identity fields, every notify with pid + value. A hang
-// in WAIT_COMPLETION shows as requests without matching acks; a lost
-// interrupt shows as a notify handshake the host never reacted to.
-ila_shell_io inst_ila_shell_io (
-    .clk(clk),
-    .probe0(rst_n),
-
-    .probe1(sq_wr.valid),
-    .probe2(sq_wr.ready),
-    .probe3(sq_wr.data.len),
-    .probe4(sq_wr.data.vaddr),
-    .probe5(sq_wr.data.dest),
-    .probe6(sq_wr.data.last),
-    .probe7(sq_wr.data.pid),
-
-    .probe8(cq_wr.valid),
-    .probe9(cq_wr.ready),
-    .probe10(cq_wr.data.opcode),
-    .probe11(cq_wr.data.strm),
-    .probe12(cq_wr.data.dest),
-    .probe13(cq_wr.data.pid),
-    .probe14(cq_wr.data.host),
-
-    .probe15(notify.valid),
-    .probe16(notify.ready),
-    .probe17(notify.data.pid),
-    .probe18(notify.data.value)
-);
-`endif

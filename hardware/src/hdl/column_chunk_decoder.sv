@@ -148,7 +148,7 @@ PlainRouter #(DATABEAT_SIZE) inst_values_router (
 
 // ------ German String Decoder ---------------
 
-ready_valid_i #(plain_str_decoder_conf_t) plain_str_decoder_conf (clk, rst_n);
+ready_valid_i #(string_decoder_conf_t) str_decoder_conf (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_in (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_strings_packed (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_out_heap (clk, rst_n);
@@ -160,7 +160,7 @@ ParallelStringDecoder #(
     .clk (clk),
     .rst_n (rst_n),
 
-    .conf (plain_str_decoder_conf),
+    .conf (str_decoder_conf),
 
     .in_data (psd_in),
     .out_strings (psd_strings_packed),
@@ -605,25 +605,25 @@ always_ff @( posedge clk ) begin : configure_str_router
 end
 `SKID_SIGNAL(page_type_info_t, clk, rst_n, _str_router_conf, str_router_conf)
 
-ready_valid_i #(plain_str_decoder_conf_t) _plain_str_decoder_conf (clk, rst_n);
-logic plain_str_decoder_active;
-assign plain_str_decoder_active =
+ready_valid_i #(string_decoder_conf_t) _str_decoder_conf (clk, rst_n);
+logic str_decoder_active;
+assign str_decoder_active =
     cc_conf_latched.typ == GERMAN_STR_T &&
     page_conf_r.page_type != PAGE_TYPE_HYBRID;
 
-always_ff @( posedge clk ) begin : configure_plain_str_decoder
-    _plain_str_decoder_conf.valid <= n_conf_valid(
-        _plain_str_decoder_conf.valid,
-        _plain_str_decoder_conf.ready,
-        plain_str_decoder_active
+always_ff @( posedge clk ) begin : configure_str_decoder
+    _str_decoder_conf.valid <= n_conf_valid(
+        _str_decoder_conf.valid,
+        _str_decoder_conf.ready,
+        str_decoder_active
     );
-    _plain_str_decoder_conf.data <= {
+    _str_decoder_conf.data <= {
         first_page,
         page_conf_r.num_values,
         cc_conf_latched.string_heap_addr
     };
 end
-`SKID_SIGNAL(plain_str_decoder_conf_t, clk, rst_n, _plain_str_decoder_conf, plain_str_decoder_conf)
+`SKID_SIGNAL(string_decoder_conf_t, clk, rst_n, _str_decoder_conf, str_decoder_conf)
 
 ready_valid_i #(logic[1:0]) _heap_normalize_conf (clk, reset_synced);
 always_ff @( posedge clk ) begin : configure_heap_normalize
@@ -715,7 +715,7 @@ assign all_modules_consumed_configs =
         !_dict_body_conf.valid &&
         !_plain_router_conf.valid &&
         !_str_router_conf.valid &&
-        !_plain_str_decoder_conf.valid &&
+        !_str_decoder_conf.valid &&
         !_rewrite_last_conf.valid &&
         !_out_mux_conf.valid &&
         !_normalize_until_conf.valid &&
@@ -763,121 +763,5 @@ StreamProfiler inst_profile_out (
 
     .profile(profile_out)
 );
-
-// ------ Heap path instrumentation ---------------------------------------
-// Counts what the decoder puts on psd_out_heap, the ParallelStringDecoder's heap
-// output as it enters HeapNormalizer. This is the last point before the packing
-// and last-rewriting, so comparing these against what the host receives says
-// whether a missing heap completion was never produced or was lost downstream.
-//
-// Free running and 32 bits, so the byte count wraps after 4 GiB. Only the deltas
-// across a chunk are meaningful; lasts is the interesting one, since it should
-// equal the number of string chunks decoded.
-data32_t heap_in_beats, heap_in_lasts, heap_in_bytes;
-
-always_ff @(posedge clk) begin
-    if (!reset_synced) begin
-        heap_in_beats <= '0;
-        heap_in_lasts <= '0;
-        heap_in_bytes <= '0;
-    end else if (psd_out_heap.valid && psd_out_heap.ready) begin
-        heap_in_beats <= heap_in_beats + 1;
-        heap_in_lasts <= heap_in_lasts + data32_t'(psd_out_heap.last);
-        heap_in_bytes <= heap_in_bytes + data32_t'($countones(psd_out_heap.keep));
-    end
-end
-
-`ifdef DEBUG
-// ParallelStringDecoder ports. The keeps are padded to the 64 bits of the IP.
-ila_string_decoder inst_ila_string_decoder (
-    .clk(clk),
-    .probe0(reset_synced),
-
-    .probe1(plain_str_decoder_conf.valid),
-    .probe2(plain_str_decoder_conf.ready),
-
-    .probe3(psd_in.valid),
-    .probe4(psd_in.ready),
-    .probe5(psd_in.last),
-
-    .probe6(psd_strings_packed.valid),
-    .probe7(psd_strings_packed.ready),
-    .probe8(psd_strings_packed.last),
-    .probe9(64'(psd_strings_packed.keep)),
-
-    .probe10(psd_out_heap.valid),
-    .probe11(psd_out_heap.ready),
-    .probe12(psd_out_heap.last),
-    .probe13(64'(psd_out_heap.keep))
-);
-
-// Every port of the five modules that can stall the pipeline on their own:
-// Decompressor, HybridPageDecoder, Dictionary, ParallelStringDecoder and the
-// output multiplexer. A blocked stream reads as valid=1 with ready=0, so
-// ready is captured alongside valid - without it the trace says something is
-// stuck but not which side is holding it up.
-//
-// None of these widths depend on DATABEAT_SIZE, so one IP serves both the 32-
-// and 64-byte configurations.
-ila_cc_decoder inst_ila_cc_decoder (
-    .clk(clk),
-    .probe0(reset_synced),
-    .probe1(state),
-
-    // Decompressor
-    .probe2(decompressor_conf.valid),
-    .probe3(decompressor_conf.ready),
-    .probe4(page_payload.valid),
-    .probe5(page_payload.ready),
-    .probe6(decompressor_out.valid),
-    .probe7(decompressor_out.ready),
-
-    // HybridPageDecoder
-    .probe8(hybrid_page_decoder_conf.valid),
-    .probe9(hybrid_page_decoder_conf.ready),
-    .probe10(ins[IN_HYBRID].valid),
-    .probe11(ins[IN_HYBRID].ready),
-    .probe12(dict_ids_native.valid),
-    .probe13(dict_ids_native.ready),
-
-    // Dictionary
-    .probe14(dict_in_values.valid),
-    .probe15(dict_in_values.ready),
-    .probe16(dict_ids_scaled.valid),
-    .probe17(dict_ids_scaled.ready),
-    .probe18(dict_out_values.valid),
-    .probe19(dict_out_values.ready),
-
-    // ParallelStringDecoder
-    .probe20(plain_str_decoder_conf.valid),
-    .probe21(plain_str_decoder_conf.ready),
-    .probe22(psd_in.valid),
-    .probe23(psd_in.ready),
-    .probe24(psd_strings_packed.valid),
-    .probe25(psd_strings_packed.ready),
-    .probe26(psd_out_heap.valid),
-    .probe27(psd_out_heap.ready),
-
-    // Output multiplexer
-    .probe28(out_mux_conf.valid),
-    .probe29(out_mux_conf.ready),
-    .probe30(plain_to_out.valid),
-    .probe31(plain_to_out.ready),
-    .probe32(hybrid_path_out.valid),
-    .probe33(hybrid_path_out.ready),
-    .probe34(per_page_out.valid),
-    .probe35(per_page_out.ready),
-
-    // Heap-path counters: a chunk that ends with heap_in_lasts incremented but
-    // nothing arriving at the host means the last was swallowed downstream.
-    .probe36(heap_in_beats),
-    .probe37(heap_in_lasts),
-    .probe38(heap_in_bytes)
-);
-`endif
-
-`undef CONFIGURE_VALID
-`undef FOR_EVERY_PAGE
-`undef RESET_WHEN_FIRE
 
 endmodule

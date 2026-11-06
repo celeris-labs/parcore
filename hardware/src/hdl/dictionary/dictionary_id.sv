@@ -7,8 +7,9 @@ import libstf::*;
 import parcore::GERMAN_STR_T;
 
 /**
-    Generates dictionary indices according to the incoming data_type
-*/
+ * Converts the dictionary indices of 64 and 128 bit values into indices of the 32 bit entries of the
+ * Dictionary. Indices of 32 bit values pass unchanged.
+ */
 module DictionaryID #(
     parameter type  id_t,
     parameter int   NUM_ELEMENTS,
@@ -57,7 +58,7 @@ assign conf.ready = conf_processed.ready;
 
 ready_valid_i #(path_idx_t) demux_select (clk, rst_n);
 ready_valid_i #(path_idx_t) mux_select (clk, rst_n);
-RegisteredReadyValidDuplicator #(type_t, 2) inst_conf_duplicate (
+RegisteredReadyValidDuplicator #(path_idx_t, 2) inst_conf_duplicate (
     .clk (clk),
     .rst_n (rst_n),
     

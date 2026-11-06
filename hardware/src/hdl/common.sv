@@ -112,7 +112,7 @@ typedef struct packed {
     data32_t        num_values;
     // See column_chunk_conf_t.string_heap_addr
     vaddress_t      buffer_addr;
-} plain_str_decoder_conf_t;
+} string_decoder_conf_t;
 
 typedef struct packed {
     page_type_t page_type;

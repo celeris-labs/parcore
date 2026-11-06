@@ -64,8 +64,8 @@ def hybrid(typ: int, values: bytearray) -> dict:
 
 class PlainRouterTestCase(fpga_test_case.FPGATestCase):
     """
-    Tests PlainRouter (hardware/src/hdl/plain_data.sv): the byte-level crossbar
-    between StripLevels, the DictionaryBody, the PlainStringDecoder and the value
+    Tests PlainRouter (hardware/src/hdl/string/plain_router.sv): the byte-level crossbar
+    between StripLevels, the DictionaryBody, the string decoder and the value
     output path. conf is a bare type_t and picks the route:
 
       german  in_from_stripped    -> out_to_str_decoder

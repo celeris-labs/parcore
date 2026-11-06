@@ -54,12 +54,14 @@ assign values[2] = MAX_NUM_ENQUEUED_BUFFERS;
 decoder_profile_t registered_counters[NUM_DECODERS];
 
 for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_profile_regs
+    // No reset: the stages only follow counters that are reset at their source, and resetting
+    // thousands of flops from the single ASYNC_REG reset flop (not replicable) fails timing.
     ShiftRegister #(
         .WIDTH($bits(decoder_profile_t)),
         .LEVELS(2)
     ) inst_counters_sr (
         .clk(clk),
-        .rst_n(reset_synced),
+        .rst_n(1'b1),
 
         .i_data(profile[I].counters),
         .o_data(registered_counters[I])

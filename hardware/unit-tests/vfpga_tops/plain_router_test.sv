@@ -8,10 +8,10 @@ import libstf::*;
 import lynxTypes::*;
 
 /*
- * ValuesRouter (hardware/src/hdl/plain_data.sv) test wiring:
+ * PlainRouter (hardware/src/hdl/string/plain_router.sv) test wiring:
  *
  *   axis_host_recv[0]      -> in_from_stripped     (StripLevels output, PLAIN pages)
- *   axis_host_recv[1]      -> in_from_str_decoder  (PlainStringDecoder output)
+ *   axis_host_recv[1]      -> in_from_str_decoder  (string decoder output)
  *
  *   out_values             -> axis_host_send[0]
  *   out_to_str_decoder     -> axis_host_send[1]

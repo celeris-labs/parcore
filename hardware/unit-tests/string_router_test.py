@@ -72,9 +72,9 @@ def hybrid(typ: int, values: bytearray) -> dict:
 
 class StringRouterTestCase(fpga_test_case.FPGATestCase):
     """
-    Tests StringRouter (hardware/src/hdl/string_router.sv):
+    Tests StringRouter (hardware/src/hdl/string/string_router.sv):
     the byte-level crossbar between PlainRouter, DictionaryBody, and the
-    PlainStringDecoder. One page_conf is consumed per page and picks the route:
+    string decoder. One page_conf is consumed per page and picks the route:
 
       ANY    / fixed   none
       HYBRID / ANY     none

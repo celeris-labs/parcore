@@ -199,33 +199,4 @@ assert property (@(posedge clk) disable iff (!rst_n)
 else $fatal(1, "StreamWriterPairArbiter received an ack with no outstanding request!");
 `endif
 
-`ifdef DEBUG
-// Grant machinery and order-FIFO heads. The hang signatures to look for:
-// an ack arriving with cq_head_valid low (sim-only assertion above cannot
-// fire on hardware — here it shows as probe10 = 2'b10 while probe8[1] = 0),
-// a permanently locked grant, or data_head stuck on a writer whose data
-// never asserts tlast. Probe widths assume the 2-writer configuration.
-if (N_WRITERS == 2) begin : gen_ila
-    ila_pair_arbiter inst_ila_pair_arbiter (
-        .clk(clk),
-        .probe0(rst_n),
-
-        .probe1(sq_valid),
-        .probe2({grant_valid, grant_locked, grant_fire}),
-        .probe3(grant),
-        .probe4(rr),
-        .probe5({data_order_iready, cq_order_iready}),
-        .probe6({sq_wr_out.valid, sq_wr_out.ready}),
-
-        .probe7({data_head_valid, data_head}),
-        .probe8({cq_head_valid, cq_head}),
-        .probe9({data_pop, cq_pop}),
-
-        .probe10({cq_wr_in.valid, cq_wr_in.ready}),
-        .probe11(cq_out_ready),
-        .probe12({data_out.tvalid, data_out.tready, data_out.tlast})
-    );
-end
-`endif
-
 endmodule

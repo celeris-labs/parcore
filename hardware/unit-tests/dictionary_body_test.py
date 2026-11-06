@@ -25,7 +25,7 @@ class DictionaryBodyRouterTestCase(fpga_test_case.FPGATestCase):
 
       - Non-german pages: in_body is forwarded verbatim to out_to_dict (through
         the DICT_BODY_SKID_CNT skid stages) and out_to_psd stays idle.
-      - German pages: in_body is forwarded to out_to_psd (the PlainStringDecoder),
+      - German pages: in_body is forwarded to out_to_psd (the string decoder),
         and the decoded strings that come back on in_german_strings are forwarded
         to out_to_dict.
 

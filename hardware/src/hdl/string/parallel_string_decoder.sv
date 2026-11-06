@@ -7,7 +7,8 @@ import parcore::*;
 import parcore_string::*;
 
 // Decodes PLAIN encoded string pages into german strings and the heap with up to N strings per
-// cycle. See docs/strings/parallel_string_decoder.md.
+// cycle: LengthExtractor finds the strings of a beat, GermanStringBuilder builds them, and the rest
+// packs them into full beats.
 module ParallelStringDecoder #(
     parameter int DATABEAT_SIZE = STRING_BEAT_WIDTH,
     parameter int EXTEND_WIDTH  = STRING_EXTEND_WIDTH,
@@ -16,7 +17,7 @@ module ParallelStringDecoder #(
     input logic clk,
     input logic rst_n,
 
-    ready_valid_i.s conf,        // #(plain_str_decoder_conf_t)
+    ready_valid_i.s conf,        // #(string_decoder_conf_t)
     ndata_i.s       in_data,     // #(data8_t, DATABEAT_SIZE)
 
     ndata_i.m       out_strings, // #(data8_t, DATABEAT_SIZE) german strings

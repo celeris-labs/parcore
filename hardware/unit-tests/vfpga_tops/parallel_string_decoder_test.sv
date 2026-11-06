@@ -32,7 +32,7 @@ assign dummy_value[1] = 64'hDEADBEEFDEADBEEF;
 
 ready_valid_i#(data32_t)                    latched_num_values  (.clk(aclk), .rst_n(aresetn));
 ready_valid_i#(vaddress_t)                  latched_heap_addr   (.clk(aclk), .rst_n(aresetn));
-ready_valid_i#(plain_str_decoder_conf_t)    decoder_conf        (.clk(aclk), .rst_n(aresetn));
+ready_valid_i#(string_decoder_conf_t)    decoder_conf        (.clk(aclk), .rst_n(aresetn));
 
 GlobalConfig#(
     .SYSTEM_ID(0),
@@ -95,7 +95,6 @@ AXIToNData#(data8_t, DATABEAT_SIZE) inst_axi_to_ndata (
     .out(in)
 );
 
-// The ParallelStringDecoder in place of the PlainStringDecoder
 ndata_i#(data8_t, DATABEAT_SIZE) strings (aclk, aresetn);
 ndata_i#(data8_t, DATABEAT_SIZE) values (aclk, aresetn);
 ParallelStringDecoder #(

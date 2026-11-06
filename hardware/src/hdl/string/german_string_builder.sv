@@ -17,7 +17,7 @@ module GermanStringBuilder #(
     input logic clk,
     input logic rst_n,
 
-    ready_valid_i.s conf,        // #(plain_str_decoder_conf_t)
+    ready_valid_i.s conf,        // #(string_decoder_conf_t)
     data_i.s        in,          // #(length_beat_t)
 
     ndata_i.m       out_strings, // #(german_str_t, N)
@@ -62,7 +62,7 @@ typedef struct packed {
                                           // This can happen when more than N strings
                                           // are in the beat
     logic                     page_first;
-    plain_str_decoder_conf_t  conf;
+    string_decoder_conf_t  conf;
 } beat_info_t;
 
 // Bytes [lo, hi) of a beat

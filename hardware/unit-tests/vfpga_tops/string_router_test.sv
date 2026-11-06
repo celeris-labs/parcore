@@ -9,11 +9,11 @@ import lynxTypes::*;
 
 
 /*
- * String (hardware/src/hdl/plain_data.sv) test wiring:
+ * StringRouter (hardware/src/hdl/string/string_router.sv) test wiring:
  *
  *   axis_host_recv[0]      -> in_from_plain        (PLAIN pages)
  *   axis_host_recv[1]      -> in_from_dict_body    (DICT pages)
- *   axis_host_recv[2]      -> in_from_str_decoder  (PlainStringDecoder output)
+ *   axis_host_recv[2]      -> in_from_str_decoder  (string decoder output)
  *
  *   out_to_str_decoder     -> axis_host_send[0]    (String data)
  *   out_to_plain           -> axis_host_send[1]    (Data fw to plain path)

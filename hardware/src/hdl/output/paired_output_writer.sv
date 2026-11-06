@@ -133,36 +133,6 @@ for (genvar I = 0; I < N_CHANNELS; I++) begin : gen_pairs
         .data_out(data_out[I])
     );
 
-`ifdef DEBUG
-    // Both writers of the pair ([0] = values, [1] = heap) plus the merged
-    // channel traffic. Each StreamWriter's FSM state is inferable from its
-    // handshakes: buffer_ready high = WAIT_FOR_BUFFER, sq valid = REQUEST,
-    // data flowing = TRANSFER, notify valid = WAIT_NOTIFY, everything quiet
-    // with buffer_ready low = WAIT_COMPLETION (acks missing).
-    ila_paired_writer inst_ila_paired_writer (
-        .clk(clk),
-        .probe0(reset_synced),
-
-        .probe1({sq_wr_pair[0].valid, sq_wr_pair[0].ready}),
-        .probe2({sq_wr_pair[1].valid, sq_wr_pair[1].ready}),
-        .probe3({data_pair[0].tvalid, data_pair[0].tready, data_pair[0].tlast}),
-        .probe4({data_pair[1].tvalid, data_pair[1].tready, data_pair[1].tlast}),
-        .probe5({cq_wr_pair[0].valid, cq_wr_pair[0].ready}),
-        .probe6({cq_wr_pair[1].valid, cq_wr_pair[1].ready}),
-        .probe7({notify_strm[2*I].valid, notify_strm[2*I].ready}),
-        .probe8({notify_strm[2*I+1].valid, notify_strm[2*I+1].ready}),
-        .probe9({mem_config[2*I].buffer_valid, mem_config[2*I].buffer_ready,
-                 mem_config[2*I].flush_buffers}),
-        .probe10({mem_config[2*I+1].buffer_valid, mem_config[2*I+1].buffer_ready,
-                  mem_config[2*I+1].flush_buffers}),
-
-        .probe11({sq_wr_chan[I].valid, sq_wr_chan[I].ready}),
-        .probe12(sq_wr_chan[I].data.len),
-        .probe13(sq_wr_chan[I].data.vaddr[31:0]),
-        .probe14({cq_wr_chan[I].valid, cq_wr_chan[I].ready}),
-        .probe15({data_out[I].tvalid, data_out[I].tready, data_out[I].tlast})
-    );
-`endif
 end
 
 endmodule

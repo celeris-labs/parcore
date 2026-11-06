@@ -5,6 +5,11 @@
 import libstf::*;
 import parcore::*;
 
+/**
+ * Routes the body of a dictionary page to the Dictionary. The entries of a string dictionary are
+ * PLAIN encoded, so they first take a detour through the string decoder (out_to_psd, back on
+ * in_german_strings) and reach the Dictionary as german strings. Other types go straight through.
+ */
 module DictionaryBody #(
     parameter int DATABEAT_SIZE,
     parameter int DICT_BODY_SKID_CNT = 1,
@@ -51,7 +56,7 @@ SkidBuffer #(select_t) inst_mux_select_skid (
     .out (_mux_select)
 );
 
-RegisteredReadyValidDuplicator #(type_t, 2) inst_conf_duplicate (
+RegisteredReadyValidDuplicator #(select_t, 2) inst_conf_duplicate (
     .clk (clk),
     .rst_n (rst_n),
     
