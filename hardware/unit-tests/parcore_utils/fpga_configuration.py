@@ -43,12 +43,13 @@ class ColumnChunkDecoderConfig(Config):
     PROFILE_REGS = 10
 
     # column_chunk_conf_t packs (MSB -> LSB) as:
-    #   logical type_t [3 bits] | is_required [1 bit] | compression_t [1 bit] |
-    #   num_values [32 bits] | type_t [3 bits]
-    NUM_VALUES_SHIFT   = 3
-    COMPRESSION_SHIFT  = NUM_VALUES_SHIFT + 32
-    IS_REQUIRED_SHIFT  = COMPRESSION_SHIFT + 1
-    LOGICAL_TYPE_SHIFT = IS_REQUIRED_SHIFT + 1
+    #   defer_dict_decoding [1 bit] | logical type_t [3 bits] | is_required [1 bit] |
+    #   compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
+    NUM_VALUES_SHIFT        = 3
+    COMPRESSION_SHIFT       = NUM_VALUES_SHIFT + 32
+    IS_REQUIRED_SHIFT       = COMPRESSION_SHIFT + 1
+    LOGICAL_TYPE_SHIFT      = IS_REQUIRED_SHIFT + 1
+    DEFER_DICT_DECODING_SHIFT = LOGICAL_TYPE_SHIFT + 3
 
     def __init__(self, registers: RegisterAccess, addr_offset: int, num_regs: int):
         super().__init__(registers, addr_offset, num_regs)
@@ -62,6 +63,7 @@ class ColumnChunkDecoderConfig(Config):
         data_type: fpga_stream.StreamType,
         is_required: bool = False,
         logical_type: Optional[fpga_stream.StreamType] = None,
+        defer_dict_decoding: bool = False,
     ) -> int:
         assert 0 <= num_values < pow(2, 32)
         # The hardware always uses the logical type, so it is written even if it equals data_type
@@ -69,7 +71,8 @@ class ColumnChunkDecoderConfig(Config):
             logical_type = data_type
         logical_type_t = stream_type_to_libstf_type_t(logical_type)
         return (
-            logical_type_t << ColumnChunkDecoderConfig.LOGICAL_TYPE_SHIFT
+            int(defer_dict_decoding) << ColumnChunkDecoderConfig.DEFER_DICT_DECODING_SHIFT
+            | logical_type_t << ColumnChunkDecoderConfig.LOGICAL_TYPE_SHIFT
             | int(is_required) << ColumnChunkDecoderConfig.IS_REQUIRED_SHIFT
             | compression << ColumnChunkDecoderConfig.COMPRESSION_SHIFT
             | num_values << ColumnChunkDecoderConfig.NUM_VALUES_SHIFT
@@ -84,12 +87,15 @@ class ColumnChunkDecoderConfig(Config):
         data_type: fpga_stream.StreamType,
         is_required: bool = False,
         logical_type: Optional[fpga_stream.StreamType] = None,
+        defer_dict_decoding: bool = False,
     ):
         """
         Configures the given decoder to process a column chunk of num_values values of data_type.
         is_required is set for REQUIRED columns (max_definition_level == 0), whose data pages carry
         no definition levels. The decoder casts the values to logical_type, which defaults to
-        data_type (no cast).
+        data_type (no cast). With defer_dict_decoding, the decoder instead emits the dictionary
+        page's values followed by one index per value (1, 2 or 4 bytes for up to 256, 65,536 or more
+        dictionary entries).
         """
         assert decoder < self.num_decoders, (
             f"Attempted to configure ColumnChunkDecoder {decoder} out of {self.num_decoders}"
@@ -97,7 +103,7 @@ class ColumnChunkDecoderConfig(Config):
         self.write_register(
             decoder,
             ColumnChunkDecoderConfig.register_value(
-                compression, num_values, data_type, is_required, logical_type
+                compression, num_values, data_type, is_required, logical_type, defer_dict_decoding
             ),
         )
 

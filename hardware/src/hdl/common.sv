@@ -80,6 +80,7 @@ typedef enum logic [1:0] {
 } page_type_t;
 
 typedef struct packed {
+    logic         defer_dict_decoding;
     type_t        logical_typ;
     logic         is_required;
     compression_t compression;

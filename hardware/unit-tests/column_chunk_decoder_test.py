@@ -24,8 +24,11 @@ class _ColumnChunk:
     is_required: bool = False  # REQUIRED columns have no definition levels in their data pages
     # Type the decoder casts the values to, None for stream_type (no cast)
     logical_type: Optional["fpga_stream.StreamType"] = None
+    defer_dict_decoding: bool = False
 
     def output_type(self) -> "fpga_stream.StreamType":
+        if self.defer_dict_decoding:
+            return fpga_stream.StreamType.UNSIGNED_INT_8
         return self.logical_type if self.logical_type is not None else self.stream_type
 
 
@@ -176,6 +179,24 @@ _RLE_OUTPUT = _rle_output(list(range(10, 20)))
 _PLAIN_OUTPUT = list(range(0, 256))
 
 
+def _deferred_dict_output(
+    dict_values: list[int], values: list[int], stream_type: "fpga_stream.StreamType"
+) -> list[int]:
+    """
+    The output bytes of a defer_dict_decoding chunk: The dictionary's values, followed by the index
+    of every value, 1, 2 or 4 bytes wide for up to 256, 65,536 or more dictionary entries. A value's
+    index is the first dictionary entry that equals it.
+    """
+    index_width = 1 if len(dict_values) <= 256 else 2 if len(dict_values) <= 65536 else 4
+    first_index = {}
+    for i, v in enumerate(dict_values):
+        first_index.setdefault(v, i)
+    output = bytearray(fpga_stream.Stream(stream_type, dict_values).data_to_bytearray())
+    for v in values:
+        output += first_index[v].to_bytes(index_width, 'little')
+    return list(output)
+
+
 class ColumnChunkDecoderTestCase(ConfiguredTestCase):
     alternative_vfpga_top_file = "vfpga_tops/column_chunk_decoder_test.sv"
     debug_mode = True
@@ -188,7 +209,7 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
             compression = Compression.SNAPPY if input.compression else Compression.RAW
             config.enqueue_column_chunk(
                 0, compression, input.num_values, input.stream_type, input.is_required,
-                input.logical_type
+                input.logical_type, input.defer_dict_decoding
             )
 
         # One stream input per column chunk (full thrift-wrapped bytes).
@@ -416,5 +437,65 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
                 _RLE_OUTPUT + _PLAIN_OUTPUT,
                 plain_values,
                 _PLAIN_OUTPUT,
+            ],
+        )
+
+    def test_defer_dict_decoding(self):
+        # Chunks that emit their dictionary and indices: 1-byte indices for a 64-bit OPTIONAL chunk,
+        # 2-byte and 4-byte indices for REQUIRED 32-bit chunks whose dictionaries have more than 256
+        # and 65,536 entries, and SNAPPY-compressed chunks from Parquet files. Value chunks before,
+        # in between and after check that the decoder switches between the modes.
+        int64_dict = [-2**63, -1, 0, 1, 2**63 - 1, -123456789012, 98765432109, -7, 65536, -65537]
+        int64_chunk = make_tricky(
+            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 2, dict_values=int64_dict, trailing_plain=False,
+        )
+        int64_chunk.defer_dict_decoding = True
+
+        int16_index_dict = [3 * i - 1000 for i in range(300)]
+        int16_index_chunk = make_tricky(
+            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 1,
+            stream_type=fpga_stream.StreamType.SIGNED_INT_32, dict_values=int16_index_dict,
+            trailing_plain=False, is_required=True,
+        )
+        int16_index_chunk.defer_dict_decoding = True
+
+        int32_index_dict = list(range(70000))
+        int32_index_chunk = make_tricky(
+            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 1,
+            stream_type=fpga_stream.StreamType.SIGNED_INT_32, dict_values=int32_index_dict,
+            trailing_plain=False, is_required=True,
+        )
+        int32_index_chunk.defer_dict_decoding = True
+
+        rle_chunk = _parquet_chunk('rle_data.parquet')
+        rle_chunk.defer_dict_decoding = True
+
+        mixed_output = ([i**8 for i in range(10, 20) for _ in range(i)] +
+                        list(range(128, 256)) * 2) * 2
+        mixed_chunk = _parquet_chunk('mixed_data.parquet')
+        mixed_chunk.defer_dict_decoding = True
+
+        int64 = fpga_stream.StreamType.SIGNED_INT_64
+        int32 = fpga_stream.StreamType.SIGNED_INT_32
+        self.run_chunks(
+            [
+                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1),
+                int64_chunk,
+                int16_index_chunk,
+                make_plain_data(_PLAIN_OUTPUT),
+                int32_index_chunk,
+                rle_chunk,
+                _parquet_chunk('rle_data.parquet'),
+                mixed_chunk,
+            ],
+            [
+                _RLE_OUTPUT + _PLAIN_OUTPUT,
+                _deferred_dict_output(int64_dict, _rle_output(int64_dict) * 2, int64),
+                _deferred_dict_output(int16_index_dict, _rle_output(int16_index_dict), int32),
+                _PLAIN_OUTPUT,
+                _deferred_dict_output(int32_index_dict, _rle_output(int32_index_dict), int32),
+                _deferred_dict_output(list(range(10, 20)), _RLE_OUTPUT, int64),
+                _RLE_OUTPUT,
+                _deferred_dict_output(list(dict.fromkeys(mixed_output)), mixed_output, int64),
             ],
         )

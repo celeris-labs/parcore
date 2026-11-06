@@ -10,6 +10,7 @@ import libstf::BYTE_T;
 import libstf::INT16_T;
 import libstf::INT32_T;
 import libstf::INT64_T;
+import libstf::GET_TYPE_WIDTH;
 import parcore::*;
 
 module ColumnChunkDecoder #(
@@ -31,20 +32,23 @@ module ColumnChunkDecoder #(
 localparam NUM_IDS = 16;
 
 // ------ Multiplexing declarations ---------------
-localparam int NUM_IN = 3;
+localparam int NUM_IN = 4;
 typedef enum logic [$bits(page_type_t) - 1:0] {
     IN_HYBRID = PAGE_TYPE_HYBRID,
     IN_DICT = PAGE_TYPE_DICT,
-    IN_PLAIN = PAGE_TYPE_PLAIN
+    IN_PLAIN = PAGE_TYPE_PLAIN,
+    IN_DICT_DEFERRED = 3
 } in_selector_t;
 `ASSERT_ELAB(NUM_IN <= 2**$bits(in_selector_t))
 
 ndata_i #(data8_t, DATABEAT_SIZE) ins[NUM_IN](clk, reset_synced);
 
-localparam int NUM_OUT = 2;
-typedef enum logic {
+localparam int NUM_OUT = 4;
+typedef enum logic [1:0] {
   OUT_HYBRID = 0,
-  OUT_PLAIN = 1
+  OUT_PLAIN = 1,
+  OUT_DICT = 2,
+  OUT_IDS = 3
 } out_selector_t;
 `ASSERT_ELAB(NUM_OUT <= 2**$bits(out_selector_t))
 typed_ndata_i #(DATABEAT_SIZE) outs[NUM_OUT](clk, reset_synced);
@@ -105,7 +109,7 @@ DataDemultiplexer #(NUM_IN) inst_multiplexer (
 // ------ Hybrid decoder + dictionary wiring ------
 data_i #(hybrid_page_conf_t) hybrid_conf(clk, reset_synced);
 
-ndata_i #(id_t, NUM_IDS) dict_ids(clk, reset_synced);
+ndata_i #(id_t, NUM_IDS) hybrid_ids(clk, reset_synced);
 HybridPageDecoder #(
     .data_t(id_t),
     .NUM_ELEMENTS(NUM_IDS),
@@ -117,7 +121,25 @@ HybridPageDecoder #(
     .conf(hybrid_conf),
     .in(ins[IN_HYBRID]),
 
-    .out(dict_ids)
+    .out(hybrid_ids)
+);
+
+localparam int NUM_IDS_OUT = 2;
+typedef enum logic {
+    IDS_DICTIONARY = 0,
+    IDS_OUTPUT = 1
+} ids_selector_t;
+
+ready_valid_i #(ids_selector_t) ids_select(clk, reset_synced);
+ndata_i #(id_t, NUM_IDS) ids_outs[NUM_IDS_OUT](clk, reset_synced);
+DataDemultiplexer #(NUM_IDS_OUT) inst_ids_demultiplexer (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .select(ids_select),
+
+    .in(hybrid_ids),
+    .out(ids_outs)
 );
 
 ready_valid_i #(type_t) dict_type(clk, reset_synced), dict_cast_type(clk, reset_synced);
@@ -157,7 +179,7 @@ TypedDictionary #(
     .rst_n(reset_synced),
 
     .in_values(dict_values),
-    .in_ids(dict_ids),
+    .in_ids(ids_outs[IDS_DICTIONARY]),
 
     .out(hybrid_typed)
 );
@@ -237,6 +259,77 @@ TypedNDataCast #(
     .out(outs[OUT_PLAIN])
 );
 
+// ------ Deferred dictionary decoding wiring -----
+// With defer_dict_decoding, the chunk's output is the dictionary page's values followed by one
+// index per value, as one byte stream. The dictionary page goes to the output as it is.
+assign outs[OUT_DICT].data  = ins[IN_DICT_DEFERRED].data;
+assign outs[OUT_DICT].typ   = BYTE_T;
+assign outs[OUT_DICT].keep  = ins[IN_DICT_DEFERRED].keep;
+assign outs[OUT_DICT].last  = ins[IN_DICT_DEFERRED].last;
+assign outs[OUT_DICT].valid = ins[IN_DICT_DEFERRED].valid;
+assign ins[IN_DICT_DEFERRED].ready = outs[OUT_DICT].ready;
+
+// The HybridPageDecoder emits a single `last` per chunk, but the output multiplexer releases its
+// select only at a `last`, and is selected per page. This ends every page's indices with a `last`.
+ready_valid_i #(data32_t) ids_num_values(clk, reset_synced);
+ndata_i #(id_t, NUM_IDS) ids_paged(clk, reset_synced);
+DataRewriteLast #(
+    .data_t(id_t),
+    .NUM_ELEMENTS(NUM_IDS)
+) inst_ids_set_last (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .num_elements(ids_num_values),
+
+    .in(ids_outs[IDS_OUTPUT]),
+    .out(ids_paged)
+);
+
+// The RunDecoder ends a beat at every run, so the indices are packed densely for the cast.
+ndata_i #(id_t, NUM_IDS) ids_normalized(clk, reset_synced);
+DataNormalizer #(
+    .data_t(id_t),
+    .NUM_ELEMENTS(NUM_IDS)
+) inst_ids_normalizer (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in(ids_paged),
+    .out(ids_normalized)
+);
+
+`ASSERT_ELAB(NUM_IDS * 4 == DATABEAT_SIZE)
+typed_ndata_i #(DATABEAT_SIZE) ids_typed(clk, reset_synced), ids_narrowed(clk, reset_synced);
+for (genvar I = 0; I < NUM_IDS; I++) begin
+    assign ids_typed.data[4 * I +: 4] = data32_t'(ids_normalized.data[I]);
+    assign ids_typed.keep[4 * I +: 4] = {4{ids_normalized.keep[I]}};
+end
+assign ids_typed.typ        = INT32_T;
+assign ids_typed.last       = ids_normalized.last;
+assign ids_typed.valid      = ids_normalized.valid;
+assign ids_normalized.ready = ids_typed.ready;
+
+ready_valid_i #(type_t) ids_type(clk, reset_synced);
+TypedNDataCast #(
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_ids_cast (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .out_type(ids_type),
+
+    .in(ids_typed),
+    .out(ids_narrowed)
+);
+
+assign outs[OUT_IDS].data  = ids_narrowed.data;
+assign outs[OUT_IDS].typ   = BYTE_T;
+assign outs[OUT_IDS].keep  = ids_narrowed.keep;
+assign outs[OUT_IDS].last  = ids_narrowed.last;
+assign outs[OUT_IDS].valid = ids_narrowed.valid;
+assign ids_narrowed.ready  = outs[OUT_IDS].ready;
+
 // ------ Output multiplexing ----------------------------
 typed_ndata_i #(DATABEAT_SIZE) inner_out(clk, reset_synced);
 TypedNDataMultiplexer #(DATABEAT_SIZE, NUM_OUT) inst_demultiplexer (
@@ -298,6 +391,31 @@ type_t path_typ; // Type the dictionary and plain paths emit
 logic is_required;
 logic last_page;
 
+logic    defer_dict_decoding;
+data32_t chunk_num_values;
+type_t   index_typ;
+
+function automatic type_t index_type(data32_t num_entries);
+    if (num_entries <= 256) begin
+        return BYTE_T;
+    end else if (num_entries <= 65536) begin
+        return INT16_T;
+    end
+    return INT32_T;
+endfunction
+
+function automatic data32_t deferred_output_size(type_t typ, data32_t num_entries,
+                                                  data32_t num_values);
+    data32_t dictionary_bytes, index_bytes;
+    dictionary_bytes = GET_TYPE_WIDTH(typ) == 64 ? num_entries << 3 : num_entries << 2;
+    case (index_type(num_entries))
+        BYTE_T:  index_bytes = num_values;
+        INT16_T: index_bytes = num_values << 1;
+        default: index_bytes = num_values << 2;
+    endcase
+    return dictionary_bytes + index_bytes;
+endfunction
+
 // Whether this chunk has had a dictionary page (and thus whether the dictionary path needs a last 
 // data beat) for the TypedDictionary to reset it's internal state.
 logic dict_seen;
@@ -342,6 +460,19 @@ always_ff @(posedge clk) begin
         plain_required.data  <= 'X;
         plain_required.valid <= 1'b0;
 
+        ids_select.data  <= ids_selector_t'('X);
+        ids_select.valid <= 1'b0;
+
+        ids_type.data  <= 'X;
+        ids_type.valid <= 1'b0;
+
+        ids_num_values.data  <= 'X;
+        ids_num_values.valid <= 1'b0;
+
+        defer_dict_decoding <= 'X;
+        chunk_num_values  <= 'X;
+        index_typ         <= type_t'('X);
+
         typ         <= BYTE_T;
         path_typ    <= type_t'('X);
         is_required <= 'X;
@@ -358,11 +489,16 @@ always_ff @(posedge clk) begin
                 if (chunk_confs[0].valid && chunk_confs[0].ready) begin
                     decompressor_conf.data <= chunk_confs[0].data.compression;
 
+                    // With defer_dict_decoding, the size is known with the dictionary page
                     num_values.data  <= chunk_confs[0].data.num_values;
-                    num_values.valid <= 1'b1;
+                    num_values.valid <= !chunk_confs[0].data.defer_dict_decoding;
 
-                    logical_type.data  <= chunk_confs[0].data.logical_typ;
+                    logical_type.data  <= chunk_confs[0].data.defer_dict_decoding ? BYTE_T :
+                                          chunk_confs[0].data.logical_typ;
                     logical_type.valid <= 1'b1;
+
+                    defer_dict_decoding <= chunk_confs[0].data.defer_dict_decoding;
+                    chunk_num_values  <= chunk_confs[0].data.num_values;
 
                     typ         <= chunk_confs[0].data.typ;
                     // 64 bit values cast to a narrower integer type are narrowed to INT32_T on the paths
@@ -398,22 +534,52 @@ always_ff @(posedge clk) begin
                             hybrid_conf.last             <= page_conf.data.last;
                             hybrid_conf.valid            <= 1'b1;
 
-                            hybrid_num_values.data  <= page_conf.data.num_values;
-                            hybrid_num_values.valid <= 1'b1;
+                            if (defer_dict_decoding) begin
+                                ids_num_values.data  <= page_conf.data.num_values;
+                                ids_num_values.valid <= 1'b1;
 
-                            out_select.data  <= OUT_HYBRID;
-                            out_select.valid <= 1'b1;
+                                ids_type.data  <= index_typ;
+                                ids_type.valid <= 1'b1;
+
+                                out_select.data  <= OUT_IDS;
+                                out_select.valid <= 1'b1;
+                            end else begin
+                                hybrid_num_values.data  <= page_conf.data.num_values;
+                                hybrid_num_values.valid <= 1'b1;
+
+                                out_select.data  <= OUT_HYBRID;
+                                out_select.valid <= 1'b1;
+                            end
                         end
                         PAGE_TYPE_DICT: begin
-                            in_select.data <= IN_DICT;
+                            if (defer_dict_decoding) begin
+                                in_select.data <= IN_DICT_DEFERRED;
 
-                            dict_type.data  <= typ;
-                            dict_type.valid <= 1'b1;
+                                out_select.data  <= OUT_DICT;
+                                out_select.valid <= 1'b1;
 
-                            dict_cast_type.data  <= path_typ;
-                            dict_cast_type.valid <= 1'b1;
+                                ids_select.data  <= IDS_OUTPUT;
+                                ids_select.valid <= 1'b1;
 
-                            dict_seen <= 1'b1;
+                                index_typ <= index_type(page_conf.data.num_values);
+
+                                num_values.data  <= deferred_output_size(
+                                    typ, page_conf.data.num_values, chunk_num_values);
+                                num_values.valid <= 1'b1;
+                            end else begin
+                                in_select.data <= IN_DICT;
+
+                                dict_type.data  <= typ;
+                                dict_type.valid <= 1'b1;
+
+                                dict_cast_type.data  <= path_typ;
+                                dict_cast_type.valid <= 1'b1;
+
+                                ids_select.data  <= IDS_DICTIONARY;
+                                ids_select.valid <= 1'b1;
+
+                                dict_seen <= 1'b1;
+                            end
                         end
                         PAGE_TYPE_PLAIN: begin
                             in_select.data <= IN_PLAIN;
@@ -471,6 +637,18 @@ always_ff @(posedge clk) begin
                     plain_required.valid <= 1'b0;
                 end
 
+                if (ids_select.ready) begin
+                    ids_select.valid <= 1'b0;
+                end
+
+                if (ids_type.ready) begin
+                    ids_type.valid <= 1'b0;
+                end
+
+                if (ids_num_values.ready) begin
+                    ids_num_values.valid <= 1'b0;
+                end
+
                 if (in_select.ready) begin
                     in_select.valid <= 1'b0;
                 end
@@ -491,7 +669,7 @@ always_ff @(posedge clk) begin
                 //   a new column chunk configuration next.
                 // - CONFIGURED if this was not the last page and this column
                 //   chunk has more pages to be fully decoded.
-                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !dict_cast_type.valid && !plain_type.valid && !plain_cast_type.valid && !plain_required.valid && !in_select.valid && !out_select.valid) begin
+                if (!decompressor_conf.valid && !hybrid_conf.valid && !dict_type.valid && !dict_cast_type.valid && !plain_type.valid && !plain_cast_type.valid && !plain_required.valid && !ids_select.valid && !ids_type.valid && !ids_num_values.valid && !in_select.valid && !out_select.valid) begin
                     if (last_page) begin
                         state <= ST_IDLE;
                     end else begin
@@ -501,8 +679,9 @@ always_ff @(posedge clk) begin
             end
         endcase
 
+        // Only a handshake clears it, since a dictionary page sets it in ST_CONFIGURED
         if (state != ST_IDLE) begin
-            if (num_values.ready) begin
+            if (num_values.valid && num_values.ready) begin
                 num_values.valid <= 1'b0;
             end
         end
@@ -513,6 +692,13 @@ end
 // next chunk until then keeps the pending logical type from being overwritten.
 assign chunk_confs[0].ready = state == ST_IDLE && !logical_type.valid;
 assign page_conf.ready      = state == ST_CONFIGURED;
+
+`ifndef SYNTHESIS
+assert property (@(posedge clk) disable iff (!reset_synced)
+    !(state == ST_CONFIGURED && page_conf.valid && defer_dict_decoding &&
+      page_conf.data.page_type == PAGE_TYPE_PLAIN))
+else $fatal(1, "ColumnChunkDecoder got a PLAIN data page in a defer_dict_decoding chunk");
+`endif
 
 // ------ Stream profiling ------------------------
 stream_profile_i profile_in ();
