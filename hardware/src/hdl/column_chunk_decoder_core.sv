@@ -1,7 +1,6 @@
 `timescale 1ns / 1ps
 
 `include "libstf_macros.svh"
-`include "parcore_macros.svh"
 
 import lynxTypes::AXI_DATA_BITS;
 import libstf::data8_t;
@@ -135,12 +134,48 @@ StripLevels #(
 
 `DATA_ASSIGN(plain_stripped, plain_pages)
 
-ndata_i #(data8_t, DATABEAT_SIZE) plain_to_out (clk, rst_n);
-ndata_i #(data8_t, DATABEAT_SIZE) dict_page_values (clk, rst_n);
-`DATA_ASSIGN(plain_values, plain_to_out)
-`DATA_ASSIGN(dict_values, dict_page_values)
+// 64 bit values cast to a narrower integer type are narrowed to INT32_T on the plain and dictionary
+// paths, so the dictionary holds them in one entry. The logical cast at the output narrows further.
+ready_valid_i #(type_t) plain_type_conf(clk, reset_synced), plain_cast_conf(clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) plain_physical(clk, reset_synced);
+
+NDataToTypedNData #(DATABEAT_SIZE) inst_plain_type (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in_type(plain_type_conf),
+    .in(plain_values),
+
+    .out(plain_physical)
+);
 
 // ------ Dictionary Encoded Path ---------------
+ready_valid_i #(type_t) dict_type_conf(clk, reset_synced), dict_cast_conf(clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) dict_physical(clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) dict_narrowed(clk, reset_synced);
+
+NDataToTypedNData #(DATABEAT_SIZE) inst_dict_type (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in_type(dict_type_conf),
+    .in(dict_values),
+
+    .out(dict_physical)
+);
+
+TypedNDataCast #(
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_dict_cast (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .out_type(dict_cast_conf),
+
+    .in(dict_physical),
+    .out(dict_narrowed)
+);
+
 // Registers the handover, so the RunDecoder's ready does not reach into the Decompressor
 ndata_i #(data8_t, DATABEAT_SIZE) hybrid_in(clk, reset_synced);
 NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_hybrid_in_skid_buffer (
@@ -152,7 +187,7 @@ NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_hybrid_in_skid_buffer (
 );
 
 data_i #(hybrid_page_conf_t) hybrid_page_decoder_conf(clk, reset_synced);
-ndata_i #(id_t, NUM_DICT_ELEM) dict_ids_native (clk, reset_synced);
+ndata_i #(id_t, NUM_DICT_ELEM) dict_ids(clk, reset_synced);
 HybridPageDecoder #(
     .data_t(id_t),
     .NUM_ELEMENTS(NUM_DICT_ELEM),
@@ -164,72 +199,22 @@ HybridPageDecoder #(
     .conf(hybrid_page_decoder_conf),
 
     .in(hybrid_in),
-    .out(dict_ids_native)
+    .out(dict_ids)
 );
 
-ready_valid_i #(type_t) dict_id_conf (clk, rst_n);
-ndata_i #(id_t, NUM_DICT_ELEM) dict_ids_scaled (clk, reset_synced);
-DictionaryID #(
-    id_t,
-    NUM_DICT_ELEM
-) inst_index_conversion (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .conf (dict_id_conf),
-
-    .in (dict_ids_native),
-    .out (dict_ids_scaled)
-);
-
-// The Dictionary indexes 32-bit values while the rest of the path moves bytes.
-// These wires logically convert one to another
-ndata_i #(data32_t, NUM_DICT_ELEM) dict_in_values  (clk, reset_synced);
-ndata_i #(data32_t, NUM_DICT_ELEM) dict_out_values (clk, reset_synced);
-ndata_i #(data8_t, DATABEAT_SIZE) dict_decoded_bytes (.*);
-
-assign dict_in_values.data     = dict_page_values.data;
-assign dict_in_values.last     = dict_page_values.last;
-assign dict_in_values.valid    = dict_page_values.valid;
-assign dict_page_values.ready  = dict_in_values.ready;
-
-assign dict_decoded_bytes.data  = dict_out_values.data;
-assign dict_decoded_bytes.last  = dict_out_values.last;
-assign dict_decoded_bytes.valid = dict_out_values.valid;
-assign dict_out_values.ready    = dict_decoded_bytes.ready;
-
-for (genvar I = 0; I < NUM_DICT_ELEM; I++) begin
-    assign dict_in_values.keep[I] = &dict_page_values.keep[4*I +: 4];
-    assign dict_decoded_bytes.keep[4*I +: 4] = {4{dict_out_values.keep[I]}};
-end
-
-Dictionary #(
-    .value_t(data32_t),
+typed_ndata_i #(DATABEAT_SIZE) dict_out(clk, reset_synced);
+TypedDictionary #(
     .id_t(id_t),
-    .NUM_ELEMENTS(NUM_DICT_ELEM)
+    .NUM_ELEMENTS(NUM_DICT_ELEM),
+    .DATABEAT_SIZE(DATABEAT_SIZE)
 ) inst_dictionary (
     .clk(clk),
     .rst_n(reset_synced),
 
-    .in_values(dict_in_values),
-    .in_ids(dict_ids_scaled),
+    .in_values(dict_narrowed),
+    .in_ids(dict_ids),
 
-    .out(dict_out_values)
-);
-
-ready_valid_i #(data32_t) rewrite_last_conf (clk, rst_n);
-ndata_i #(data8_t, DATABEAT_SIZE) hybrid_path_out (.*);
-DataRewriteLast #(
-    .data_t(data8_t),
-    .NUM_ELEMENTS (DATABEAT_SIZE)
-) inst_reinsert_last_for_hybrid_path (
-    .clk (clk),
-    .rst_n (rst_n),
-
-    .num_elements (rewrite_last_conf),
-
-    .in (dict_decoded_bytes),
-    .out (hybrid_path_out)
+    .out(dict_out)
 );
 
 // ------ Output Multiplexing ---------------
@@ -239,75 +224,65 @@ typedef enum logic {
   OUT_HYBRID = 1
 } out_selector_t;
 `ASSERT_ELAB(NUM_OUT <= 2**$bits(out_selector_t))
-ndata_i #(data8_t, DATABEAT_SIZE) outs[NUM_OUT](clk, reset_synced);
-
-`DATA_ASSIGN(plain_to_out, outs[OUT_PLAIN])
-`DATA_ASSIGN(hybrid_path_out, outs[OUT_HYBRID])
-
-ready_valid_i #(logic) out_mux_conf (clk, rst_n);
-ndata_i #(data8_t, DATABEAT_SIZE) per_page_out(clk, reset_synced);
-DataMultiplexer #(
-    data8_t,
-    DATABEAT_SIZE,
-    NUM_OUT
-) inst_out_mux (
-    .clk (clk),
-    .rst_n (rst_n),
-
-    .select (out_mux_conf),
-
-    .in (outs),
-    .out(per_page_out)
-);
-
-ready_valid_i #(data32_t) normalize_until_conf (clk, rst_n);
-ndata_i #(data8_t, DATABEAT_SIZE) per_cc_out (clk, reset_synced);
-NormalizeUntil #(
-    data8_t,
-    data32_t,
-    DATABEAT_SIZE
-) inst_page_value_collector (
-    .clk (clk),
-    .rst_n (rst_n),
-
-    .size (normalize_until_conf),
-
-    .in (per_page_out),
-    .out (per_cc_out)
-);
-
-// 64 bit values cast to a narrower integer type are first narrowed to INT32_T, because the
-// TypedNDataCast narrows by at most one step. Both casts need the dense input the NormalizeUntil
-// provides.
-ready_valid_i #(type_t) physical_type_conf (clk, reset_synced);
-ready_valid_i #(type_t) path_type_conf (clk, reset_synced);
-ready_valid_i #(type_t) logical_type_conf (clk, reset_synced);
-typed_ndata_i #(DATABEAT_SIZE) per_cc_physical (clk, reset_synced);
-typed_ndata_i #(DATABEAT_SIZE) per_cc_narrowed (clk, reset_synced);
-typed_ndata_i #(DATABEAT_SIZE) per_cc_logical (clk, reset_synced);
-
-NDataToTypedNData #(DATABEAT_SIZE) inst_out_type (
-    .clk(clk),
-    .rst_n(reset_synced),
-
-    .in_type(physical_type_conf),
-    .in(per_cc_out),
-
-    .out(per_cc_physical)
-);
+typed_ndata_i #(DATABEAT_SIZE) outs[NUM_OUT](clk, reset_synced);
 
 TypedNDataCast #(
     .DATABEAT_SIZE(DATABEAT_SIZE)
-) inst_narrow_cast (
+) inst_plain_cast (
     .clk(clk),
     .rst_n(reset_synced),
 
-    .out_type(path_type_conf),
+    .out_type(plain_cast_conf),
 
-    .in(per_cc_physical),
-    .out(per_cc_narrowed)
+    .in(plain_physical),
+    .out(outs[OUT_PLAIN])
 );
 
+// The TypedDictionary emits one last per dictionary, but the output multiplexer switches per page
+ready_valid_i #(data32_t) rewrite_last_conf(clk, reset_synced);
+TypedRewriteLast #(
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_hybrid_rewrite_last (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .num_elements(rewrite_last_conf),
+
+    .in(dict_out),
+    .out(outs[OUT_HYBRID])
+);
+
+ready_valid_i #(logic) out_mux_conf(clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) per_page_out(clk, reset_synced);
+TypedNDataMultiplexer #(DATABEAT_SIZE, NUM_OUT) inst_out_mux (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .select(out_mux_conf),
+
+    .in(outs),
+    .out(per_page_out)
+);
+
+ready_valid_i #(data32_t) normalize_until_conf(clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) per_cc_out(clk, reset_synced);
+TypedNormalizeUntil #(
+    .size_t(data32_t),
+    .DATABEAT_SIZE(DATABEAT_SIZE),
+    .BARREL_SHIFTER_REGISTER_LEVELS(2)
+) inst_normalize_until (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .size(normalize_until_conf),
+
+    .in(per_page_out),
+    .out(per_cc_out)
+);
+
+// Needs the dense input the TypedNormalizeUntil provides
+ready_valid_i #(type_t) logical_type_conf(clk, reset_synced);
+typed_ndata_i #(DATABEAT_SIZE) per_cc_logical(clk, reset_synced);
 TypedNDataCast #(
     .DATABEAT_SIZE(DATABEAT_SIZE)
 ) inst_logical_cast (
@@ -316,7 +291,7 @@ TypedNDataCast #(
 
     .out_type(logical_type_conf),
 
-    .in(per_cc_narrowed),
+    .in(per_cc_out),
     .out(per_cc_logical)
 );
 
@@ -337,7 +312,6 @@ state_t state;
 
 logic first_page;
 logic dict_page_seen;
-logic hybrid_page_seen;
 
 column_chunk_conf_t cc_conf_latched;
 page_conf_t page_conf_r;
@@ -349,7 +323,6 @@ if (!reset_synced) begin
     state <= WAIT_FOR_CC_CONF;
     first_page <= 1;
     dict_page_seen <= 0;
-    hybrid_page_seen <= 0;
 end else begin
     case (state)
         WAIT_FOR_CC_CONF:
@@ -370,14 +343,11 @@ end else begin
                     state <= WAIT_FOR_CC_CONF;
                     first_page <= 1;
                     dict_page_seen <= 0;
-                    hybrid_page_seen <= 0;
                 end else begin
                     state <= WAIT_FOR_PAGE_CONF;
                     first_page <= 0;
                     dict_page_seen <=
                             dict_page_seen || page_conf_r.page_type == PAGE_TYPE_DICT;
-                    hybrid_page_seen <= 
-                            hybrid_page_seen || page_conf_r.page_type == PAGE_TYPE_HYBRID;
                 end
             end
         end
@@ -405,7 +375,7 @@ always_ff @( posedge clk ) begin : configure_decompressor
     );
     _decompressor_conf.data <= cc_conf_latched.compression;
 end
-`SKID_SIGNAL(compression_t, clk, rst_n, _decompressor_conf, decompressor_conf)
+SkidBuffer #(compression_t) inst_decompressor_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_decompressor_conf), .out(decompressor_conf));
 
 ready_valid_i #(in_selector_t) _data_page_path_conf (clk, reset_synced);
 always_ff @( posedge clk ) begin : configure_data_page_path
@@ -416,7 +386,7 @@ always_ff @( posedge clk ) begin : configure_data_page_path
     );
     _data_page_path_conf.data <= page_conf_r.page_type == PAGE_TYPE_HYBRID ? IN_HYBRID : IN_PLAIN;
 end
-`SKID_SIGNAL(in_selector_t, clk, rst_n, _data_page_path_conf, data_page_path_conf)
+SkidBuffer #(in_selector_t) inst_data_page_path_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_data_page_path_conf), .out(data_page_path_conf));
 
 
 // ------ Hybrid Path configuration ---------------------------------------
@@ -457,23 +427,7 @@ always_ff @( posedge clk ) begin : configure_hybrid_page_decoder
     _hybrid_page_decoder_conf.keep <= ~hybrid_flush;
     _hybrid_page_decoder_conf.last <= page_conf_r.last;
 end
-`SKID_DATA_SIGNAL(hybrid_page_conf_t, clk, rst_n, _hybrid_page_decoder_conf, hybrid_page_decoder_conf)
-
-// The Hybrid path routing needs to be once per hybrid pages group
-ready_valid_i #(type_t) _dict_id_conf (clk, rst_n);
-logic enqueue_dict_id_conf;
-assign enqueue_dict_id_conf =
-        !hybrid_page_seen &&
-        (hybrid_flush || page_conf_r.page_type == PAGE_TYPE_HYBRID);
-always_ff @( posedge clk ) begin : configure_dict_id
-    _dict_id_conf.valid <= n_conf_valid(
-        _dict_id_conf.valid,
-        _dict_id_conf.ready,
-        enqueue_dict_id_conf
-    );
-    _dict_id_conf.data <= hybrid_flush ? INT32_T : cc_conf_latched.typ;
-end
-`SKID_SIGNAL(type_t, clk, rst_n, _dict_id_conf, dict_id_conf)
+DataSkidBuffer #(hybrid_page_conf_t) inst_hybrid_page_decoder_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_hybrid_page_decoder_conf), .out(hybrid_page_decoder_conf));
 
 ready_valid_i #(data32_t) _rewrite_last_conf (clk, rst_n);
 always_ff @( posedge clk ) begin : configure_rewrite_last
@@ -482,10 +436,9 @@ always_ff @( posedge clk ) begin : configure_rewrite_last
         _rewrite_last_conf.ready,
         page_conf_r.page_type == PAGE_TYPE_HYBRID
     );
-    _rewrite_last_conf.data <=
-        page_conf_r.num_values * GET_TYPE_BYTES(cc_conf_latched.typ);
+    _rewrite_last_conf.data <= page_conf_r.num_values;
 end
-`SKID_SIGNAL(data32_t, clk, rst_n, _rewrite_last_conf, rewrite_last_conf)
+SkidBuffer #(data32_t) inst_rewrite_last_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_rewrite_last_conf), .out(rewrite_last_conf));
 
 // ------ PLAIN encoded values configuration ---------------------------------------
 logic plain_encoded_page;
@@ -506,7 +459,7 @@ always_ff @( posedge clk ) begin : configure_page_info
         num_values: page_conf_r.num_values
     };
 end
-`SKID_SIGNAL(page_info_t, clk, rst_n, _page_info, page_info)
+SkidBuffer #(page_info_t) inst_page_info_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_page_info), .out(page_info));
 
 // ------ Output MUX control ---------------------------------------
 ready_valid_i #(logic) _out_mux_conf (clk, rst_n);
@@ -520,7 +473,7 @@ always_ff @( posedge clk ) begin : configure_out_mux
             OUT_HYBRID :
             OUT_PLAIN;
 end
-`SKID_SIGNAL(logic, clk, rst_n, _out_mux_conf, out_mux_conf)
+SkidBuffer #(logic) inst_out_mux_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_out_mux_conf), .out(out_mux_conf));
 
 // ------ Plain Page level configuration ---------------------------------------
 // Dictionary pages have no levels, so StripLevels forwards them like pages of a REQUIRED column
@@ -534,7 +487,7 @@ always_ff @( posedge clk ) begin : configure_plain_required
     _plain_required_conf.data <= cc_conf_latched.is_required ||
                                  page_conf_r.page_type == PAGE_TYPE_DICT;
 end
-`SKID_SIGNAL(logic, clk, rst_n, _plain_required_conf, plain_required_conf)
+SkidBuffer #(logic) inst_plain_required_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_plain_required_conf), .out(plain_required_conf));
 
 // ------ Column Chunk level configurations ---------------------------------------
 ready_valid_i #(data32_t) _normalize_until_conf (clk, rst_n);
@@ -544,52 +497,54 @@ always_ff @( posedge clk ) begin : configure_normalize_until
         _normalize_until_conf.ready,
         first_page
     );
-    _normalize_until_conf.data <= 
-        cc_conf_latched.num_values * GET_TYPE_BYTES(cc_conf_latched.typ);
+    _normalize_until_conf.data <= cc_conf_latched.num_values;
 end
-`SKID_SIGNAL(data32_t, clk, rst_n, _normalize_until_conf, normalize_until_conf)
+SkidBuffer #(data32_t) inst_normalize_until_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_normalize_until_conf), .out(normalize_until_conf));
 
-ready_valid_i #(type_t) _physical_type_conf (clk, reset_synced);
-ready_valid_i #(type_t) _path_type_conf (clk, reset_synced);
+type_t path_typ;
+assign path_typ = cc_conf_latched.typ == INT64_T &&
+                  cc_conf_latched.logical_typ inside {INT32_T, INT16_T, BYTE_T} ?
+                  INT32_T : cc_conf_latched.typ;
+
+ready_valid_i #(type_t) _plain_type_conf (clk, reset_synced);
+ready_valid_i #(type_t) _plain_cast_conf (clk, reset_synced);
+ready_valid_i #(type_t) _dict_type_conf (clk, reset_synced);
+ready_valid_i #(type_t) _dict_cast_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_path_types
+    _plain_type_conf.valid <= n_conf_valid(_plain_type_conf.valid, _plain_type_conf.ready, page_conf_r.page_type == PAGE_TYPE_PLAIN);
+    _plain_cast_conf.valid <= n_conf_valid(_plain_cast_conf.valid, _plain_cast_conf.ready, page_conf_r.page_type == PAGE_TYPE_PLAIN);
+    _dict_type_conf.valid  <= n_conf_valid(_dict_type_conf.valid, _dict_type_conf.ready, page_conf_r.page_type == PAGE_TYPE_DICT);
+    _dict_cast_conf.valid  <= n_conf_valid(_dict_cast_conf.valid, _dict_cast_conf.ready, page_conf_r.page_type == PAGE_TYPE_DICT);
+    _plain_type_conf.data  <= cc_conf_latched.typ;
+    _plain_cast_conf.data  <= path_typ;
+    _dict_type_conf.data   <= cc_conf_latched.typ;
+    _dict_cast_conf.data   <= path_typ;
+end
+SkidBuffer #(type_t) inst_plain_type_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_plain_type_conf), .out(plain_type_conf));
+SkidBuffer #(type_t) inst_plain_cast_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_plain_cast_conf), .out(plain_cast_conf));
+SkidBuffer #(type_t) inst_dict_type_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_dict_type_conf), .out(dict_type_conf));
+SkidBuffer #(type_t) inst_dict_cast_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_dict_cast_conf), .out(dict_cast_conf));
+
 ready_valid_i #(type_t) _logical_type_conf (clk, reset_synced);
-always_ff @( posedge clk ) begin : configure_casts
-    _physical_type_conf.valid <= n_conf_valid(
-        _physical_type_conf.valid,
-        _physical_type_conf.ready,
-        first_page
-    );
-    _path_type_conf.valid <= n_conf_valid(
-        _path_type_conf.valid,
-        _path_type_conf.ready,
-        first_page
-    );
-    _logical_type_conf.valid <= n_conf_valid(
-        _logical_type_conf.valid,
-        _logical_type_conf.ready,
-        first_page
-    );
-    _physical_type_conf.data <= cc_conf_latched.typ;
-    _path_type_conf.data     <= cc_conf_latched.typ == INT64_T &&
-                                cc_conf_latched.logical_typ inside {INT32_T, INT16_T, BYTE_T} ?
-                                INT32_T : cc_conf_latched.typ;
+always_ff @( posedge clk ) begin : configure_logical_type
+    _logical_type_conf.valid <= n_conf_valid(_logical_type_conf.valid, _logical_type_conf.ready, first_page);
     _logical_type_conf.data  <= cc_conf_latched.logical_typ;
 end
-`SKID_SIGNAL(type_t, clk, rst_n, _physical_type_conf, physical_type_conf)
-`SKID_SIGNAL(type_t, clk, rst_n, _path_type_conf, path_type_conf)
-`SKID_SIGNAL(type_t, clk, rst_n, _logical_type_conf, logical_type_conf)
+SkidBuffer #(type_t) inst_logical_type_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_logical_type_conf), .out(logical_type_conf));
 
 assign all_modules_consumed_configs =
         !_decompressor_conf.valid &&
         !_data_page_path_conf.valid &&
         !_hybrid_page_decoder_conf.valid &&
-        !_dict_id_conf.valid &&
         !_page_info.valid &&
         !_rewrite_last_conf.valid &&
         !_out_mux_conf.valid &&
         !_normalize_until_conf.valid &&
         !_plain_required_conf.valid &&
-        !_physical_type_conf.valid &&
-        !_path_type_conf.valid &&
+        !_plain_type_conf.valid &&
+        !_plain_cast_conf.valid &&
+        !_dict_type_conf.valid &&
+        !_dict_cast_conf.valid &&
         !_logical_type_conf.valid;
 assign chunk_confs[0].ready = state == WAIT_FOR_CC_CONF;
 assign page_conf.ready = state == WAIT_FOR_PAGE_CONF;

@@ -1,7 +1,6 @@
 `timescale 1ns / 1ps
 
 `include "libstf_macros.svh"
-`include "parcore_macros.svh"
 
 import libstf::*;
 
@@ -23,11 +22,6 @@ module HeapNormalizer #(
     ndata_i.m out         // #(data8_t, NUM_BYTES)
 );
 
-ready_valid_i #(logic[1:0]) _conf (.*);
-`SKID_SIGNAL(logic[1:0], clk, rst_n, conf, _conf)
-ndata_i #(data8_t, NUM_BYTES) _in (.*);
-`SKID_NDATA_SIGNAL(data8_t, NUM_BYTES, clk, rst_n, in, _in)
-
 logic generates_heap;
 logic last_page;
 
@@ -41,11 +35,11 @@ state_t state;
 ndata_i #(data8_t, NUM_BYTES) to_normalizer (.*);
 
 task fetch_conf_transition();
-    generates_heap <= _conf.data[1];
-    last_page <= _conf.data[0];
-    if (_conf.data[1])
+    generates_heap <= conf.data[1];
+    last_page <= conf.data[0];
+    if (conf.data[1])
         state <= PASSTHROUGH;
-    else if (_conf.data[0])
+    else if (conf.data[0])
         state <= EMIT_DUMMY;
     else
         state <= WAIT_CONF;
@@ -57,7 +51,7 @@ if (!rst_n) begin
 end else begin
     case (state)
         WAIT_CONF: begin
-            if (_conf.valid)
+            if (conf.valid)
                 fetch_conf_transition();
         end
         EMIT_DUMMY: begin
@@ -65,7 +59,7 @@ end else begin
                 state <= WAIT_CONF;
         end
         PASSTHROUGH: begin
-            if (_in.valid && _in.last && to_normalizer.ready) begin
+            if (in.valid && in.last && to_normalizer.ready) begin
                 state <= WAIT_CONF;
             end
         end
@@ -73,12 +67,12 @@ end else begin
 end
 end
 
-assign _conf.ready = state == WAIT_CONF;
-assign to_normalizer.data = _in.data;
-assign to_normalizer.keep = state == PASSTHROUGH ? _in.keep : '0;
-assign to_normalizer.valid = (state == PASSTHROUGH && _in.valid) || state == EMIT_DUMMY;
-assign to_normalizer.last = state == EMIT_DUMMY || (state == PASSTHROUGH && _in.last && last_page);
-assign _in.ready = state == PASSTHROUGH && to_normalizer.ready;
+assign conf.ready = state == WAIT_CONF;
+assign to_normalizer.data = in.data;
+assign to_normalizer.keep = state == PASSTHROUGH ? in.keep : '0;
+assign to_normalizer.valid = (state == PASSTHROUGH && in.valid) || state == EMIT_DUMMY;
+assign to_normalizer.last = state == EMIT_DUMMY || (state == PASSTHROUGH && in.last && last_page);
+assign in.ready = state == PASSTHROUGH && to_normalizer.ready;
 
 DataNormalizer #(
     .data_t(data8_t),

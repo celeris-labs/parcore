@@ -1,7 +1,6 @@
 `timescale 1ns / 1ps
 
 `include "libstf_macros.svh"
-`include "parcore_macros.svh"
 
 import lynxTypes::AXI_DATA_BITS;
 import libstf::data8_t;
@@ -55,7 +54,7 @@ ColumnChunkDecoderCore #(
 
 // ------ Configuration ---------------
 ready_valid_i #(page_info_t) infos[3] (clk, reset_synced);
-RegisteredReadyValidDuplicator #(page_info_t, 3) inst_page_info_duplicator (
+ReadyValidDuplicator #(3) inst_page_info_duplicator (
     .clk(clk),
     .rst_n(reset_synced),
 
@@ -79,7 +78,7 @@ assign _plain_page_conf.data = '{
 };
 assign _plain_page_conf.valid = infos[0].valid && plain_encoded(infos[0].data);
 assign infos[0].ready = !infos[0].valid || !plain_encoded(infos[0].data) || _plain_page_conf.ready;
-`SKID_SIGNAL(plain_page_conf_t, clk, reset_synced, _plain_page_conf, plain_page_conf)
+SkidBuffer #(plain_page_conf_t) inst_plain_page_conf_skid_buffer (.clk(clk), .rst_n(reset_synced), .in(_plain_page_conf), .out(plain_page_conf));
 
 logic decoder_page, needs_heap_addr;
 assign decoder_page    = infos[1].valid && is_string(infos[1].data) && plain_encoded(infos[1].data);
@@ -95,7 +94,7 @@ assign _str_decoder_conf.data = '{
 assign _str_decoder_conf.valid = decoder_page && (!needs_heap_addr || heap_addr.valid);
 assign infos[1].ready = !decoder_page || _str_decoder_conf.ready && (!needs_heap_addr || heap_addr.valid);
 assign heap_addr.ready = decoder_page && needs_heap_addr && _str_decoder_conf.ready;
-`SKID_SIGNAL(string_decoder_conf_t, clk, reset_synced, _str_decoder_conf, str_decoder_conf)
+SkidBuffer #(string_decoder_conf_t) inst_str_decoder_conf_skid_buffer (.clk(clk), .rst_n(reset_synced), .in(_str_decoder_conf), .out(str_decoder_conf));
 
 // The HeapNormalizer takes every page of string column chunks to see the chunk's last page
 ready_valid_i #(logic[1:0]) _heap_normalize_conf (clk, reset_synced);
@@ -103,7 +102,7 @@ ready_valid_i #(logic[1:0]) heap_normalize_conf (clk, reset_synced);
 assign _heap_normalize_conf.data  = {plain_encoded(infos[2].data), infos[2].data.last};
 assign _heap_normalize_conf.valid = infos[2].valid && is_string(infos[2].data);
 assign infos[2].ready = !infos[2].valid || !is_string(infos[2].data) || _heap_normalize_conf.ready;
-`SKID_SIGNAL(logic[1:0], clk, reset_synced, _heap_normalize_conf, heap_normalize_conf)
+SkidBuffer #(logic[1:0]) inst_heap_normalize_conf_skid_buffer (.clk(clk), .rst_n(reset_synced), .in(_heap_normalize_conf), .out(heap_normalize_conf));
 
 // ------ PLAIN encoded values ---------------
 ndata_i #(data8_t, DATABEAT_SIZE) psd_in (clk, rst_n);

@@ -1,7 +1,6 @@
 `timescale 1ns / 1ps
 
 `include "libstf_macros.svh"
-`include "parcore_macros.svh"
 
 import libstf::*;
 import parcore::*;
@@ -43,7 +42,7 @@ typedef enum logic {
 // ------ Config ------------------------------------------------------------------------------------
 // The skid buffers let each routing decision be taken at its own page boundary
 ready_valid_i #(plain_page_conf_t) confs[3](clk, reset_synced);
-RegisteredReadyValidDuplicator #(plain_page_conf_t, 3) inst_conf_duplicator (
+ReadyValidDuplicator #(3) inst_conf_duplicator (
     .clk(clk),
     .rst_n(reset_synced),
 
@@ -70,9 +69,9 @@ assign confs[2].ready     = _dest_select.ready;
 ready_valid_i #(path_t) path_in_select(clk, reset_synced);
 ready_valid_i #(path_t) path_out_select(clk, reset_synced);
 ready_valid_i #(dest_t) dest_select(clk, reset_synced);
-`SKID_SIGNAL(path_t, clk, reset_synced, _path_in_select, path_in_select)
-`SKID_SIGNAL(path_t, clk, reset_synced, _path_out_select, path_out_select)
-`SKID_SIGNAL(dest_t, clk, reset_synced, _dest_select, dest_select)
+SkidBuffer #(path_t) inst_path_in_select_skid_buffer (.clk(clk), .rst_n(reset_synced), .in(_path_in_select), .out(path_in_select));
+SkidBuffer #(path_t) inst_path_out_select_skid_buffer (.clk(clk), .rst_n(reset_synced), .in(_path_out_select), .out(path_out_select));
+SkidBuffer #(dest_t) inst_dest_select_skid_buffer (.clk(clk), .rst_n(reset_synced), .in(_dest_select), .out(dest_select));
 
 // ------ String decoder or bypass ------------------------------------------------------------------
 ndata_i #(data8_t, DATABEAT_SIZE) paths_in[2](clk, reset_synced);

@@ -2,7 +2,6 @@
 
 `include "lynx_macros.svh"
 `include "libstf_macros.svh"
-`include "parcore_macros.svh"
 
 import parcore::*;
 import libstf::*;
