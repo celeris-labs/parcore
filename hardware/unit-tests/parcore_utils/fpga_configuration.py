@@ -51,14 +51,14 @@ class ColumnChunkDecoderConfig(Config):
     ID = 0x5c19f934407065bd # COLUMN_CHUNK_DECODER_CONFIG_ID
 
     # Read registers: info registers followed by the StreamProfiler counters of each decoder
-    INFO_REGS    = 3
+    INFO_REGS    = 4
     PROFILE_REGS = 10
 
     # column_chunk_conf_t packs (MSB -> LSB) as:
     #   logical type_t [3 bits] | is_required [1 bit] | compression_t [1 bit] |
     #   num_values [32 bits] | type_t [3 bits]
-    # in register 2 * decoder. The string heap address does not fit, so GERMAN_STR_T chunks write it
-    # to register 2 * decoder + 1.
+    # in register decoder. With string decoders, GERMAN_STR_T chunks write their heap address to
+    # register num_decoders + decoder.
     NUM_VALUES_SHIFT   = 3
     COMPRESSION_SHIFT  = NUM_VALUES_SHIFT + 32
     IS_REQUIRED_SHIFT  = COMPRESSION_SHIFT + 1
@@ -68,6 +68,7 @@ class ColumnChunkDecoderConfig(Config):
         super().__init__(registers, addr_offset, num_regs)
         self.num_decoders = self.read_register(1)
         self.maximum_num_enqueued_configs = self.read_register(2)
+        self.has_string_decoders = self.read_register(3) != 0
 
     @staticmethod
     def register_value(
@@ -111,16 +112,17 @@ class ColumnChunkDecoderConfig(Config):
         assert decoder < self.num_decoders, (
             f"Attempted to configure ColumnChunkDecoder {decoder} out of {self.num_decoders}"
         )
+        is_string = to_type_t(data_type) == GERMAN_STR_T
+        assert not is_string or self.has_string_decoders, "The decoders do not decode strings"
         self.write_register(
-            2 * decoder,
+            decoder,
             ColumnChunkDecoderConfig.register_value(
                 compression, num_values, data_type, is_required, logical_type, defer_dict_decoding
             ),
         )
-        # Writing it for any other type would desynchronise the two configuration FIFOs, since the
-        # hardware only pops it for GERMAN_STR_T.
-        if to_type_t(data_type) == GERMAN_STR_T:
-            self.write_register(2 * decoder + 1, string_heap_addr)
+        # The decoder only takes a heap address for string column chunks
+        if is_string:
+            self.write_register(self.num_decoders + decoder, string_heap_addr)
 
     def read_profile(self, decoder: int) -> DecoderProfile:
         """

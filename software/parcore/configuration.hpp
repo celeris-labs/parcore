@@ -11,7 +11,7 @@ constexpr const uint64_t COLUMN_CHUNK_DECODER_CONFIG_ID = 0x5c19f934407065bd;
 
 // Read-side register layout of the ColumnChunkDecoderConfig: a few info
 // registers followed by 10 profiling counters per decoder (5 input + 5 output).
-constexpr const uint32_t COLUMN_CHUNK_DECODER_INFO_REGS    = 3;
+constexpr const uint32_t COLUMN_CHUNK_DECODER_INFO_REGS    = 4;
 constexpr const uint32_t COLUMN_CHUNK_DECODER_PROFILE_REGS = 10;
 
 struct StreamProfile {
@@ -50,7 +50,8 @@ class ColumnChunkDecoderConfig : public libstf::Config {
      *                         data pages carry no definition levels.
      * @param logical_typ      The type the decoder casts the values to. Pass typ for no cast.
      * @param string_heap_addr Base address of the buffer receiving the string heap.
-     *                         Only meaningful for GERMAN_STR_T; ignored otherwise.
+     *                         Only meaningful for GERMAN_STR_T, which needs string decoders;
+     *                         ignored otherwise.
      */
     void enqueue_column_chunk(libstf::stream_t decoder, metadata::Compression compression,
                               uint64_t num_values, libstf::type_t typ, bool is_required,
@@ -62,12 +63,19 @@ class ColumnChunkDecoderConfig : public libstf::Config {
     static bool supports_cast(libstf::type_t typ, libstf::type_t logical_typ);
 
     const libstf::stream_t num_decoders() const;
+
+    /**
+     * Whether the decoders decode strings. They then write their string heap on a second output
+     * stream each.
+     */
+    bool has_string_decoders() const;
     const size_t           maximum_num_enqueued_configs() const;
 
     static constexpr uint64_t ID = COLUMN_CHUNK_DECODER_CONFIG_ID;
 
   private:
     libstf::stream_t num_decoders_;
+    bool             has_string_decoders_;
     size_t           maximum_num_enqueued_configs_;
 };
 

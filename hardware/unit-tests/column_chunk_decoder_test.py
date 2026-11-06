@@ -399,8 +399,8 @@ _RLE_OUTPUT = _rle_output(list(range(10, 20)))
 _PLAIN_OUTPUT = list(range(0, 256))
 
 
-class ColumnChunkDecoderTestCase(ConfiguredTestCase):
-    alternative_vfpga_top_file = "vfpga_tops/column_chunk_decoder_test.sv"
+class StringColumnChunkDecoderTestCase(ConfiguredTestCase):
+    alternative_vfpga_top_file = "vfpga_tops/string_column_chunk_decoder_test.sv"
     debug_mode = True
 
     def configure(self):
@@ -706,8 +706,8 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
 
     # -- German strings -----------------------------------------------------
     #
-    # A PLAIN BYTE_ARRAY chunk takes the string path: StripLevels -> PlainRouter
-    # -> StringRouter -> ParallelStringDecoder -> out. Values land on stream 0 as
+    # A PLAIN BYTE_ARRAY chunk takes the string path: StripLevels -> PlainPagePath
+    # -> ParallelStringDecoder -> PlainPagePath -> out. Values land on stream 0 as
     # 16-byte german_str_t records, and the bytes of strings longer than 12 bytes
     # on heap_out (stream 1).
 
@@ -864,3 +864,24 @@ _COUNTERID_RUNS = {
     203: [(167516, 9038), (167537, 7286), (178321, 81920), (190147, 40960), (192248, 22980),
           (192286, 1355), (192337, 16625), (199550, 155708)],
 }
+
+
+class ColumnChunkDecoderTestCase(StringColumnChunkDecoderTestCase):
+    """
+    Runs the tests without strings on the ColumnChunkDecoder, which shares everything but the path
+    of PLAIN encoded values with the StringColumnChunkDecoder. The real-data tests only exercise the
+    shared part, so they only run on the StringColumnChunkDecoder.
+    """
+
+    alternative_vfpga_top_file = "vfpga_tops/column_chunk_decoder_test.sv"
+
+    def setUp(self):
+        if self._testMethodName.startswith("test_hits_"):
+            self.skipTest("Only exercises the part shared with the StringColumnChunkDecoder")
+        return super().setUp()
+
+    def run_chunks(self, inputs: list[_ColumnChunk], outputs: list[list[int]],
+                   read_profile: bool = False):
+        if any(input.is_string for input in inputs):
+            self.skipTest("The ColumnChunkDecoder does not decode strings")
+        super().run_chunks(inputs, outputs, read_profile)

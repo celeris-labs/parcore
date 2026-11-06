@@ -29,8 +29,8 @@ inline uint64_t compression_to_hardware(metadata::Compression compression) {
 // column_chunk_conf_t packs (MSB -> LSB) as:
 //   logical type_t [3 bits] | is_required [1 bit] | compression_t [1 bit] | num_values [32 bits] |
 //   type_t [3 bits]
-// The string_heap_addr [48 bits] does not fit alongside the rest in a single 64-bit AXIL write, so
-// it travels in a second register that the hardware only pops for GERMAN_STR_T chunks.
+// in register decoder. With string decoders, GERMAN_STR_T chunks also write their string_heap_addr
+// [48 bits] to register num_decoders + decoder.
 constexpr const uint32_t COLUMN_CHUNK_DECODER_NUM_VALUES_SHIFT = 3;
 constexpr const uint32_t COLUMN_CHUNK_DECODER_COMPRESSION_SHIFT =
     COLUMN_CHUNK_DECODER_NUM_VALUES_SHIFT + 32;
@@ -46,6 +46,7 @@ const std::string column_config_prefix = "parcore::ColumnChunkDecoderConfig::";
 ColumnChunkDecoderConfig::ColumnChunkDecoderConfig(std::shared_ptr<coyote::cThread> cthread,
                                                    uint32_t addr_offset, uint32_t num_regs)
     : Config(cthread, addr_offset, num_regs), num_decoders_(read_register(1).value()),
+      has_string_decoders_(read_register(3).value() != 0),
       maximum_num_enqueued_configs_(read_register(2).value()) {}
 
 // Casts the TypedNDataCasts in the ColumnChunkDecoder support
@@ -70,6 +71,10 @@ void ColumnChunkDecoderConfig::enqueue_column_chunk(libstf::stream_t      decode
         msg << "ColumnChunkDecoder cannot cast " << typ << " to " << logical_typ;
         throw std::runtime_error(msg.str());
     }
+    const bool is_string = typ == metadata::GERMAN_STR_T;
+    if (is_string && !has_string_decoders_) {
+        throw std::runtime_error("The decoders of this design do not decode strings");
+    }
 
     Profiler::open_regions({column_config_prefix + "enqueue_column_chunk"});
     uint64_t packed =
@@ -80,11 +85,10 @@ void ColumnChunkDecoderConfig::enqueue_column_chunk(libstf::stream_t      decode
         (compression_to_hardware(compression) << COLUMN_CHUNK_DECODER_COMPRESSION_SHIFT) |
         ((num_values & 0xFFFFFFFF) << COLUMN_CHUNK_DECODER_NUM_VALUES_SHIFT) |
         (static_cast<uint64_t>(typ) & 0x7);
-    write_register(libstf::ConfigRegister(2 * decoder, packed));
-    // Writing this for any other type would desynchronise the two config FIFOs, since
-    // the hardware only pops it for GERMAN_STR_T.
-    if (typ == metadata::GERMAN_STR_T)
-        write_register(libstf::ConfigRegister(2 * decoder + 1, string_heap_addr));
+    write_register(libstf::ConfigRegister(decoder, packed));
+    // The decoder only takes a heap address for string column chunks
+    if (is_string)
+        write_register(libstf::ConfigRegister(num_decoders_ + decoder, string_heap_addr));
     Profiler::close_regions({column_config_prefix + "enqueue_column_chunk"});
 }
 
@@ -112,6 +116,8 @@ DecoderProfile ColumnChunkDecoderConfig::read_profile(libstf::stream_t decoder) 
 }
 
 const libstf::stream_t ColumnChunkDecoderConfig::num_decoders() const { return num_decoders_; }
+
+bool ColumnChunkDecoderConfig::has_string_decoders() const { return has_string_decoders_; }
 
 const size_t ColumnChunkDecoderConfig::maximum_num_enqueued_configs() const {
     return maximum_num_enqueued_configs_;

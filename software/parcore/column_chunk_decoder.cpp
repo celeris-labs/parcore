@@ -1,6 +1,8 @@
 #include <libstf/profiling.hpp>
 #include <parcore/column_chunk_decoder.hpp>
 
+#include <stdexcept>
+
 using libstf::Profiler;
 
 namespace parcore {
@@ -18,8 +20,16 @@ ColumnChunkDecoder::ColumnChunkDecoder(
 
 const libstf::stream_t &ColumnChunkDecoder::decoder() const { return decoder_; }
 
-libstf::stream_t ColumnChunkDecoder::values_stream() const { return 2 * decoder_; }
-libstf::stream_t ColumnChunkDecoder::heap_stream() const { return 2 * decoder_ + 1; }
+libstf::stream_t ColumnChunkDecoder::values_stream() const {
+  return column_chunk_config_->has_string_decoders() ? 2 * decoder_ : decoder_;
+}
+
+libstf::stream_t ColumnChunkDecoder::heap_stream() const {
+  if (!column_chunk_config_->has_string_decoders()) {
+    throw std::logic_error("Decoders without strings have no heap stream");
+  }
+  return 2 * decoder_ + 1;
+}
 
 ColumnChunkDecoder::Handle::Handle(
     std::shared_ptr<ColumnChunkDecoder> column_chunk_decoder,

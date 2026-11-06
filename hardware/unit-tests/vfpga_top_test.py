@@ -2,15 +2,15 @@
 
 Unlike every other test in this directory these do not override the vfpga top, so
 the design that actually gets synthesised is what runs: NUM_DECODERS
-ColumnChunkDecoders fed from axis_host_recv[I], with their values and string heap
-written back to host memory by PairedOutputWriter over FPGA-initiated transfers.
+StringColumnChunkDecoders fed from axis_host_recv[I], with their values and string
+heap written back to host memory by the OutputWriter over FPGA-initiated transfers.
 That covers the pieces no per-module test reaches - the register map produced by
-GlobalConfig, MemConfig buffer handling, StreamWriter, the pair arbiter that
+GlobalConfig, MemConfig buffer handling, StreamWriter, the StreamWriterArbiter that
 merges each decoder's two output streams onto one physical channel, and the
 cross-channel request/completion arbitration.
 
-Stream numbering follows PairedOutputWriter: decoder I writes its values on
-logical stream 2I and its string heap on 2I + 1, both sharing physical channel I.
+Decoder I writes its values on output stream 2I and its string heap on 2I + 1, both
+sharing physical channel I (OutputWriter with STREAMS_PER_CHANNEL of 2).
 The heap stays completely silent for anything that is not a german string chunk,
 so no transfer and no interrupt are expected on it there.
 """
@@ -40,7 +40,7 @@ from column_chunk_decoder_test import (
 
 # FPGAOutputMemoryManager caps stream ids at MAX_NUMBER_STREAMS, which used to be
 # both the number of physical AXI channels and the number of output streams.
-# PairedOutputWriter puts two logical streams on each channel, so the real bound
+# The OutputWriter puts two output streams on each channel, so the real bound
 # is the width of the interrupt's stream id field. Widening the guard is enough -
 # nothing else in the manager assumes one stream per channel.
 memory_manager.MAX_NUMBER_STREAMS = MAX_SUPPORTED_N_STREAMS

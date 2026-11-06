@@ -80,9 +80,6 @@ typedef enum logic [1:0] {
 } page_type_t;
 
 typedef struct packed {
-    // Buffer address at which raw string bytes will land. Used for german strings longer than 12
-    // bytes. The software writes it to its own register, the other fields share one.
-    vaddress_t    string_heap_addr;
     type_t        logical_typ;
     logic         is_required;
     compression_t compression;
@@ -108,10 +105,9 @@ typedef struct packed {
 localparam type_t GERMAN_STR_T = INT128_T;
 
 typedef struct packed {
-    logic update_buffer_addr;
-    data32_t        num_values;
-    // See column_chunk_conf_t.string_heap_addr
-    vaddress_t      buffer_addr;
+    logic      update_buffer_addr; // First page of the chunk, which brings the chunk's buffer_addr
+    data32_t   num_values;
+    vaddress_t buffer_addr;        // Where the chunk's heap lands, see StringColumnChunkDecoderConfig
 } string_decoder_conf_t;
 
 typedef struct packed {
@@ -120,11 +116,20 @@ typedef struct packed {
     data32_t    num_values;
 } page_conf_t;
 
+// What the ColumnChunkDecoderCore tells the path of PLAIN encoded values about each page
 typedef struct packed {
     type_t      typ;
-    page_type_t ptyp;
-    logic last;
-} page_type_info_t;
+    page_type_t page_type;
+    logic       first_page; // First page of the column chunk
+    logic       last;       // Last page of the column chunk
+    data32_t    num_values;
+} page_info_t;
+
+// Route of a PLAIN encoded page through the PlainPagePath
+typedef struct packed {
+    logic is_string;     // Takes the detour through the string decoder
+    logic is_dictionary; // Dictionary page, whose values go to the Dictionary
+} plain_page_conf_t;
 
 typedef struct packed {
     stream_profile_t in;
@@ -135,9 +140,9 @@ parameter longint unsigned PARCORE_SYSTEM_ID = 64'hfd888c49aec6e141;
 
 parameter longint unsigned COLUMN_CHUNK_DECODER_CONFIG_ID = 64'h5c19f934407065bd;
 
-// Read address space of the ColumnChunkDecoderConfig: 3 info registers plus
+// Read address space of the ColumnChunkDecoderConfig: 4 info registers plus
 // 10 profiling counters (5 input + 5 output) per decoder.
-parameter longint unsigned COLUMN_CHUNK_DECODER_INFO_REGS    = 3;
+parameter longint unsigned COLUMN_CHUNK_DECODER_INFO_REGS    = 4;
 parameter longint unsigned COLUMN_CHUNK_DECODER_PROFILE_REGS = 10;
 function automatic longint unsigned COLUMN_CHUNK_DECODER_READ_REGS(input int num_decoders);
     return COLUMN_CHUNK_DECODER_INFO_REGS + COLUMN_CHUNK_DECODER_PROFILE_REGS * num_decoders;
