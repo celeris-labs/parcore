@@ -7,13 +7,9 @@ import libstf::*;
 import parcore::*;
 
 /**
- * Routes PLAIN encoded values, which are the values of PLAIN data pages and the bodies of dictionary
- * pages. Strings take a detour through the string decoder (out_to_str_decoder, back on
- * in_from_str_decoder), fixed-width values bypass it. Data pages then leave on out_values and
- * dictionary pages on out_dictionary.
- *
- * Each page takes one conf. Every routing decision is consumed with the page's last beat, so a page
- * can enter the decoder while the previous one still leaves it.
+ * Routes PLAIN encoded pages through the string decoder or around it, then to out_values (data pages)
+ * or out_dictionary (dictionary pages). Each routing decision is consumed with the page's last beat,
+ * so a page can enter the string decoder while the previous one still leaves it.
  */
 module PlainPagePath #(
     parameter int DATABEAT_SIZE
@@ -45,8 +41,7 @@ typedef enum logic {
 } dest_t;
 
 // ------ Config ------------------------------------------------------------------------------------
-// One copy per routing decision. The skid buffers let each decision be taken up at its own page
-// boundary, independent of the others.
+// The skid buffers let each routing decision be taken at its own page boundary
 ready_valid_i #(plain_page_conf_t) confs[3](clk, reset_synced);
 RegisteredReadyValidDuplicator #(plain_page_conf_t, 3) inst_conf_duplicator (
     .clk(clk),

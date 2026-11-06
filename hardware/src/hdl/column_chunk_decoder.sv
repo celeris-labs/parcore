@@ -7,7 +7,7 @@ import libstf::data8_t;
 import parcore::*;
 
 /**
- * Decodes Parquet column chunks of fixed-width types. Strings need the StringColumnChunkDecoder.
+ * Decodes column chunks of fixed-width types.
  */
 module ColumnChunkDecoder #(
     parameter DATABEAT_SIZE = AXI_DATA_BITS / 8
@@ -47,8 +47,7 @@ ColumnChunkDecoderCore #(
 );
 
 // ------ PLAIN encoded values ---------------
-// Values of data pages go to the output and those of dictionary pages to the Dictionary. Hybrid
-// pages carry no PLAIN encoded values, so their page_info is dropped.
+// Hybrid pages carry no PLAIN encoded values, so their page_info is dropped
 ready_valid_i #(logic) dest_select (clk, rst_n);
 assign dest_select.data  = page_info.data.page_type == PAGE_TYPE_DICT;
 assign dest_select.valid = page_info.valid && page_info.data.page_type != PAGE_TYPE_HYBRID;

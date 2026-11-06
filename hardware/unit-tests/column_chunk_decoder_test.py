@@ -867,11 +867,7 @@ _COUNTERID_RUNS = {
 
 
 class ColumnChunkDecoderTestCase(StringColumnChunkDecoderTestCase):
-    """
-    Runs the tests without strings on the ColumnChunkDecoder, which shares everything but the path
-    of PLAIN encoded values with the StringColumnChunkDecoder. The real-data tests only exercise the
-    shared part, so they only run on the StringColumnChunkDecoder.
-    """
+    """The real-data tests only exercise the shared core, so they only run on the string variant."""
 
     alternative_vfpga_top_file = "vfpga_tops/column_chunk_decoder_test.sv"
 

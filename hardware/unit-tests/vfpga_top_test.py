@@ -6,11 +6,11 @@ StringColumnChunkDecoders fed from axis_host_recv[I], with their values and stri
 heap written back to host memory by the OutputWriter over FPGA-initiated transfers.
 That covers the pieces no per-module test reaches - the register map produced by
 GlobalConfig, MemConfig buffer handling, StreamWriter, the StreamWriterArbiter that
-merges each decoder's two output streams onto one physical channel, and the
-cross-channel request/completion arbitration.
+merges each decoder's two output ports onto one Coyote stream, and the
+cross-stream request/completion arbitration.
 
-Decoder I writes its values on output stream 2I and its string heap on 2I + 1, both
-sharing physical channel I (OutputWriter with STREAMS_PER_CHANNEL of 2).
+Decoder I writes its values on output port 2I and its string heap on 2I + 1, both
+sharing Coyote stream I (OutputWriter with PORTS_PER_STREAM of 2).
 The heap stays completely silent for anything that is not a german string chunk,
 so no transfer and no interrupt are expected on it there.
 """
@@ -39,13 +39,13 @@ from column_chunk_decoder_test import (
 )
 
 # FPGAOutputMemoryManager caps stream ids at MAX_NUMBER_STREAMS, which used to be
-# both the number of physical AXI channels and the number of output streams.
-# The OutputWriter puts two output streams on each channel, so the real bound
-# is the width of the interrupt's stream id field. Widening the guard is enough -
-# nothing else in the manager assumes one stream per channel.
+# both the number of Coyote streams and the number of output ports.
+# The OutputWriter puts two output ports on each stream, so the real bound
+# is the width of the interrupt's id field. Widening the guard is enough -
+# nothing else in the manager assumes one port per stream.
 memory_manager.MAX_NUMBER_STREAMS = MAX_SUPPORTED_N_STREAMS
 
-# One decoder per physical AXI channel, mirroring N_STREAMS in the vfpga top.
+# One decoder per Coyote stream, mirroring N_STREAMS in the vfpga top.
 NUM_DECODERS = constants.MAX_NUMBER_STREAMS
 
 
@@ -185,7 +185,7 @@ class VFPGATopTestCase(OutputWriterTestCase):
 
     def test_single_decoder_strings(self):
         """Both writers of one pair active - the arbiter has to interleave them
-        on channel 0 without either transfer overtaking its own request."""
+        on stream 0 without either transfer overtaking its own request."""
         self.run_jobs({0: [string_job([b"alpha", b"b" * 30, b"gamma"])]})
 
     def test_single_decoder_page_ends_in_heap(self):
@@ -214,8 +214,8 @@ class VFPGATopTestCase(OutputWriterTestCase):
     # -- Several decoders ---------------------------------------------------
 
     def test_all_decoders_plain(self):
-        """One chunk per decoder at once: cross-channel request arbitration and
-        completion demultiplexing, with only one writer live per channel."""
+        """One chunk per decoder at once: cross-stream request arbitration and
+        completion demultiplexing, with only one writer live per stream."""
         self.run_jobs(
             {d: [plain_job(list(range(0, 200 + d)))] for d in range(NUM_DECODERS)}
         )
@@ -270,7 +270,7 @@ class VFPGATopTestCase(OutputWriterTestCase):
 
     def test_dictionary_flush_across_decoders(self):
         """A chunk whose trailing plain page forces the dictionary flush, running
-        against unrelated traffic on the other channels."""
+        against unrelated traffic on the other streams."""
         tricky = make_tricky("rle_data_rg0_col0", len(_RLE_OUTPUT), _PLAIN_OUTPUT, 2)
         self.run_jobs(
             {
@@ -290,7 +290,7 @@ class VFPGATopTestCase(OutputWriterTestCase):
 
     def test_small_transfers(self):
         """One data beat per transfer, maximising request/completion traffic
-        through the shared channel."""
+        through the shared stream."""
         self.overwrite_memory_manager(allocation_size=512, transfer_size=64)
         self.run_jobs({0: [string_job([b"tiny", b"t" * 40])]})
 

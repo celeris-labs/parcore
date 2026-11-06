@@ -12,7 +12,6 @@ localparam N_STREAMS = N_STRM_AXI;
 localparam DATABEAT_SIZE = 64;
 localparam AXI_DATA_SIZE = 64;
 
-// Decode german strings. Each decoder then also writes its string heap.
 localparam ENABLE_STRINGS = 1;
 
 // Pipeline depth on every stream between the shell (SLR0) and a decoder. Matches
@@ -27,13 +26,12 @@ assign clk   = aclk;
 assign rst_n = aresetn;
 
 /* -- CONFIG ------------------------------------------------------------ */
-// Decoder I writes its values on output stream STREAMS_PER_DECODER * I and, with strings, its heap
-// on the stream after. Both share host stream I (see OutputWriter).
-localparam int STREAMS_PER_DECODER = ENABLE_STRINGS ? 2 : 1;
-localparam int NUM_OUTPUTS = STREAMS_PER_DECODER * N_STREAMS;
-localparam int STREAMS_PER_CHANNEL[N_STREAMS] = '{default: STREAMS_PER_DECODER};
+// With strings, decoder I writes its values on port 2I and its heap on port 2I + 1
+localparam int PORTS_PER_DECODER = ENABLE_STRINGS ? 2 : 1;
+localparam int NUM_OUTPUTS = PORTS_PER_DECODER * N_STREAMS;
+localparam logic [0:N_STREAMS - 1][31:0] PORTS_PER_STREAM = '{default: PORTS_PER_DECODER};
 
-// MemConfig has a write register per stream plus flush and 4 read registers.
+// MemConfig has a write register per port plus flush and 4 read registers.
 localparam MEM_CONFIG_REGS = NUM_OUTPUTS + 1 > 4 ? NUM_OUTPUTS + 1 : 4;
 
 write_config_i write_configs[2](.*);
@@ -208,8 +206,7 @@ for (genvar I = 0; I < NUM_OUTPUTS; I++) begin : gen_outputs
 end
 
 OutputWriter #(
-    .STREAMS_PER_CHANNEL(STREAMS_PER_CHANNEL),
-    .NUM_STREAMS(NUM_OUTPUTS)
+    .PORTS_PER_STREAM(PORTS_PER_STREAM)
 ) inst_output_writer (
     .clk(clk),
     .rst_n(rst_n),

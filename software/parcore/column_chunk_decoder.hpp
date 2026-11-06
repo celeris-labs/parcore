@@ -22,11 +22,9 @@ public:
 
   [[nodiscard]] const libstf::stream_t &decoder() const;
 
-  // With string decoders, every decoder has two output streams sharing one
-  // physical channel: values on 2I, the string heap on 2I + 1. The heap stays
-  // completely silent for anything that is not a BYTE_ARRAY column, so no
-  // transfer and no interrupt are raised on it there. Without, decoder I writes
-  // its values on stream I and has no heap stream.
+  // With string decoders, values are on 2I and the string heap on 2I + 1. The
+  // heap stays completely silent for anything that is not a BYTE_ARRAY column,
+  // so no transfer and no interrupt are raised on it there.
   [[nodiscard]] libstf::stream_t values_stream() const;
   [[nodiscard]] libstf::stream_t heap_stream() const;
 

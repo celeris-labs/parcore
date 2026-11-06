@@ -25,39 +25,34 @@ def _conf(is_string: bool, is_dictionary: bool) -> int:
 
 
 def plain_fixed(values: bytearray) -> dict:
-    """PLAIN data page of a fixed-width type: bypasses the decoder to out_values."""
     return {"conf": _conf(False, False), "in": values, OUT_VALUES: values}
 
 
 def plain_string(page: bytearray, decoded: bytearray) -> dict:
-    """PLAIN data page of strings: through the decoder, the decoded records leave on out_values."""
     return {"conf": _conf(True, False), "in": page, OUT_STR_DECODER: page,
             "in_from_str_decoder": decoded, OUT_VALUES: decoded}
 
 
 def dict_fixed(body: bytearray) -> dict:
-    """Dictionary page of a fixed-width type: bypasses the decoder to out_dictionary."""
     return {"conf": _conf(False, True), "in": body, OUT_DICTIONARY: body}
 
 
 def dict_string(body: bytearray, decoded: bytearray) -> dict:
-    """Dictionary page of strings: through the decoder, the records leave on out_dictionary."""
     return {"conf": _conf(True, True), "in": body, OUT_STR_DECODER: body,
             "in_from_str_decoder": decoded, OUT_DICTIONARY: decoded}
 
 
 class PlainPagePathTestCase(fpga_test_case.FPGATestCase):
     """
-    Tests PlainPagePath (hardware/src/hdl/plain_page_path.sv). One conf per page picks the route:
+    Tests PlainPagePath. One conf per page picks the route:
 
       data page / fixed    in -> out_values
       data page / string   in -> out_to_str_decoder, in_from_str_decoder -> out_values
       dictionary / fixed   in -> out_dictionary
       dictionary / string  in -> out_to_str_decoder, in_from_str_decoder -> out_dictionary
 
-    The module never touches the bytes, so every expected output is an input unchanged. Pages are
-    the last-terminated transfers of each stream. The decoder stand-in on recv[1] may return more
-    or fewer bytes than it was given, as the real decoder does.
+    The decoder stand-in on recv[1] may return more or fewer bytes than it was given, as the real
+    decoder does.
     """
 
     alternative_vfpga_top_file = "vfpga_tops/plain_page_path_test.sv"

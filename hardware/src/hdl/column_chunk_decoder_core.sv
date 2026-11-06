@@ -14,10 +14,8 @@ import libstf::BYTE_T;
 import parcore::*;
 
 /**
- * Everything of a ColumnChunkDecoder except the path of PLAIN encoded values, which differs between
- * the ColumnChunkDecoder and the StringColumnChunkDecoder. Data pages and dictionary pages both hold
- * PLAIN encoded values: they leave on plain_pages without their levels, and come back decoded on
- * plain_values and dict_values. page_info describes every page of the column chunk in order.
+ * The ColumnChunkDecoder without the path of PLAIN encoded values. They leave on plain_pages and come
+ * back decoded on plain_values (data pages) and dict_values (dictionary pages).
  */
 module ColumnChunkDecoderCore #(
     parameter DATABEAT_SIZE = AXI_DATA_BITS / 8
@@ -91,8 +89,6 @@ Decompressor #(DATABEAT_SIZE) inst_decompressor (
 
 
 // ------ Page Data Demultiplexing ---------------------
-// Data pages and dictionary pages both hold PLAIN encoded values and share one path. Hybrid pages
-// hold dictionary indices.
 localparam int NUM_IN = 2;
 typedef enum logic {
     IN_HYBRID = 0,
@@ -137,7 +133,6 @@ StripLevels #(
     .out(plain_stripped)
 );
 
-// The PLAIN encoded values leave the core and come back decoded
 `DATA_ASSIGN(plain_stripped, plain_pages)
 
 ndata_i #(data8_t, DATABEAT_SIZE) plain_to_out (clk, rst_n);

@@ -105,9 +105,9 @@ typedef struct packed {
 localparam type_t GERMAN_STR_T = INT128_T;
 
 typedef struct packed {
-    logic      update_buffer_addr; // First page of the chunk, which brings the chunk's buffer_addr
+    logic      update_buffer_addr;
     data32_t   num_values;
-    vaddress_t buffer_addr;        // Where the chunk's heap lands, see StringColumnChunkDecoderConfig
+    vaddress_t buffer_addr;
 } string_decoder_conf_t;
 
 typedef struct packed {
@@ -116,7 +116,6 @@ typedef struct packed {
     data32_t    num_values;
 } page_conf_t;
 
-// What the ColumnChunkDecoderCore tells the path of PLAIN encoded values about each page
 typedef struct packed {
     type_t      typ;
     page_type_t page_type;
@@ -125,10 +124,9 @@ typedef struct packed {
     data32_t    num_values;
 } page_info_t;
 
-// Route of a PLAIN encoded page through the PlainPagePath
 typedef struct packed {
-    logic is_string;     // Takes the detour through the string decoder
-    logic is_dictionary; // Dictionary page, whose values go to the Dictionary
+    logic is_string;
+    logic is_dictionary;
 } plain_page_conf_t;
 
 typedef struct packed {

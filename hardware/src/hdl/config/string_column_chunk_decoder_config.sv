@@ -7,11 +7,7 @@ import parcore::*;
 `include "config_macros.svh"
 
 /**
- * The ColumnChunkDecoderConfig of StringColumnChunkDecoders. Each decoder additionally takes the
- * address of the buffer its next string column chunk writes its heap to.
- *
- * Write registers: register I holds the column_chunk_conf_t of decoder I, register NUM_DECODERS + I
- * the heap address of decoder I. The heap address is only written for string column chunks.
+ * Register NUM_DECODERS + I takes the heap address of the next string column chunk of decoder I.
  */
 module StringColumnChunkDecoderConfig #(
     parameter NUM_DECODERS

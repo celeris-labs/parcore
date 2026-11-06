@@ -21,16 +21,9 @@ interface decoder_profile_i;
     );
 endinterface
 
-/**
- * Takes the column chunk configs of the decoders and exposes their profiling counters.
- *
- * Write registers: register I holds the column_chunk_conf_t of decoder I.
- * Read registers: the config id, the number of decoders, the config FIFO depth and whether the
- * decoders decode strings, followed by 10 profiling counters per decoder.
- */
 module ColumnChunkDecoderConfig #(
     parameter NUM_DECODERS,
-    parameter HAS_STRING_DECODERS = 0 // Only reported to the host, see StringColumnChunkDecoderConfig
+    parameter HAS_STRING_DECODERS = 0 // Only reported to the host
 ) (
     input logic clk,
     input logic rst_n,
@@ -47,7 +40,7 @@ localparam MAX_NUM_ENQUEUED_BUFFERS = 64;
 
 // Info registers followed by the per-decoder profiling counters. Each decoder
 // contributes 10 counters (5 input + 5 output stream profile counters).
-localparam NUM_INFO_REGS    = COLUMN_CHUNK_DECODER_INFO_REGS;
+localparam NUM_INFO_REGS   = COLUMN_CHUNK_DECODER_INFO_REGS;
 localparam NUM_PROFILE_REGS = COLUMN_CHUNK_DECODER_PROFILE_REGS;
 localparam NUM_READ_REGS    = COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS);
 
