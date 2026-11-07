@@ -27,8 +27,8 @@ inline uint64_t compression_to_hardware(metadata::Compression compression) {
 }
 
 // column_chunk_conf_t packs (MSB -> LSB) as:
-//   logical type_t [3 bits] | is_required [1 bit] | compression_t [1 bit] | num_values [32 bits] |
-//   type_t [3 bits]
+//   defer_dict_decoding [1 bit] | logical type_t [3 bits] | is_required [1 bit] |
+//   compression_t [1 bit] | num_values [32 bits] | type_t [3 bits]
 // in register decoder. With string decoders, GERMAN_STR_T chunks also write their string_heap_addr
 // [48 bits] to register num_decoders + decoder.
 constexpr const uint32_t COLUMN_CHUNK_DECODER_NUM_VALUES_SHIFT = 3;
@@ -60,6 +60,7 @@ void ColumnChunkDecoderConfig::enqueue_column_chunk(libstf::stream_t      decode
                                                     metadata::Compression compression,
                                                     uint64_t num_values, libstf::type_t typ,
                                                     bool is_required, libstf::type_t logical_typ,
+                                                    bool defer_dict_decoding,
                                                     uint64_t string_heap_addr) {
     if (decoder >= num_decoders_) {
         throw std::runtime_error("attempted to configure ColumnChunkDecoder " +

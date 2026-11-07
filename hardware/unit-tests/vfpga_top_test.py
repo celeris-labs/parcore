@@ -168,7 +168,8 @@ class VFPGATopTestCase(OutputWriterTestCase):
                 compression = Compression.SNAPPY if chunk.compression else Compression.RAW
                 config.enqueue_column_chunk(
                     decoder, compression, chunk.num_values, chunk.data_type, chunk.is_required,
-                    chunk.logical_type if not chunk.is_string else None, chunk.heap_addr
+                    chunk.logical_type if not chunk.is_string else None,
+                    string_heap_addr=chunk.heap_addr
                 )
 
                 self.set_stream_input(decoder, chunk.chunk_bytes)

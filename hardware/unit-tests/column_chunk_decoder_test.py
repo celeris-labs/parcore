@@ -38,8 +38,11 @@ class _ColumnChunk:
     heap_addr: int = 0
     # String chunks only: the raw PLAIN bytes the decoder echoes on heap_out.
     expected_heap: Optional[bytearray] = None
+    defer_dict_decoding: bool = False
 
     def output_type(self) -> "fpga_stream.StreamType":
+        if self.defer_dict_decoding:
+            return fpga_stream.StreamType.UNSIGNED_INT_8
         return self.logical_type if self.logical_type is not None else self.stream_type
 
     @property
@@ -399,6 +402,83 @@ _RLE_OUTPUT = _rle_output(list(range(10, 20)))
 _PLAIN_OUTPUT = list(range(0, 256))
 
 
+def _deferred_dict_output(
+    dict_values: list[int], values: list[int], stream_type: "fpga_stream.StreamType"
+) -> list[int]:
+    """
+    The output bytes of a defer_dict_decoding chunk: The dictionary's values, followed by the index
+    of every value, 1, 2 or 4 bytes wide for up to 256, 65,536 or more dictionary entries. A value's
+    index is the first dictionary entry that equals it.
+    """
+    index_width = 1 if len(dict_values) <= 256 else 2 if len(dict_values) <= 65536 else 4
+    first_index = {}
+    for i, v in enumerate(dict_values):
+        first_index.setdefault(v, i)
+    output = bytearray(fpga_stream.Stream(stream_type, dict_values).data_to_bytearray())
+    for v in values:
+        output += first_index[v].to_bytes(index_width, 'little')
+    return list(output)
+
+
+def make_string_dict(
+    dict_strings: list[bytes],
+    factor: int,
+    heap_addr: int = DEFAULT_HEAP_ADDR,
+) -> _ColumnChunk:
+    """
+    A string chunk with a PLAIN dictionary page of the 10 dict_strings and `factor` HYBRID pages of
+    the rle_data fixture, whose indices select entry i - 10 i times for i in range(10, 20).
+    """
+    assert len(dict_strings) == 10
+    hybrid_body = read_bytes('rle_data_rg0_col0_chunk_decompressed.bin')
+    dict_body = _encode_strings(dict_strings)
+
+    chunk = bytearray(_make_dict_page_header(
+        num_values=len(dict_strings),
+        uncompressed_size=len(dict_body),
+        compressed_size=len(dict_body),
+    ))
+    chunk += dict_body
+    for _ in range(factor):
+        chunk += _make_data_page_header(
+            num_values=len(_RLE_OUTPUT),
+            uncompressed_size=len(hybrid_body),
+            compressed_size=len(hybrid_body),
+            encoding=8,  # RLE_DICTIONARY
+        )
+        chunk += hybrid_body
+
+    return _ColumnChunk(
+        compression=False,
+        num_values=len(_RLE_OUTPUT) * factor,
+        chunk_bytes=chunk,
+        type_t_override=GERMAN_STR_T,
+        heap_addr=heap_addr,
+        expected_heap=_heap_bytes(dict_strings),
+    )
+
+
+_DICT_STRINGS = [b'a', b'', b'exactly12byt', b'thirteen byte', b'short',
+                 b'a much longer string that spans beats' * 3, b'abcd', b'0123456789abcdef',
+                 b'x' * 100, b'last one']
+
+
+def _string_dict_output(dict_strings: list[bytes], factor: int,
+                        heap_addr: int = DEFAULT_HEAP_ADDR) -> list[int]:
+    records = _german_records(dict_strings, heap_addr)
+    output = []
+    for _ in range(factor):
+        for i in _rle_output(list(range(len(dict_strings)))):
+            output += records[16 * i:16 * i + 16]
+    return output
+
+
+def _deferred_string_dict_output(dict_strings: list[bytes], factor: int,
+                                 heap_addr: int = DEFAULT_HEAP_ADDR) -> list[int]:
+    return (_german_records(dict_strings, heap_addr) +
+            _rle_output(list(range(len(dict_strings)))) * factor)
+
+
 class StringColumnChunkDecoderTestCase(ConfiguredTestCase):
     alternative_vfpga_top_file = "vfpga_tops/string_column_chunk_decoder_test.sv"
     debug_mode = True
@@ -411,7 +491,8 @@ class StringColumnChunkDecoderTestCase(ConfiguredTestCase):
             compression = Compression.SNAPPY if input.compression else Compression.RAW
             config.enqueue_column_chunk(
                 0, compression, input.num_values, input.data_type, input.is_required,
-                input.logical_type if not input.is_string else None, input.heap_addr
+                input.logical_type if not input.is_string else None, input.defer_dict_decoding,
+                input.heap_addr
             )
 
         # One stream input per column chunk (full thrift-wrapped bytes).
@@ -820,6 +901,91 @@ class StringColumnChunkDecoderTestCase(ConfiguredTestCase):
     # REQUIRED INT32 column, verbatim: a dictionary page of 3/5 entries and a single
     # data page whose RLE/bit-packed hybrid indices are a short RLE run, one
     # bit-packed group and very long RLE runs, e.g. [rle 9][bp 8][rle 450543].
+    def test_defer_dict_decoding(self):
+        # Chunks that emit their dictionary and indices: 1-byte indices for a 64-bit OPTIONAL chunk,
+        # 2-byte and 4-byte indices for REQUIRED 32-bit chunks whose dictionaries have more than 256
+        # and 65,536 entries, and SNAPPY-compressed chunks from Parquet files. Value chunks before,
+        # in between and after check that the decoder switches between the modes.
+        int64_dict = [-2**63, -1, 0, 1, 2**63 - 1, -123456789012, 98765432109, -7, 65536, -65537]
+        int64_chunk = make_tricky(
+            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 2, dict_values=int64_dict, trailing_plain=False,
+        )
+        int64_chunk.defer_dict_decoding = True
+
+        int16_index_dict = [3 * i - 1000 for i in range(300)]
+        int16_index_chunk = make_tricky(
+            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 1,
+            stream_type=fpga_stream.StreamType.SIGNED_INT_32, dict_values=int16_index_dict,
+            trailing_plain=False, is_required=True,
+        )
+        int16_index_chunk.defer_dict_decoding = True
+
+        int32_index_dict = list(range(70000))
+        int32_index_chunk = make_tricky(
+            'rle_data_rg0_col0', len(_RLE_OUTPUT), [], 1,
+            stream_type=fpga_stream.StreamType.SIGNED_INT_32, dict_values=int32_index_dict,
+            trailing_plain=False, is_required=True,
+        )
+        int32_index_chunk.defer_dict_decoding = True
+
+        rle_chunk = _parquet_chunk('rle_data.parquet')
+        rle_chunk.defer_dict_decoding = True
+
+        mixed_output = ([i**8 for i in range(10, 20) for _ in range(i)] +
+                        list(range(128, 256)) * 2) * 2
+        mixed_chunk = _parquet_chunk('mixed_data.parquet')
+        mixed_chunk.defer_dict_decoding = True
+
+        int64 = fpga_stream.StreamType.SIGNED_INT_64
+        int32 = fpga_stream.StreamType.SIGNED_INT_32
+        self.run_chunks(
+            [
+                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1),
+                int64_chunk,
+                int16_index_chunk,
+                make_plain_data(_PLAIN_OUTPUT),
+                int32_index_chunk,
+                rle_chunk,
+                _parquet_chunk('rle_data.parquet'),
+                mixed_chunk,
+            ],
+            [
+                _RLE_OUTPUT + _PLAIN_OUTPUT,
+                _deferred_dict_output(int64_dict, _rle_output(int64_dict) * 2, int64),
+                _deferred_dict_output(int16_index_dict, _rle_output(int16_index_dict), int32),
+                _PLAIN_OUTPUT,
+                _deferred_dict_output(int32_index_dict, _rle_output(int32_index_dict), int32),
+                _deferred_dict_output(list(range(10, 20)), _RLE_OUTPUT, int64),
+                _RLE_OUTPUT,
+                _deferred_dict_output(list(dict.fromkeys(mixed_output)), mixed_output, int64),
+            ],
+        )
+
+    def test_string_dictionary(self):
+        self.run_chunks([make_string_dict(_DICT_STRINGS, 2)], [_string_dict_output(_DICT_STRINGS, 2)])
+
+    def test_string_dictionary_between_fixed(self):
+        self.run_chunks(
+            [
+                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1),
+                make_string_dict(_DICT_STRINGS, 1),
+                _parquet_chunk('rle_data.parquet'),
+            ],
+            [_RLE_OUTPUT + _PLAIN_OUTPUT, _string_dict_output(_DICT_STRINGS, 1), _RLE_OUTPUT],
+        )
+
+    def test_defer_dict_decoding_strings(self):
+        deferred = make_string_dict(_DICT_STRINGS, 2)
+        deferred.defer_dict_decoding = True
+        self.run_chunks(
+            [make_string_dict(_DICT_STRINGS, 1), deferred, make_string_dict(_DICT_STRINGS, 1)],
+            [
+                _string_dict_output(_DICT_STRINGS, 1),
+                _deferred_string_dict_output(_DICT_STRINGS, 2),
+                _string_dict_output(_DICT_STRINGS, 1),
+            ],
+        )
+
     def _run_counterid(self, row_groups: list[int]):
         chunks = [_ColumnChunk(
                       compression=True,

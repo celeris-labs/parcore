@@ -49,13 +49,24 @@ class ColumnChunkDecoderConfig : public libstf::Config {
      * @param is_required      Whether the column is REQUIRED (max_definition_level == 0), i.e. its
      *                         data pages carry no definition levels.
      * @param logical_typ      The type the decoder casts the values to. Pass typ for no cast.
+     * @param defer_dict_decoding Whether the decoder emits the dictionary and the dictionary
+     *                         indices instead of the values: The output is the dictionary page's
+     *                         values (typ), followed by one index per value, 1 byte wide for up to
+     *                         256 dictionary entries, 2 bytes for up to 65,536 and 4 bytes above.
+     *                         logical_typ is ignored.
      * @param string_heap_addr Base address of the buffer receiving the string heap.
      *                         Only meaningful for GERMAN_STR_T, which needs string decoders;
      *                         ignored otherwise.
+     *
+     * @warning Only set defer_dict_decoding for chunks whose data pages are ALL
+     *          dictionary-encoded, for example checked with the chunk's encoding_stats. A single
+     *          PLAIN data page (such as a writer's fallback after its dictionary filled up) makes
+     *          the hardware hang or emit corrupt output. The decoder does not detect this.
      */
     void enqueue_column_chunk(libstf::stream_t decoder, metadata::Compression compression,
                               uint64_t num_values, libstf::type_t typ, bool is_required,
-                              libstf::type_t logical_typ, uint64_t string_heap_addr = 0);
+                              libstf::type_t logical_typ, bool defer_dict_decoding = false,
+                              uint64_t string_heap_addr = 0);
 
     /**
      * Whether the decoders can cast values of typ to logical_typ.

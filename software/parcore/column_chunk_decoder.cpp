@@ -83,7 +83,7 @@ ColumnChunkDecoder::decode_column_chunk(
 
   column_chunk_config_->enqueue_column_chunk(
       decoder_, column_chunk.compression, column_chunk.num_values, type,
-      column_chunk.is_required, column_chunk.logical_type(), string_heap_address);
+      column_chunk.is_required, column_chunk.logical_type(), false, string_heap_address);
 
   column_chunk_enqueued_configs_ += 1;
 

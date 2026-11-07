@@ -10,6 +10,7 @@ import libstf::INT16_T;
 import libstf::INT32_T;
 import libstf::INT64_T;
 import libstf::BYTE_T;
+import libstf::GET_TYPE_WIDTH;
 import parcore::*;
 
 /**
@@ -150,6 +151,25 @@ NDataToTypedNData #(DATABEAT_SIZE) inst_plain_type (
 );
 
 // ------ Dictionary Encoded Path ---------------
+// With defer_dict_decoding, the dictionary page's values and the indices go to the output instead
+// of the dictionary
+typedef enum logic {
+    TO_DICTIONARY = 0,
+    TO_OUTPUT     = 1
+} dict_dest_t;
+
+ready_valid_i #(dict_dest_t) dict_dest_conf(clk, reset_synced);
+ndata_i #(data8_t, DATABEAT_SIZE) dict_dests[2](clk, reset_synced);
+DataDemultiplexer #(2) inst_dict_demux (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .select(dict_dest_conf),
+
+    .in(dict_values),
+    .out(dict_dests)
+);
+
 ready_valid_i #(type_t) dict_type_conf(clk, reset_synced), dict_cast_conf(clk, reset_synced);
 typed_ndata_i #(DATABEAT_SIZE) dict_physical(clk, reset_synced);
 typed_ndata_i #(DATABEAT_SIZE) dict_narrowed(clk, reset_synced);
@@ -159,7 +179,7 @@ NDataToTypedNData #(DATABEAT_SIZE) inst_dict_type (
     .rst_n(reset_synced),
 
     .in_type(dict_type_conf),
-    .in(dict_values),
+    .in(dict_dests[TO_DICTIONARY]),
 
     .out(dict_physical)
 );
@@ -187,7 +207,7 @@ NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_hybrid_in_skid_buffer (
 );
 
 data_i #(hybrid_page_conf_t) hybrid_page_decoder_conf(clk, reset_synced);
-ndata_i #(id_t, NUM_DICT_ELEM) dict_ids(clk, reset_synced);
+ndata_i #(id_t, NUM_DICT_ELEM) hybrid_ids(clk, reset_synced);
 HybridPageDecoder #(
     .data_t(id_t),
     .NUM_ELEMENTS(NUM_DICT_ELEM),
@@ -199,7 +219,19 @@ HybridPageDecoder #(
     .conf(hybrid_page_decoder_conf),
 
     .in(hybrid_in),
-    .out(dict_ids)
+    .out(hybrid_ids)
+);
+
+ready_valid_i #(dict_dest_t) ids_dest_conf(clk, reset_synced);
+ndata_i #(id_t, NUM_DICT_ELEM) ids_dests[2](clk, reset_synced);
+DataDemultiplexer #(2) inst_ids_demux (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .select(ids_dest_conf),
+
+    .in(hybrid_ids),
+    .out(ids_dests)
 );
 
 typed_ndata_i #(DATABEAT_SIZE) dict_out(clk, reset_synced);
@@ -212,16 +244,73 @@ TypedDictionary #(
     .rst_n(reset_synced),
 
     .in_values(dict_narrowed),
-    .in_ids(dict_ids),
+    .in_ids(ids_dests[TO_DICTIONARY]),
 
     .out(dict_out)
 );
 
+// ------ Deferred dictionary decoding ---------------
+// The HybridPageDecoder emits a single last per chunk, but the output multiplexer switches per page
+ready_valid_i #(data32_t) ids_num_values_conf(clk, reset_synced);
+ndata_i #(id_t, NUM_DICT_ELEM) ids_paged(clk, reset_synced);
+DataRewriteLast #(
+    .data_t(id_t),
+    .NUM_ELEMENTS(NUM_DICT_ELEM)
+) inst_ids_rewrite_last (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .num_elements(ids_num_values_conf),
+
+    .in(ids_dests[TO_OUTPUT]),
+    .out(ids_paged)
+);
+
+// The RunDecoder ends a beat at every run, so the indices are packed densely for the cast
+ndata_i #(id_t, NUM_DICT_ELEM) ids_normalized(clk, reset_synced);
+DataNormalizer #(
+    .data_t(id_t),
+    .NUM_ELEMENTS(NUM_DICT_ELEM)
+) inst_ids_normalizer (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in(ids_paged),
+    .out(ids_normalized)
+);
+
+`ASSERT_ELAB(NUM_DICT_ELEM * 4 == DATABEAT_SIZE)
+typed_ndata_i #(DATABEAT_SIZE) ids_typed(clk, reset_synced), ids_narrowed(clk, reset_synced);
+for (genvar I = 0; I < NUM_DICT_ELEM; I++) begin
+    assign ids_typed.data[4 * I +: 4] = data32_t'(ids_normalized.data[I]);
+    assign ids_typed.keep[4 * I +: 4] = {4{ids_normalized.keep[I]}};
+end
+assign ids_typed.typ        = INT32_T;
+assign ids_typed.last       = ids_normalized.last;
+assign ids_typed.valid      = ids_normalized.valid;
+assign ids_normalized.ready = ids_typed.ready;
+
+// Narrows the indices to 1, 2 or 4 bytes
+ready_valid_i #(type_t) ids_type_conf(clk, reset_synced);
+TypedNDataCast #(
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_ids_cast (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .out_type(ids_type_conf),
+
+    .in(ids_typed),
+    .out(ids_narrowed)
+);
+
 // ------ Output Multiplexing ---------------
-localparam int NUM_OUT = 2;
-typedef enum logic {
+localparam int NUM_OUT = 4;
+typedef enum logic [1:0] {
   OUT_PLAIN  = 0,
-  OUT_HYBRID = 1
+  OUT_HYBRID = 1,
+  OUT_DICT   = 2,
+  OUT_IDS    = 3
 } out_selector_t;
 `ASSERT_ELAB(NUM_OUT <= 2**$bits(out_selector_t))
 typed_ndata_i #(DATABEAT_SIZE) outs[NUM_OUT](clk, reset_synced);
@@ -252,7 +341,22 @@ TypedRewriteLast #(
     .out(outs[OUT_HYBRID])
 );
 
-ready_valid_i #(logic) out_mux_conf(clk, reset_synced);
+// The deferred output is a byte stream, so the TypedNormalizeUntil counts its bytes
+assign outs[OUT_DICT].data  = dict_dests[TO_OUTPUT].data;
+assign outs[OUT_DICT].typ   = BYTE_T;
+assign outs[OUT_DICT].keep  = dict_dests[TO_OUTPUT].keep;
+assign outs[OUT_DICT].last  = dict_dests[TO_OUTPUT].last;
+assign outs[OUT_DICT].valid = dict_dests[TO_OUTPUT].valid;
+assign dict_dests[TO_OUTPUT].ready = outs[OUT_DICT].ready;
+
+assign outs[OUT_IDS].data  = ids_narrowed.data;
+assign outs[OUT_IDS].typ   = BYTE_T;
+assign outs[OUT_IDS].keep  = ids_narrowed.keep;
+assign outs[OUT_IDS].last  = ids_narrowed.last;
+assign outs[OUT_IDS].valid = ids_narrowed.valid;
+assign ids_narrowed.ready  = outs[OUT_IDS].ready;
+
+ready_valid_i #(out_selector_t) out_mux_conf(clk, reset_synced);
 typed_ndata_i #(DATABEAT_SIZE) per_page_out(clk, reset_synced);
 TypedNDataMultiplexer #(DATABEAT_SIZE, NUM_OUT) inst_out_mux (
     .clk(clk),
@@ -365,6 +469,64 @@ endfunction
 
 localparam logic FOR_EVERY_PAGE = 1;
 
+// ------ Deferred dictionary decoding ---------------------------------------
+logic defer_dict;
+assign defer_dict = cc_conf_latched.defer_dict_decoding;
+
+function automatic type_t index_type(data32_t num_entries);
+    if (num_entries <= 256) begin
+        return BYTE_T;
+    end else if (num_entries <= 65536) begin
+        return INT16_T;
+    end
+    return INT32_T;
+endfunction
+
+// The dictionary page's values followed by one index per value
+function automatic data32_t deferred_output_size(type_t typ, data32_t num_entries, data32_t num_values);
+    data32_t dictionary_bytes, index_bytes;
+    case (GET_TYPE_WIDTH(typ))
+        128:     dictionary_bytes = num_entries << 4;
+        64:      dictionary_bytes = num_entries << 3;
+        default: dictionary_bytes = num_entries << 2;
+    endcase
+    case (index_type(num_entries))
+        BYTE_T:  index_bytes = num_values;
+        INT16_T: index_bytes = num_values << 1;
+        default: index_bytes = num_values << 2;
+    endcase
+    return dictionary_bytes + index_bytes;
+endfunction
+
+type_t index_typ; // Of the chunk's dictionary page
+always_ff @( posedge clk ) begin
+    if (state == CONFIGURE && page_conf_r.page_type == PAGE_TYPE_DICT) begin
+        index_typ <= index_type(page_conf_r.num_values);
+    end
+end
+
+ready_valid_i #(dict_dest_t) _dict_dest_conf (clk, reset_synced);
+ready_valid_i #(dict_dest_t) _ids_dest_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_dict_dests
+    _dict_dest_conf.valid <= n_conf_valid(_dict_dest_conf.valid, _dict_dest_conf.ready, page_conf_r.page_type == PAGE_TYPE_DICT);
+    _ids_dest_conf.valid  <= n_conf_valid(_ids_dest_conf.valid, _ids_dest_conf.ready, page_conf_r.page_type == PAGE_TYPE_DICT);
+    _dict_dest_conf.data  <= defer_dict ? TO_OUTPUT : TO_DICTIONARY;
+    _ids_dest_conf.data   <= defer_dict ? TO_OUTPUT : TO_DICTIONARY;
+end
+SkidBuffer #(dict_dest_t) inst_dict_dest_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_dict_dest_conf), .out(dict_dest_conf));
+SkidBuffer #(dict_dest_t) inst_ids_dest_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_ids_dest_conf), .out(ids_dest_conf));
+
+ready_valid_i #(data32_t) _ids_num_values_conf (clk, reset_synced);
+ready_valid_i #(type_t) _ids_type_conf (clk, reset_synced);
+always_ff @( posedge clk ) begin : configure_ids_output
+    _ids_num_values_conf.valid <= n_conf_valid(_ids_num_values_conf.valid, _ids_num_values_conf.ready, defer_dict && page_conf_r.page_type == PAGE_TYPE_HYBRID);
+    _ids_type_conf.valid       <= n_conf_valid(_ids_type_conf.valid, _ids_type_conf.ready, defer_dict && page_conf_r.page_type == PAGE_TYPE_HYBRID);
+    _ids_num_values_conf.data  <= page_conf_r.num_values;
+    _ids_type_conf.data        <= index_typ;
+end
+SkidBuffer #(data32_t) inst_ids_num_values_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_ids_num_values_conf), .out(ids_num_values_conf));
+SkidBuffer #(type_t) inst_ids_type_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_ids_type_conf), .out(ids_type_conf));
+
 // ------ Frontend configuration ---------------------------------------
 ready_valid_i #(compression_t) _decompressor_conf (clk, reset_synced);
 always_ff @( posedge clk ) begin : configure_decompressor
@@ -434,7 +596,7 @@ always_ff @( posedge clk ) begin : configure_rewrite_last
     _rewrite_last_conf.valid <= n_conf_valid(
         _rewrite_last_conf.valid,
         _rewrite_last_conf.ready,
-        page_conf_r.page_type == PAGE_TYPE_HYBRID
+        !defer_dict && page_conf_r.page_type == PAGE_TYPE_HYBRID
     );
     _rewrite_last_conf.data <= page_conf_r.num_values;
 end
@@ -462,18 +624,20 @@ end
 SkidBuffer #(page_info_t) inst_page_info_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_page_info), .out(page_info));
 
 // ------ Output MUX control ---------------------------------------
-ready_valid_i #(logic) _out_mux_conf (clk, rst_n);
+ready_valid_i #(out_selector_t) _out_mux_conf (clk, rst_n);
 always_ff @( posedge clk ) begin : configure_out_mux
     _out_mux_conf.valid <= n_conf_valid(
         _out_mux_conf.valid,
         _out_mux_conf.ready,
-        page_conf_r.page_type != PAGE_TYPE_DICT
+        defer_dict || page_conf_r.page_type != PAGE_TYPE_DICT
     );
-    _out_mux_conf.data <= page_conf_r.page_type == PAGE_TYPE_HYBRID ?
-            OUT_HYBRID :
-            OUT_PLAIN;
+    case (page_conf_r.page_type)
+        PAGE_TYPE_HYBRID: _out_mux_conf.data <= defer_dict ? OUT_IDS : OUT_HYBRID;
+        PAGE_TYPE_DICT:   _out_mux_conf.data <= OUT_DICT;
+        default:          _out_mux_conf.data <= OUT_PLAIN;
+    endcase
 end
-SkidBuffer #(logic) inst_out_mux_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_out_mux_conf), .out(out_mux_conf));
+SkidBuffer #(out_selector_t) inst_out_mux_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_out_mux_conf), .out(out_mux_conf));
 
 // ------ Plain Page level configuration ---------------------------------------
 // Dictionary pages have no levels, so StripLevels forwards them like pages of a REQUIRED column
@@ -497,7 +661,10 @@ always_ff @( posedge clk ) begin : configure_normalize_until
         _normalize_until_conf.ready,
         first_page
     );
-    _normalize_until_conf.data <= cc_conf_latched.num_values;
+    // A defer_dict_decoding chunk starts with its dictionary page
+    _normalize_until_conf.data <= defer_dict ?
+        deferred_output_size(cc_conf_latched.typ, page_conf_r.num_values, cc_conf_latched.num_values) :
+        cc_conf_latched.num_values;
 end
 SkidBuffer #(data32_t) inst_normalize_until_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_normalize_until_conf), .out(normalize_until_conf));
 
@@ -513,8 +680,8 @@ ready_valid_i #(type_t) _dict_cast_conf (clk, reset_synced);
 always_ff @( posedge clk ) begin : configure_path_types
     _plain_type_conf.valid <= n_conf_valid(_plain_type_conf.valid, _plain_type_conf.ready, page_conf_r.page_type == PAGE_TYPE_PLAIN);
     _plain_cast_conf.valid <= n_conf_valid(_plain_cast_conf.valid, _plain_cast_conf.ready, page_conf_r.page_type == PAGE_TYPE_PLAIN);
-    _dict_type_conf.valid  <= n_conf_valid(_dict_type_conf.valid, _dict_type_conf.ready, page_conf_r.page_type == PAGE_TYPE_DICT);
-    _dict_cast_conf.valid  <= n_conf_valid(_dict_cast_conf.valid, _dict_cast_conf.ready, page_conf_r.page_type == PAGE_TYPE_DICT);
+    _dict_type_conf.valid  <= n_conf_valid(_dict_type_conf.valid, _dict_type_conf.ready, !defer_dict && page_conf_r.page_type == PAGE_TYPE_DICT);
+    _dict_cast_conf.valid  <= n_conf_valid(_dict_cast_conf.valid, _dict_cast_conf.ready, !defer_dict && page_conf_r.page_type == PAGE_TYPE_DICT);
     _plain_type_conf.data  <= cc_conf_latched.typ;
     _plain_cast_conf.data  <= path_typ;
     _dict_type_conf.data   <= cc_conf_latched.typ;
@@ -528,7 +695,7 @@ SkidBuffer #(type_t) inst_dict_cast_conf_skid_buffer (.clk(clk), .rst_n(rst_n), 
 ready_valid_i #(type_t) _logical_type_conf (clk, reset_synced);
 always_ff @( posedge clk ) begin : configure_logical_type
     _logical_type_conf.valid <= n_conf_valid(_logical_type_conf.valid, _logical_type_conf.ready, first_page);
-    _logical_type_conf.data  <= cc_conf_latched.logical_typ;
+    _logical_type_conf.data  <= defer_dict ? BYTE_T : cc_conf_latched.logical_typ;
 end
 SkidBuffer #(type_t) inst_logical_type_conf_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_logical_type_conf), .out(logical_type_conf));
 
@@ -545,9 +712,23 @@ assign all_modules_consumed_configs =
         !_plain_cast_conf.valid &&
         !_dict_type_conf.valid &&
         !_dict_cast_conf.valid &&
-        !_logical_type_conf.valid;
+        !_logical_type_conf.valid &&
+        !_dict_dest_conf.valid &&
+        !_ids_dest_conf.valid &&
+        !_ids_num_values_conf.valid &&
+        !_ids_type_conf.valid;
 assign chunk_confs[0].ready = state == WAIT_FOR_CC_CONF;
 assign page_conf.ready = state == WAIT_FOR_PAGE_CONF;
+
+`ifndef SYNTHESIS
+assert property (@(posedge clk) disable iff (!reset_synced)
+    !(state == CONFIGURE && defer_dict && page_conf_r.page_type == PAGE_TYPE_PLAIN))
+else $fatal(1, "ColumnChunkDecoderCore got a PLAIN data page in a defer_dict_decoding chunk");
+
+assert property (@(posedge clk) disable iff (!reset_synced)
+    !(state == CONFIGURE && defer_dict && first_page && page_conf_r.page_type != PAGE_TYPE_DICT))
+else $fatal(1, "ColumnChunkDecoderCore got a defer_dict_decoding chunk without a dictionary page");
+`endif
 
 // ------ Stream profiling ------------------------
 stream_profile_i profile_in ();
