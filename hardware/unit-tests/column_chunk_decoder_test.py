@@ -12,7 +12,15 @@ from page_header_parser_test import (
 )
 
 from libstf_utils.configured_test_case import ConfiguredTestCase
-from parcore_utils.fpga_configuration import ColumnChunkDecoderConfig, Compression
+from parcore_utils.fpga_configuration import (
+    ColumnChunkDecoderConfig,
+    Compression,
+    GERMAN_STR_T,
+)
+
+
+INLINE_LEN = 12
+DEFAULT_HEAP_ADDR = 0x1000
 
 
 @dataclass
@@ -24,12 +32,26 @@ class _ColumnChunk:
     is_required: bool = False  # REQUIRED columns have no definition levels in their data pages
     # Type the decoder casts the values to, None for stream_type (no cast)
     logical_type: Optional["fpga_stream.StreamType"] = None
+    # BYTE_ARRAY columns have no fpga_stream.StreamType equivalent, so their
+    # type_t is given directly.
+    type_t_override: Optional[int] = None
+    heap_addr: int = 0
+    # String chunks only: the raw PLAIN bytes the decoder echoes on heap_out.
+    expected_heap: Optional[bytearray] = None
     defer_dict_decoding: bool = False
 
     def output_type(self) -> "fpga_stream.StreamType":
         if self.defer_dict_decoding:
             return fpga_stream.StreamType.UNSIGNED_INT_8
         return self.logical_type if self.logical_type is not None else self.stream_type
+
+    @property
+    def data_type(self):
+        return self.type_t_override if self.type_t_override is not None else self.stream_type
+
+    @property
+    def is_string(self) -> bool:
+        return self.type_t_override == GERMAN_STR_T
 
 
 def read_bytes(filename: str) -> bytearray:
@@ -58,6 +80,137 @@ def _parquet_chunk(parquet_filename: str, col_idx: int = 0) -> _ColumnChunk:
     )
 
 
+# -- lineitem_stress_uniform.parquet, row group 0 ---------------------------
+#
+# vfpga_top hangs on column 3 of this file: input consumed, no write request ever
+# issued, and 119k idle cycles after it. Columns 1 and 2 are the controls -- same
+# chunk shape (one PLAIN dictionary page then four RLE_DICTIONARY data pages of 8
+# values each) and they complete. The three differ only in how many dictionary
+# entries they carry:
+#
+#   col1 l_partkey     32 entries, 256 B dictionary page   passes
+#   col2 l_suppkey     11 entries,  88 B                   passes
+#   col3 l_linenumber   7 entries,  56 B                   HANGS
+#
+# 7 entries is the first of the three that does not fill a whole 32 B beat pair.
+#
+# The chunks are inlined verbatim rather than read from the file: each is the
+# byte range [dictionary_page_offset or data_page_offset, +total_compressed_size)
+# of row group 0, i.e. thrift page headers plus their SNAPPY payloads, exactly
+# what _extract_parquet_column_chunks used to hand over. All 48 row groups of
+# lineitem_stress_uniform.parquet are byte-identical (it was generated with
+# make_lineitem_stress.py --uniform), so row group 0 is the whole story.
+_STRESS_ROWS = 32
+
+# col0 l_orderkey  INT64  PLAIN, no dictionary  275 B
+_STRESS_COL0_ORDERKEY = bytes.fromhex(
+    # [  0] DATA PLAIN  nvals=8  header 18 B + payload 48 B
+    "1500158c0115602c15101500150615060000461802000000"
+    "1001000d0100040d0800080d08000c0d0800100d0800140d"
+    "083c18000000000000001500000000000000"
+    # [ 66] DATA PLAIN  nvals=8  header 18 B + payload 51 B
+    "1500158c0115662c15101500150615060000461c02000000"
+    "100119000901041d000901002109070400250d0800290d08"
+    "002d0d083c2a000000000000002e00000000000000"
+    # [135] DATA PLAIN  nvals=8  header 18 B + payload 52 B
+    "1500158c0115682c15101500150615060000461c02000000"
+    "1001320009010036090708003a000901003e09070400420d"
+    "08003f0d083c43000000000000004700000000000000"
+    # [205] DATA PLAIN  nvals=8  header 18 B + payload 52 B
+    "1500158c0115682c15101500150615060000461c02000000"
+    "10014b000901004f09070400530d08045700090100540907"
+    "0400580d083c5c000000000000006000000000000000"
+)
+
+# col1 l_partkey  INT64  dictionary of 32 entries (-100..-69), 256 B body  282 B
+_STRESS_COL1_PARTKEY = bytes.fromhex(
+    # [  0] DICT PLAIN  nvals=32  header 16 B + payload 141 B
+    "1504158004159a024c154015001200008002049cff090100"
+    "9d090704ff9e0d08009f0d0800a00d0800a10d0800a20d08"
+    "00a30d0800a40d0800a50d0800a60d0800a70d0800a80d08"
+    "00a90d0800aa0d0800ab0d0800ac0d0800ad0d0800ae0d08"
+    "00af0d0800b00d0800b10d0800b20d0800b30d0800b40d08"
+    "00b50d0800b60d0800b70d0800b80d0800b90d083cbaffff"
+    "ffffffffffbbffffffffffffff"
+    # [157] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "01030388c6fa"
+    # [187] DATA RLE_DICTIONARY  nvals=8  bit_width 4  header 17 B + payload 14 B
+    "15001518151c2c151015101506150600000c2c0200000010"
+    "01040398badcfe"
+    # [218] DATA RLE_DICTIONARY  nvals=8  bit_width 5  header 17 B + payload 15 B
+    "1500151a151e2c151015101506150600000d300200000010"
+    "01050330ca49abbd"
+    # [250] DATA RLE_DICTIONARY  nvals=8  bit_width 5  header 17 B + payload 15 B
+    "1500151a151e2c151015101506150600000d300200000010"
+    "01050338ebcdbbff"
+)
+
+# col2 l_suppkey  INT64  dictionary of 11 entries (-5..5), 88 B body  192 B
+_STRESS_COL2_SUPPKEY = bytes.fromhex(
+    # [  0] DICT PLAIN  nvals=11  header 15 B + payload 54 B
+    "150415b001156c4c151615001200005804fbff090100fc09"
+    "0704fffd0d0800fe0d08110100000d0100010d0800020d08"
+    "00030d083c04000000000000000500000000000000"
+    # [ 69] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "01030388c6fa"
+    # [ 99] DATA RLE_DICTIONARY  nvals=8  bit_width 4  header 17 B + payload 14 B
+    "15001518151c2c151015101506150600000c2c0200000010"
+    "010403980a2143"
+    # [130] DATA RLE_DICTIONARY  nvals=8  bit_width 4  header 17 B + payload 14 B
+    "15001518151c2c151015101506150600000c2c0200000010"
+    "0104036587a910"
+    # [161] DATA RLE_DICTIONARY  nvals=8  bit_width 4  header 17 B + payload 14 B
+    "15001518151c2c151015101506150600000c2c0200000010"
+    "01040332547698"
+)
+
+# col3 l_linenumber  INT64  dictionary of 7 entries (1..7), 56 B body  174 B
+_STRESS_COL3_LINENUMBER = bytes.fromhex(
+    # [  0] DICT PLAIN  nvals=7  header 14 B + payload 40 B
+    "1504157015504c150e150012000038040100090100020907"
+    "0400030d0800040d0800050d083c06000000000000000700"
+    "000000000000"
+    # [ 54] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "01030388c61a"
+    # [ 84] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "010303d15823"
+    # [114] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "0103031a6b44"
+    # [144] DATA RLE_DICTIONARY  nvals=8  bit_width 3  header 17 B + payload 13 B
+    "15001516151a2c151015101506150600000b280200000010"
+    "010303638d68"
+)
+
+_STRESS_CHUNKS = {
+    0: _STRESS_COL0_ORDERKEY,
+    1: _STRESS_COL1_PARTKEY,
+    2: _STRESS_COL2_SUPPKEY,
+    3: _STRESS_COL3_LINENUMBER,
+}
+
+
+def _stress_chunk(col: int) -> _ColumnChunk:
+    return _ColumnChunk(
+        compression=True,
+        num_values=_STRESS_ROWS,
+        chunk_bytes=bytearray(_STRESS_CHUNKS[col]),
+    )
+
+
+def stress_dict_chunks() -> list[tuple[str, int, list[int]]]:
+    """(name, column index, expected values) for the three dictionary columns."""
+    return [
+        ('l_partkey',    1, [(i % 200) - 100 for i in range(_STRESS_ROWS)]),
+        ('l_suppkey',    2, [(i % 11) - 5    for i in range(_STRESS_ROWS)]),
+        ('l_linenumber', 3, [(i % 7) + 1     for i in range(_STRESS_ROWS)]),
+    ]
+
+
 # -- Synthetic PLAIN-only chunk ---------------------------------------------
 
 def _make_def_levels(num_values: int) -> bytes:
@@ -78,8 +231,12 @@ def _make_def_levels(num_values: int) -> bytes:
     return len(rle_body).to_bytes(4, 'little') + rle_body
 
 
-def make_plain_data(items: list[int], is_required: bool = False) -> _ColumnChunk:
-    stream = fpga_stream.Stream(fpga_stream.StreamType.SIGNED_INT_64, items)
+def make_plain_data(
+    items: list,
+    stream_type: "fpga_stream.StreamType" = fpga_stream.StreamType.SIGNED_INT_64,
+    is_required: bool = False,
+) -> _ColumnChunk:
+    stream = fpga_stream.Stream(stream_type, items)
     values = stream.data_to_bytearray()
     def_levels = b'' if is_required else _make_def_levels(len(items))
     payload = bytearray(def_levels) + bytearray(values)
@@ -94,7 +251,73 @@ def make_plain_data(items: list[int], is_required: bool = False) -> _ColumnChunk
         compression=False,
         num_values=len(items),
         chunk_bytes=chunk,
+        stream_type=stream_type,
         is_required=is_required,
+    )
+
+
+# -- Synthetic PLAIN BYTE_ARRAY (german string) chunk ------------------------
+
+def _encode_strings(strings: list[bytes]) -> bytearray:
+    """PLAIN BYTE_ARRAY encoding: 4-byte LE length prefix followed by payload."""
+    buf = bytearray()
+    for s in strings:
+        buf += len(s).to_bytes(4, 'little')
+        buf += s
+    return buf
+
+
+def _heap_bytes(strings: list[bytes]) -> bytearray:
+    """The heap the decoder writes: the payloads of the strings that do not fit
+    inline, back to back and without their length prefixes."""
+    return bytearray(b''.join(s for s in strings if len(s) > INLINE_LEN))
+
+
+def _german_records(strings: list[bytes], heap_addr: int) -> list[int]:
+    """The german_str_t records the decoder emits, serialised LSB-first.
+
+    Each 16-byte record is length[0:4] | prefix[4:8] | payload[8:16], where the
+    payload is the inline bytes 4..11 for strings of at most INLINE_LEN bytes and
+    an 8-byte heap address otherwise. Only the strings that do not fit inline are
+    in the heap (see _heap_bytes), so a string's address is heap_addr plus the
+    length of the long strings before it.
+    """
+    out = bytearray()
+    heap_offset = 0
+    for s in strings:
+        n = len(s)
+        rec = bytearray(16)
+        rec[0:4] = n.to_bytes(4, 'little')
+        rec[4:8] = s[:4].ljust(4, b'\x00')
+        if n <= INLINE_LEN:
+            rec[8:16] = s[4:12].ljust(8, b'\x00')
+        else:
+            rec[8:16] = (heap_addr + heap_offset).to_bytes(8, 'little')
+            heap_offset += n
+        out += rec
+    return list(out)
+
+
+def make_string_data(
+    strings: list[bytes],
+    heap_addr: int = DEFAULT_HEAP_ADDR,
+) -> _ColumnChunk:
+    values = _encode_strings(strings)
+    def_levels = _make_def_levels(len(strings))
+    payload = bytearray(def_levels) + values
+    hdr = _make_data_page_header(
+        num_values=len(strings),
+        uncompressed_size=len(payload),
+        compressed_size=len(payload),
+        encoding=0,  # PLAIN
+    )
+    return _ColumnChunk(
+        compression=False,
+        num_values=len(strings),
+        chunk_bytes=bytearray(hdr) + payload,
+        type_t_override=GERMAN_STR_T,
+        heap_addr=heap_addr,
+        expected_heap=_heap_bytes(strings),
     )
 
 
@@ -197,8 +420,67 @@ def _deferred_dict_output(
     return list(output)
 
 
-class ColumnChunkDecoderTestCase(ConfiguredTestCase):
-    alternative_vfpga_top_file = "vfpga_tops/column_chunk_decoder_test.sv"
+def make_string_dict(
+    dict_strings: list[bytes],
+    factor: int,
+    heap_addr: int = DEFAULT_HEAP_ADDR,
+) -> _ColumnChunk:
+    """
+    A string chunk with a PLAIN dictionary page of the 10 dict_strings and `factor` HYBRID pages of
+    the rle_data fixture, whose indices select entry i - 10 i times for i in range(10, 20).
+    """
+    assert len(dict_strings) == 10
+    hybrid_body = read_bytes('rle_data_rg0_col0_chunk_decompressed.bin')
+    dict_body = _encode_strings(dict_strings)
+
+    chunk = bytearray(_make_dict_page_header(
+        num_values=len(dict_strings),
+        uncompressed_size=len(dict_body),
+        compressed_size=len(dict_body),
+    ))
+    chunk += dict_body
+    for _ in range(factor):
+        chunk += _make_data_page_header(
+            num_values=len(_RLE_OUTPUT),
+            uncompressed_size=len(hybrid_body),
+            compressed_size=len(hybrid_body),
+            encoding=8,  # RLE_DICTIONARY
+        )
+        chunk += hybrid_body
+
+    return _ColumnChunk(
+        compression=False,
+        num_values=len(_RLE_OUTPUT) * factor,
+        chunk_bytes=chunk,
+        type_t_override=GERMAN_STR_T,
+        heap_addr=heap_addr,
+        expected_heap=_heap_bytes(dict_strings),
+    )
+
+
+_DICT_STRINGS = [b'a', b'', b'exactly12byt', b'thirteen byte', b'short',
+                 b'a much longer string that spans beats' * 3, b'abcd', b'0123456789abcdef',
+                 b'x' * 100, b'last one']
+
+
+def _string_dict_output(dict_strings: list[bytes], factor: int,
+                        heap_addr: int = DEFAULT_HEAP_ADDR) -> list[int]:
+    records = _german_records(dict_strings, heap_addr)
+    output = []
+    for _ in range(factor):
+        for i in _rle_output(list(range(len(dict_strings)))):
+            output += records[16 * i:16 * i + 16]
+    return output
+
+
+def _deferred_string_dict_output(dict_strings: list[bytes], factor: int,
+                                 heap_addr: int = DEFAULT_HEAP_ADDR) -> list[int]:
+    return (_german_records(dict_strings, heap_addr) +
+            _rle_output(list(range(len(dict_strings)))) * factor)
+
+
+class StringColumnChunkDecoderTestCase(ConfiguredTestCase):
+    alternative_vfpga_top_file = "vfpga_tops/string_column_chunk_decoder_test.sv"
     debug_mode = True
 
     def configure(self):
@@ -208,17 +490,31 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
         for input in self.inputs:
             compression = Compression.SNAPPY if input.compression else Compression.RAW
             config.enqueue_column_chunk(
-                0, compression, input.num_values, input.stream_type, input.is_required,
-                input.logical_type, input.defer_dict_decoding
+                0, compression, input.num_values, input.data_type, input.is_required,
+                input.logical_type if not input.is_string else None, input.defer_dict_decoding,
+                input.heap_addr
             )
 
         # One stream input per column chunk (full thrift-wrapped bytes).
         for input in self.inputs:
             self.set_stream_input(0, input.chunk_bytes)
 
-        # The output value width follows each chunk's logical type.
+        # The output value width follows each chunk's logical type. String chunks emit fixed
+        # 16-byte german_str_t records, so they are compared as raw bytes.
         for input, output in zip(self.inputs, self.outputs):
-            self.set_expected_output(0, fpga_stream.Stream(input.output_type(), output))
+            if input.is_string:
+                self.set_expected_output(
+                    0, fpga_stream.Stream(fpga_stream.StreamType.UNSIGNED_INT_8, output))
+            else:
+                self.set_expected_output(0, fpga_stream.Stream(input.output_type(), output))
+
+        # heap_out carries the raw string bytes for long strings; it stays idle for fixed-width
+        # chunks.
+        for input in self.inputs:
+            if input.expected_heap is not None:
+                self.set_expected_output(
+                    1, fpga_stream.Stream(fpga_stream.StreamType.UNSIGNED_INT_8,
+                                          list(input.expected_heap)))
 
     def finish_input(self, end_event):
         # Reads the profile once all outputs were written, while the simulation is still running.
@@ -241,6 +537,55 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
 
         self.simulate_fpga()
         self.assert_simulation_output()
+
+    def _run_stress_column(self, col: int, expected: list[int]):
+        self.run_chunks([_stress_chunk(col)], [expected])
+
+    def test_stress_dict_32_entries(self):
+        """Control: 32-entry dictionary, 4 pages of 8 values."""
+        self._run_stress_column(*stress_dict_chunks()[0][1:])
+
+    def test_stress_dict_11_entries(self):
+        """Control: 11-entry dictionary."""
+        self._run_stress_column(*stress_dict_chunks()[1][1:])
+
+    def test_stress_dict_7_entries(self):
+        """l_linenumber: 7-entry dictionary, which hung vfpga_top at DATABEAT_SIZE=32."""
+        self._run_stress_column(*stress_dict_chunks()[2][1:])
+
+    def _run_stress_sequence(self, cols: list[int], expected: list[list[int]]):
+        self.run_chunks([_stress_chunk(c) for c in cols], expected)
+
+    def test_stress_dict_two_back_to_back(self):
+        cases = stress_dict_chunks()[:2]
+        self._run_stress_sequence([c for _, c, _ in cases], [e for _, _, e in cases])
+
+    def test_stress_dict_all_three_back_to_back(self):
+        """The failing chunk preceded by the two that work, as vfpga_top saw it."""
+        cases = stress_dict_chunks()
+        self._run_stress_sequence([c for _, c, _ in cases], [e for _, _, e in cases])
+
+    def test_stress_dict_same_chunk_three_times(self):
+        """Separates "third dictionary chunk" from "a dictionary that shrank"."""
+        _, col, expected = stress_dict_chunks()[2]
+        self._run_stress_sequence([col] * 3, [expected] * 3)
+
+    def test_stress_dict_shrinking_dictionaries(self):
+        """32 -> 11 -> 7 entries, the order vfpga_top hit. Reversed below."""
+        cases = stress_dict_chunks()
+        self._run_stress_sequence([c for _, c, _ in cases], [e for _, _, e in cases])
+
+    def test_stress_dict_growing_dictionaries(self):
+        """7 -> 11 -> 32 entries."""
+        cases = list(reversed(stress_dict_chunks()))
+        self._run_stress_sequence([c for _, c, _ in cases], [e for _, _, e in cases])
+
+    def test_stress_plain_then_dicts(self):
+        """l_orderkey (PLAIN) first, exactly as vfpga_top decoded row group 0."""
+        cases = stress_dict_chunks()
+        self._run_stress_sequence(
+            [0] + [c for _, c, _ in cases],
+            [[i * 3 + (i % 7) for i in range(_STRESS_ROWS)]] + [e for _, _, e in cases])
 
     def test_one_rle_page(self):
         self.run_chunks([_parquet_chunk('rle_data.parquet')], [_RLE_OUTPUT])
@@ -440,6 +785,122 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
             ],
         )
 
+    # -- German strings -----------------------------------------------------
+    #
+    # A PLAIN BYTE_ARRAY chunk takes the string path: StripLevels -> PlainPagePath
+    # -> ParallelStringDecoder -> PlainPagePath -> out. Values land on stream 0 as
+    # 16-byte german_str_t records, and the bytes of strings longer than 12 bytes
+    # on heap_out (stream 1).
+
+    def _run_strings(self, strings: list[bytes], heap_addr: int = DEFAULT_HEAP_ADDR):
+        chunk = make_string_data(strings, heap_addr)
+        self.run_chunks([chunk], [_german_records(strings, heap_addr)])
+
+    def test_string_single_short(self):
+        self._run_strings([b'abc'])
+
+    def test_string_all_inline(self):
+        # Every string fits in the 12 inline bytes, so no heap address is used.
+        self._run_strings([b'a', b'bb', b'ccc', b'abcdefghijkl'])
+
+    def test_string_inline_boundary(self):
+        # 12 bytes is the last inline length; 13 is the first that spills.
+        self._run_strings([b'a' * INLINE_LEN, b'b' * (INLINE_LEN + 1)])
+
+    def test_string_all_long(self):
+        # Every record stores a heap address rather than inline bytes.
+        self._run_strings([b'x' * 20, b'y' * 33, b'z' * 17])
+
+    def test_string_mixed_lengths(self):
+        self._run_strings([b'ab', b'c' * 40, b'defghijkl', b'm' * 13, b'', b'no'])
+
+    def test_string_multi_beat(self):
+        # More than four records per 64-byte beat, so the decoder emits several
+        # full beats plus a partial final one.
+        strings = [bytes([0x41 + (i % 26)]) * (1 + i % 30) for i in range(37)]
+        self._run_strings(strings)
+
+    def test_string_nondefault_heap_addr(self):
+        self._run_strings([b'p' * 25, b'q' * 14], heap_addr=0xDEAD0000)
+
+    # -- Mixed data types ---------------------------------------------------
+
+    def test_mixed_fixed_widths(self):
+        # One chunk per fixed width, back to back. Each chunk reconfigures the
+        # byte scaling that NormalizeUntil and DataRewriteLast are driven with,
+        # so a wrong shift shows up as a truncated or never-terminating output.
+        bytes_out = list(range(0, 200))
+        i32 = list(range(-100, 100))
+        i64 = list(range(0, 150))
+        self.run_chunks(
+            [
+                make_plain_data(bytes_out, fpga_stream.StreamType.UNSIGNED_INT_8),
+                make_plain_data(i32, fpga_stream.StreamType.SIGNED_INT_32),
+                make_plain_data(i64, fpga_stream.StreamType.SIGNED_INT_64),
+            ],
+            [bytes_out, i32, i64],
+        )
+
+    def test_mixed_float_widths(self):
+        f32 = [float(i) for i in range(0, 128)]
+        f64 = [float(i) * 0.5 for i in range(0, 96)]
+        self.run_chunks(
+            [
+                make_plain_data(f32, fpga_stream.StreamType.FLOAT_32),
+                make_plain_data(f64, fpga_stream.StreamType.FLOAT_64),
+            ],
+            [f32, f64],
+        )
+
+    def test_string_then_fixed(self):
+        # The type switch that matters most: the string path must fully drain and
+        # the PSD's first-page latch must re-arm before the fixed chunk runs.
+        strings = [b'alpha', b'b' * 30, b'gamma']
+        self.run_chunks(
+            [make_string_data(strings), make_plain_data(_PLAIN_OUTPUT)],
+            [_german_records(strings, DEFAULT_HEAP_ADDR), _PLAIN_OUTPUT],
+        )
+
+    def test_fixed_then_string(self):
+        strings = [b'x' * 18, b'yz']
+        self.run_chunks(
+            [make_plain_data(_PLAIN_OUTPUT), make_string_data(strings)],
+            [_PLAIN_OUTPUT, _german_records(strings, DEFAULT_HEAP_ADDR)],
+        )
+
+    def test_back_to_back_string_chunks(self):
+        # Two string chunks in a row: the second must pick up its own heap base,
+        # which only happens if psd_first_page re-arms on the chunk boundary.
+        first = [b'a' * 20, b'bb']
+        second = [b'c' * 15, b'dddd', b'e' * 40]
+        self.run_chunks(
+            [make_string_data(first, 0x1000), make_string_data(second, 0x9000)],
+            [_german_records(first, 0x1000), _german_records(second, 0x9000)],
+        )
+
+    def test_string_between_hybrid_chunks(self):
+        # A string chunk sandwiched between dictionary-encoded chunks, exercising
+        # the dictionary flush and the string path in the same run.
+        strings = [b'mid', b'f' * 22]
+        self.run_chunks(
+            [
+                _parquet_chunk('rle_data.parquet'),
+                make_string_data(strings),
+                _parquet_chunk('bpe_data.parquet'),
+            ],
+            [
+                _RLE_OUTPUT,
+                _german_records(strings, DEFAULT_HEAP_ADDR),
+                list(range(10, 20)) * 15,
+            ],
+        )
+
+    # -- hits.parquet CounterID -----------------------------------------------
+    #
+    # These hung on hardware at DATABEAT_SIZE=32. They are the first two row groups of the
+    # REQUIRED INT32 column, verbatim: a dictionary page of 3/5 entries and a single
+    # data page whose RLE/bit-packed hybrid indices are a short RLE run, one
+    # bit-packed group and very long RLE runs, e.g. [rle 9][bp 8][rle 450543].
     def test_defer_dict_decoding(self):
         # Chunks that emit their dictionary and indices: 1-byte indices for a 64-bit OPTIONAL chunk,
         # 2-byte and 4-byte indices for REQUIRED 32-bit chunks whose dictionaries have more than 256
@@ -499,3 +960,90 @@ class ColumnChunkDecoderTestCase(ConfiguredTestCase):
                 _deferred_dict_output(list(dict.fromkeys(mixed_output)), mixed_output, int64),
             ],
         )
+
+    def test_string_dictionary(self):
+        self.run_chunks([make_string_dict(_DICT_STRINGS, 2)], [_string_dict_output(_DICT_STRINGS, 2)])
+
+    def test_string_dictionary_between_fixed(self):
+        self.run_chunks(
+            [
+                make_tricky('rle_data_rg0_col0', len(_RLE_OUTPUT), _PLAIN_OUTPUT, 1),
+                make_string_dict(_DICT_STRINGS, 1),
+                _parquet_chunk('rle_data.parquet'),
+            ],
+            [_RLE_OUTPUT + _PLAIN_OUTPUT, _string_dict_output(_DICT_STRINGS, 1), _RLE_OUTPUT],
+        )
+
+    def test_defer_dict_decoding_strings(self):
+        deferred = make_string_dict(_DICT_STRINGS, 2)
+        deferred.defer_dict_decoding = True
+        self.run_chunks(
+            [make_string_dict(_DICT_STRINGS, 1), deferred, make_string_dict(_DICT_STRINGS, 1)],
+            [
+                _string_dict_output(_DICT_STRINGS, 1),
+                _deferred_string_dict_output(_DICT_STRINGS, 2),
+                _string_dict_output(_DICT_STRINGS, 1),
+            ],
+        )
+
+    def _run_counterid(self, row_groups: list[int]):
+        chunks = [_ColumnChunk(
+                      compression=True,
+                      num_values=sum(n for _, n in _COUNTERID_RUNS[rg]),
+                      chunk_bytes=bytearray(_COUNTERID_CHUNKS[rg]),
+                      stream_type=fpga_stream.StreamType.SIGNED_INT_32,
+                      is_required=True)
+                  for rg in row_groups]
+        expected = [[v for v, n in _COUNTERID_RUNS[rg] for _ in range(n)] for rg in row_groups]
+        self.run_chunks(chunks, expected)
+
+    def test_hits_counterid_rg0(self):
+        self._run_counterid([0])
+
+    def test_hits_counterid_rg1(self):
+        self._run_counterid([1])
+
+    def test_hits_counterid_rg203(self):
+        """Its dictionary page is 8 entries, exactly one 32 B beat."""
+        self._run_counterid([203])
+
+
+_COUNTERID_CHUNKS = {
+    0: bytes.fromhex(
+        "15041518151c4c150615041200000c2c1100000014000000260000001500151415182c158080371504150615061c"
+        "18042600000018041100000016002804260000001804110000000000000a240212000355a5deff3602"),
+    1: bytes.fromhex(
+        "15041528152c4c150a1504120000144c2600000031000000340000003b0000003e00000015001528152c2c159cdd4a"
+        "1504150615061c18043e000000180426000000160028043e000000180426000000000000144c03928107000589"
+        "244992b46dccc509039e963a04"),
+}
+
+_COUNTERID_CHUNKS[203] = bytes.fromhex(
+    "1504154015444c15101504120000207c5c8e0200718e020091b80200c3e60200f8ee02001eef020051ef02007e0b"
+    "03001500153e15422c158080291504150615061c18047e0b030018045c8e0200160028047e0b030018045c8e0200"
+    "0000001f78039c8d0100ec710180800a028080050388e70204961505e2830206f8801307")
+
+# (value, count) runs of the decoded values
+_COUNTERID_RUNS = {
+    0: [(17, 9), (20, 6), (38, 450545)],
+    1: [(38, 57417), (49, 2), (52, 10), (59, 78186), (62, 476559)],
+    203: [(167516, 9038), (167537, 7286), (178321, 81920), (190147, 40960), (192248, 22980),
+          (192286, 1355), (192337, 16625), (199550, 155708)],
+}
+
+
+class ColumnChunkDecoderTestCase(StringColumnChunkDecoderTestCase):
+    """The real-data tests only exercise the shared core, so they only run on the string variant."""
+
+    alternative_vfpga_top_file = "vfpga_tops/column_chunk_decoder_test.sv"
+
+    def setUp(self):
+        if self._testMethodName.startswith("test_hits_"):
+            self.skipTest("Only exercises the part shared with the StringColumnChunkDecoder")
+        return super().setUp()
+
+    def run_chunks(self, inputs: list[_ColumnChunk], outputs: list[list[int]],
+                   read_profile: bool = False):
+        if any(input.is_string for input in inputs):
+            self.skipTest("The ColumnChunkDecoder does not decode strings")
+        super().run_chunks(inputs, outputs, read_profile)
