@@ -4,6 +4,7 @@
 `include "libstf_macros.svh"
 
 import parcore::*;
+import parcore_string::*;
 import libstf::*;
 import lynxTypes::*;
 
@@ -29,9 +30,8 @@ logic[AXIL_DATA_BITS - 1:0] dummy_value[2];
 assign dummy_value[0] = 64'hDEADBEEFDEADBEEF;
 assign dummy_value[1] = 64'hDEADBEEFDEADBEEF;
 
-ready_valid_i#(data32_t)                    latched_num_values  (.clk(aclk), .rst_n(aresetn));
-ready_valid_i#(vaddress_t)                  latched_heap_addr   (.clk(aclk), .rst_n(aresetn));
-ready_valid_i#(string_decoder_conf_t)    decoder_conf        (.clk(aclk), .rst_n(aresetn));
+ready_valid_i#(vaddress_t)            latched_heap_addr (.clk(aclk), .rst_n(aresetn));
+ready_valid_i#(string_decoder_conf_t) decoder_conf      (.clk(aclk), .rst_n(aresetn));
 
 GlobalConfig#(
     .SYSTEM_ID(0),
@@ -56,14 +56,6 @@ ConfigReadRegisterFile#(
     .values(dummy_value)
 );
 
-ConfigWriteFIFO#(0, 1, data32_t) num_values_config_fifo (
-    .clk(aclk),
-    .rst_n(aresetn),
-
-    .write_config(conf_config[0]),
-    .data(latched_num_values)
-);
-
 ConfigWriteFIFO#(1, 1, vaddress_t) heap_addr_config_fifo (
     .clk(aclk),
     .rst_n(aresetn),
@@ -76,11 +68,9 @@ always_comb begin : buildConf
     // A fresh heap base is written alongside every config here, so the decoder
     // reloads it on each page rather than walking on from the previous one.
     decoder_conf.data.update_buffer_addr = 1'b1;
-    decoder_conf.data.num_values = latched_num_values.data;
     decoder_conf.data.buffer_addr = latched_heap_addr.data;
-    decoder_conf.valid = latched_num_values.valid && latched_heap_addr.valid;
-    latched_num_values.ready = decoder_conf.ready && latched_heap_addr.valid;
-    latched_heap_addr.ready = decoder_conf.ready && latched_num_values.valid;
+    decoder_conf.valid = latched_heap_addr.valid;
+    latched_heap_addr.ready = decoder_conf.ready;
 end
 
 AXI4S axi_host_recv (.aclk(aclk), .aresetn(aresetn));

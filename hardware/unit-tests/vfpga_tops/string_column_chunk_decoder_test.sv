@@ -11,7 +11,7 @@ always_comb sq_wr.tie_off_m();
 always_comb cq_rd.tie_off_s();
 always_comb cq_wr.tie_off_s();
 
-// send[1] carries the string heap; recv[1] is unused.
+// send[1] carries the string heap, recv[1] is unused.
 always_comb axis_host_recv[1].tie_off_s();
 
 for (genvar I = 2; I < N_STRM_AXI; I++) begin

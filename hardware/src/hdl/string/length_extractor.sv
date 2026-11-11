@@ -14,8 +14,7 @@ import parcore_string::*;
 // fit into a cycle is repeated with duplicate set.
 module LengthExtractor #(
     parameter int BEAT_WIDTH   = STRING_BEAT_WIDTH,
-    parameter int EXTEND_WIDTH = STRING_EXTEND_WIDTH,
-    parameter int N            = STRING_N
+    parameter int EXTEND_WIDTH = STRING_EXTEND_WIDTH
 ) (
     input logic clk,
     input logic rst_n,
@@ -32,10 +31,9 @@ localparam int INLINE_BYTES = STRING_INLINE_BYTES;
 localparam int POS_BITS     = $clog2(BEAT_WIDTH);
 
 `ASSERT_ELAB(EXTEND_WIDTH >= PREFIX_BYTES + INLINE_BYTES - 1)
-`ASSERT_ELAB(N == 4)
 `ASSERT_ELAB(2 ** POS_BITS == BEAT_WIDTH && POS_BITS < 8)
 `ASSERT_ELAB(in.NUM_ELEMENTS == VIEW_WIDTH)
-`ASSERT_ELAB(BEAT_WIDTH == STRING_BEAT_WIDTH && EXTEND_WIDTH == STRING_EXTEND_WIDTH && N == STRING_N)
+`ASSERT_ELAB(BEAT_WIDTH == STRING_BEAT_WIDTH && EXTEND_WIDTH == STRING_EXTEND_WIDTH)
 
 typedef logic[POS_BITS - 1:0]      pos_t;   // Offset within the beat
 typedef logic[POS_BITS + 1:0]      sum_t;   // Offset plus prefix plus the low bits of a length
@@ -69,12 +67,12 @@ typedef struct packed {
 } table_beat_t;
 
 typedef struct packed {
-    data8_t[VIEW_WIDTH - 1:0] data;
-    count_t                   count;
-    logic                     last;
-    logic                     duplicate;
-    pos_t  [N - 1:0]          positions;
-    logic  [N - 1:0]          length_keep;
+    data8_t[VIEW_WIDTH - 1:0]        data;
+    count_t                          count;
+    logic                            last;
+    logic                            duplicate;
+    pos_t  [STRINGS_PER_CYCLE - 1:0] positions;
+    logic  [STRINGS_PER_CYCLE - 1:0] length_keep;
 } position_beat_t;
 
 // The length prefix and the inline bytes after it
@@ -213,7 +211,7 @@ logic           positions_valid;
 logic           length_valid;
 
 ptr_t      hop1, hop2, hop3, hop4, leave;
-logic[N:0] found;
+logic[STRINGS_PER_CYCLE:0] found;
 logic      repeat_beat;
 
 assign cur = table_beat;
@@ -231,7 +229,7 @@ assign found[2] = found[1] && stays_in_beat(hop2);
 assign found[3] = found[2] && stays_in_beat(hop3);
 assign found[4] = found[0] && cur.two_hops_stay[cursor] && cur.two_hops_stay[hop2.pos];
 
-// More than N length prefixes in this beat, so it is processed again in the next cycle
+// More than 4 length prefixes in this beat, so it is processed again in the next cycle
 assign repeat_beat = table_valid && found[4];
 assign leave       = found[3] ? hop4 : found[2] ? hop3 : found[1] ? hop2 : hop1;
 
@@ -243,7 +241,7 @@ always_comb begin
     positions_next.count        = cur.count;
     positions_next.last         = cur.last && !repeat_beat;
     positions_next.duplicate    = repeat_beat;
-    positions_next.length_keep  = found[N - 1:0];
+    positions_next.length_keep  = found[STRINGS_PER_CYCLE - 1:0];
     positions_next.positions[0] = found[0] ? cursor   : '0;
     positions_next.positions[1] = found[1] ? hop1.pos : '0;
     positions_next.positions[2] = found[2] ? hop2.pos : '0;
@@ -265,11 +263,11 @@ always_ff @(posedge clk) begin
 end
 
 // ------- Read the lengths ---------
-length_beat_t     length_beat;
-logic             length_last;
-window_t[N - 1:0] windows;
+length_beat_t                     length_beat;
+logic                             length_last;
+window_t[STRINGS_PER_CYCLE - 1:0] windows;
 
-for (genvar I = 0; I < N; I++) begin : gen_windows
+for (genvar I = 0; I < STRINGS_PER_CYCLE; I++) begin : gen_windows
     assign windows[I] = read_window(positions.data, positions.positions[I]);
 end
 
@@ -279,7 +277,7 @@ always_ff @(posedge clk) begin
         length_beat.positions   <= positions.positions;
         length_beat.duplicate   <= positions.duplicate;
         length_last             <= positions.last;
-        for (int i = 0; i < N; i++) begin
+        for (int i = 0; i < STRINGS_PER_CYCLE; i++) begin
             length_beat.length_keep[i]  <= positions.length_keep[i] &&
                                            count_t'(positions.positions[i]) < positions.count;
             length_beat.lengths[i]      <= data32_t'(windows[i]);

@@ -6,13 +6,12 @@ import libstf::*;
 import parcore::*;
 import parcore_string::*;
 
-// Decodes PLAIN encoded string pages into german strings and the heap with up to N strings per
+// Decodes PLAIN encoded string pages into german strings and the heap with up to 4 strings per
 // cycle: LengthExtractor finds the strings of a beat, GermanStringBuilder builds them, and the rest
 // packs them into full beats.
 module ParallelStringDecoder #(
     parameter int DATABEAT_SIZE = STRING_BEAT_WIDTH,
-    parameter int EXTEND_WIDTH  = STRING_EXTEND_WIDTH,
-    parameter int N             = STRING_N
+    parameter int EXTEND_WIDTH  = STRING_EXTEND_WIDTH
 ) (
     input logic clk,
     input logic rst_n,
@@ -47,8 +46,7 @@ NDataLookahead #(
 data_i #(length_beat_t) lengths(clk, reset_synced);
 LengthExtractor #(
     .BEAT_WIDTH(DATABEAT_SIZE),
-    .EXTEND_WIDTH(EXTEND_WIDTH),
-    .N(N)
+    .EXTEND_WIDTH(EXTEND_WIDTH)
 ) inst_length_extractor (
     .clk(clk),
     .rst_n(reset_synced),
@@ -57,11 +55,10 @@ LengthExtractor #(
     .out(lengths)
 );
 
-ndata_i #(german_str_t, N) string_lanes(clk, reset_synced);
+ndata_i #(german_str_t, STRINGS_PER_CYCLE) string_lanes(clk, reset_synced);
 GermanStringBuilder #(
     .BEAT_WIDTH(DATABEAT_SIZE),
-    .EXTEND_WIDTH(EXTEND_WIDTH),
-    .N(N)
+    .EXTEND_WIDTH(EXTEND_WIDTH)
 ) inst_german_string_builder (
     .clk(clk),
     .rst_n(reset_synced),
@@ -73,11 +70,11 @@ GermanStringBuilder #(
     .out_heap(out_heap)
 );
 
-// Beats with fewer than N strings are packed into full beats
-ndata_i #(german_str_t, N) strings_packed(clk, reset_synced);
+// Beats with fewer than 4 strings are packed into full beats
+ndata_i #(german_str_t, STRINGS_PER_CYCLE) strings_packed(clk, reset_synced);
 DataNormalizer #(
     .data_t(german_str_t),
-    .NUM_ELEMENTS(N)
+    .NUM_ELEMENTS(STRINGS_PER_CYCLE)
 ) inst_strings_normalizer (
     .clk(clk),
     .rst_n(reset_synced),
@@ -88,10 +85,10 @@ DataNormalizer #(
 
 // A page that ends in heap bytes ends with a beat without strings, whose last moves to the previous
 // beat
-ndata_i #(german_str_t, N) strings_suppressed(clk, reset_synced);
+ndata_i #(german_str_t, STRINGS_PER_CYCLE) strings_suppressed(clk, reset_synced);
 NullBeatSuppressor #(
     .data_t(german_str_t),
-    .NUM_ELEMENTS(N)
+    .NUM_ELEMENTS(STRINGS_PER_CYCLE)
 ) inst_strings_suppressor (
     .clk(clk),
     .rst_n(reset_synced),

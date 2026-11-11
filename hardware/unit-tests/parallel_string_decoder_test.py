@@ -7,7 +7,6 @@ from unit_test.simulation_time import SimulationTime, SimulationTimeUnit, FixedS
 
 import numpy as np
 
-REG_OFFSET      = 3
 REG_BUFFER_ADDR = 4
 
 BEAT_SIZE  = 64
@@ -130,8 +129,6 @@ class ParallelStringDecoderTest(fpga_test_case.FPGATestCase):
 
     def _run(self, strings: List[bytes], buffer_addr: int = DEFAULT_BUFFER_ADDR) -> None:
         self.write_register(fpga_register.vFPGARegister(
-            REG_OFFSET, bytearray((len(strings)).to_bytes(4, 'little'))))
-        self.write_register(fpga_register.vFPGARegister(
             REG_BUFFER_ADDR, bytearray(buffer_addr.to_bytes(8, 'little'))))
 
         input = _encode(strings)
@@ -195,8 +192,8 @@ class ParallelStringDecoderTest(fpga_test_case.FPGATestCase):
         self._run([b"b" * 200])
 
     def test_mixed_short_and_long(self):
-        """Mix of inline and address strings; checks the running buffer address
-        advances by every string's length."""
+        """Mix of inline and address strings. Checks that the running buffer
+        address advances by every string's length."""
         self._run([b"hi", b"x" * 20, b"yo", b"z" * 30, b"end"])
 
     # ------------------------------------------------------------------

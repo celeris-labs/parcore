@@ -55,8 +55,8 @@ class ColumnChunkDecoderConfig : public libstf::Config {
      *                         256 dictionary entries, 2 bytes for up to 65,536 and 4 bytes above.
      *                         logical_typ is ignored.
      * @param string_heap_addr Base address of the buffer receiving the string heap.
-     *                         Only meaningful for GERMAN_STR_T, which needs string decoders;
-     *                         ignored otherwise.
+     *                         Only meaningful for GERMAN_STR_T, which needs string decoders,
+     *                         and ignored otherwise.
      *
      * @warning Only set defer_dict_decoding for chunks whose data pages are ALL
      *          dictionary-encoded, for example checked with the chunk's encoding_stats. A single

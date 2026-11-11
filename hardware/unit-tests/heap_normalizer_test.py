@@ -32,15 +32,15 @@ class HeapNormalizerTestCase(fpga_test_case.FPGATestCase):
     that flushes the carried residue without adding bytes. Skip pages
     (generates_heap=0, last_page=0) consume conf and contribute nothing.
 
-    Each heap page is driven as its own `in` transfer (per-page last); one conf
-    is written per page. vfpga top wiring: recv[0] -> in, out -> send[0].
+    Each heap page is driven as its own `in` transfer (per-page last), and one
+    conf is written per page. vfpga top wiring: recv[0] -> in, out -> send[0].
     """
 
     alternative_vfpga_top_file = "vfpga_tops/heap_normalizer_test.sv"
     debug_mode = True
 
     def _run(self, chunks: list[list[tuple[int, int, bytearray | None]]]):
-        """chunks: list of chunks; each chunk is a list of
+        """chunks: list of chunks, each a list of
         (generates_heap, last_page, body) pages. Every chunk yields one packed
         output packet = concatenation of its heap-page bodies."""
         for pages in chunks:

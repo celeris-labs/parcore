@@ -42,9 +42,9 @@ def dict_string(body: bytearray, decoded: bytearray) -> dict:
             "in_from_str_decoder": decoded, OUT_DICTIONARY: decoded}
 
 
-class PlainPagePathTestCase(fpga_test_case.FPGATestCase):
+class PlainPageRouterTestCase(fpga_test_case.FPGATestCase):
     """
-    Tests PlainPagePath. One conf per page picks the route:
+    Tests PlainPageRouter. One conf per page picks the route:
 
       data page / fixed    in -> out_values
       data page / string   in -> out_to_str_decoder, in_from_str_decoder -> out_values
@@ -55,7 +55,7 @@ class PlainPagePathTestCase(fpga_test_case.FPGATestCase):
     decoder does.
     """
 
-    alternative_vfpga_top_file = "vfpga_tops/plain_page_path_test.sv"
+    alternative_vfpga_top_file = "vfpga_tops/plain_page_router_test.sv"
     debug_mode = True
 
     def _run_pages(self, pages: list[dict]):

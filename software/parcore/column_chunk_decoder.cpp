@@ -34,15 +34,10 @@ libstf::stream_t ColumnChunkDecoder::heap_stream() const {
 ColumnChunkDecoder::Handle::Handle(
     std::shared_ptr<ColumnChunkDecoder> column_chunk_decoder,
     std::unique_lock<std::mutex> lock,
-    std::shared_ptr<libstf::OutputHandle> output_handle,
-    uint64_t string_heap_address)
+    std::shared_ptr<libstf::OutputHandle> output_handle)
     : column_chunk_decoder_(std::move(column_chunk_decoder)),
       lock_(std::move(lock)), output_handle_(output_handle),
-      string_heap_address_(string_heap_address), chunk_written_(false) {}
-
-uint64_t ColumnChunkDecoder::Handle::string_heap_address() const {
-  return string_heap_address_;
-}
+      chunk_written_(false) {}
 
 void ColumnChunkDecoder::Handle::add_chunk(
     const std::shared_ptr<libstf::Buffer> &buffer) {
@@ -82,31 +77,28 @@ private:
 
 std::unique_ptr<ColumnChunkDecoder::Handle>
 ColumnChunkDecoder::decode_column_chunk(
-    const metadata::ColumnChunk &column_chunk, uint64_t string_heap_address,
-    bool defer_dict_decoding) {
+    const metadata::ColumnChunk &column_chunk, bool defer_dict_decoding) {
   std::unique_lock lock(mtx);
   ProfilerRegion region(prefix + "decode_column_chunk");
   assert(column_chunk_enqueued_configs_ + 1 <
          column_chunk_config_->maximum_num_enqueued_configs());
 
-  auto type = metadata::to_libstf_type(column_chunk.type);
-  const bool is_string = type == metadata::GERMAN_STR_T;
-
   // The config is enqueued first, as it checks that the decoder supports the chunk before it
   // writes anything. The decoder does not produce output before its input is enqueued through the
-  // returned Handle, so the output handle is acquired in time.
+  // returned Handle, so the output handle is acquired in time. The heap address is 0, so the
+  // records hold offsets into the heap.
   column_chunk_config_->enqueue_column_chunk(
-      decoder_, column_chunk.compression, column_chunk.num_values, type,
-      column_chunk.is_required, column_chunk.logical_type(), defer_dict_decoding,
-      string_heap_address);
+      decoder_, column_chunk.compression, column_chunk.num_values,
+      metadata::to_libstf_type(column_chunk.type), column_chunk.is_required,
+      column_chunk.logical_type(), defer_dict_decoding, 0);
 
   auto output_handle =
-      output_buffer_manager_->acquire_output_handle(decoder_mask(is_string));
+      output_buffer_manager_->acquire_output_handle(output_streams(column_chunk));
 
   column_chunk_enqueued_configs_ += 1;
 
   return std::make_unique<Handle>(shared_from_this(), std::move(lock),
-                                  output_handle, string_heap_address);
+                                  output_handle);
 }
 
 void ColumnChunkDecoder::finished_decoding_column_chunk(
@@ -115,10 +107,11 @@ void ColumnChunkDecoder::finished_decoding_column_chunk(
   column_chunk_enqueued_configs_ -= 1;
 }
 
-libstf::stream_mask_t ColumnChunkDecoder::decoder_mask(bool with_heap) const {
+libstf::stream_mask_t ColumnChunkDecoder::output_streams(
+    const metadata::ColumnChunk &column_chunk) const {
   libstf::stream_mask_t mask;
   mask.set(values_stream());
-  if (with_heap)
+  if (metadata::is_string_type(column_chunk.type))
     mask.set(heap_stream());
   return mask;
 }

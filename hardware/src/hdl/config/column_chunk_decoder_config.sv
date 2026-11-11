@@ -40,7 +40,7 @@ localparam MAX_NUM_ENQUEUED_BUFFERS = 64;
 
 // Info registers followed by the per-decoder profiling counters. Each decoder
 // contributes 10 counters (5 input + 5 output stream profile counters).
-localparam NUM_INFO_REGS   = COLUMN_CHUNK_DECODER_INFO_REGS;
+localparam NUM_INFO_REGS    = COLUMN_CHUNK_DECODER_INFO_REGS;
 localparam NUM_PROFILE_REGS = COLUMN_CHUNK_DECODER_PROFILE_REGS;
 localparam NUM_READ_REGS    = COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS);
 

@@ -17,11 +17,11 @@ column.
 String columns are decoded into 16 byte records laid out like DuckDB's `string_t` on the decoder's
 values stream: the length, then strings of up to 12 bytes inline, longer ones as their first 4 bytes
 and a pointer. Only the strings longer than 12 bytes are written to the decoder's heap stream, back
-to back. The pointers are the heap address the column chunk is configured with plus the offset of
-the string in the heap. This example lets the `OutputBufferManager` place the heap, so it configures
-address 0, which makes the pointers offsets into the heap. Software that provides the heap buffer
-itself passes its address and gets pointers it can hand on without copying. `--verify` checks every
-record and the heap against the strings Arrow decodes, and `out_bytes` includes the heap.
+to back. `parcore::ColumnChunkDecoder` lets the `OutputBufferManager` place the heap, so the pointers
+are offsets into the heap. Software that places the heap itself passes its address to
+`ColumnChunkDecoderConfig::enqueue_column_chunk` and gets pointers it can hand on without copying.
+`--verify` checks every record and the heap against the strings Arrow decodes, and `out_bytes`
+includes the heap.
 
 With `--defer-dict`, the decoder emits a column chunk's dictionary page values (german_str_t records
 for strings, whose long strings go to the heap) followed by one index per value, 1, 2 or 4 bytes for up

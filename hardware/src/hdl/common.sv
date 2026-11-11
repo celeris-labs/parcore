@@ -106,29 +106,18 @@ typedef struct packed {
 localparam type_t GERMAN_STR_T = INT128_T;
 
 typedef struct packed {
-    logic      update_buffer_addr;
-    data32_t   num_values;
-    vaddress_t buffer_addr;
-} string_decoder_conf_t;
-
-typedef struct packed {
     page_type_t page_type;
     logic       last;
     data32_t    num_values;
 } page_conf_t;
 
+// The page the ColumnChunkDecoderCore hands to the plain_pages path of the decoder variant around it
 typedef struct packed {
     type_t      typ;
     page_type_t page_type;
     logic       first_page; // First page of the column chunk
     logic       last;       // Last page of the column chunk
-    data32_t    num_values;
 } page_info_t;
-
-typedef struct packed {
-    logic is_string;
-    logic is_dictionary;
-} plain_page_conf_t;
 
 typedef struct packed {
     stream_profile_t in;

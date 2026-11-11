@@ -508,7 +508,7 @@ class StringColumnChunkDecoderTestCase(ConfiguredTestCase):
             else:
                 self.set_expected_output(0, fpga_stream.Stream(input.output_type(), output))
 
-        # heap_out carries the raw string bytes for long strings; it stays idle for fixed-width
+        # heap_out carries the raw string bytes for long strings. It stays idle for fixed-width
         # chunks.
         for input in self.inputs:
             if input.expected_heap is not None:
@@ -787,8 +787,8 @@ class StringColumnChunkDecoderTestCase(ConfiguredTestCase):
 
     # -- German strings -----------------------------------------------------
     #
-    # A PLAIN BYTE_ARRAY chunk takes the string path: StripLevels -> PlainPagePath
-    # -> ParallelStringDecoder -> PlainPagePath -> out. Values land on stream 0 as
+    # A PLAIN BYTE_ARRAY chunk takes the string path: StripLevels -> PlainPageRouter
+    # -> ParallelStringDecoder -> PlainPageRouter -> out. Values land on stream 0 as
     # 16-byte german_str_t records, and the bytes of strings longer than 12 bytes
     # on heap_out (stream 1).
 
@@ -804,7 +804,7 @@ class StringColumnChunkDecoderTestCase(ConfiguredTestCase):
         self._run_strings([b'a', b'bb', b'ccc', b'abcdefghijkl'])
 
     def test_string_inline_boundary(self):
-        # 12 bytes is the last inline length; 13 is the first that spills.
+        # 12 bytes is the last inline length, 13 the first that spills.
         self._run_strings([b'a' * INLINE_LEN, b'b' * (INLINE_LEN + 1)])
 
     def test_string_all_long(self):

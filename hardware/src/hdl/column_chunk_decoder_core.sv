@@ -15,7 +15,9 @@ import parcore::*;
 
 /**
  * The ColumnChunkDecoder without the path of PLAIN encoded values. They leave on plain_pages and come
- * back decoded on plain_values (data pages) and dict_values (dictionary pages).
+ * back decoded on plain_values (data pages) and dict_values (dictionary pages). This way the
+ * ColumnChunkDecoder for fixed-width types and the StringColumnChunkDecoder share everything else,
+ * and only the latter pays for the string decoder on that path.
  */
 module ColumnChunkDecoderCore #(
     parameter DATABEAT_SIZE = AXI_DATA_BITS / 8
@@ -617,8 +619,7 @@ always_ff @( posedge clk ) begin : configure_page_info
         typ:        cc_conf_latched.typ,
         page_type:  page_conf_r.page_type,
         first_page: first_page,
-        last:       page_conf_r.last,
-        num_values: page_conf_r.num_values
+        last:       page_conf_r.last
     };
 end
 SkidBuffer #(page_info_t) inst_page_info_skid_buffer (.clk(clk), .rst_n(rst_n), .in(_page_info), .out(page_info));

@@ -4,13 +4,14 @@
 
 import libstf::*;
 import parcore::*;
+import parcore_string::*;
 
 /**
  * Routes PLAIN encoded pages through the string decoder or around it, then to out_values (data pages)
  * or out_dictionary (dictionary pages). Each routing decision is consumed with the page's last beat,
  * so a page can enter the string decoder while the previous one still leaves it.
  */
-module PlainPagePath #(
+module PlainPageRouter #(
     parameter int DATABEAT_SIZE
 ) (
     input logic clk,

@@ -4,11 +4,12 @@
 `include "libstf_macros.svh"
 
 import parcore::*;
+import parcore_string::*;
 import libstf::*;
 import lynxTypes::*;
 
 /*
- * PlainPagePath (hardware/src/hdl/plain_page_path.sv) test wiring:
+ * PlainPageRouter (hardware/src/hdl/string/plain_page_router.sv) test wiring:
  *
  *   axis_host_recv[0]  -> in                   (PLAIN encoded values of a page)
  *   axis_host_recv[1]  -> in_from_str_decoder  (string decoder output)
@@ -95,9 +96,9 @@ ndata_i #(data8_t, DATABEAT_SIZE) out_to_str_decoder(clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) out_values(clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) out_dictionary(clk, rst_n);
 
-PlainPagePath #(
+PlainPageRouter #(
     .DATABEAT_SIZE(DATABEAT_SIZE)
-) inst_plain_page_path (
+) inst_plain_page_router (
     .clk(clk),
     .rst_n(rst_n),
 

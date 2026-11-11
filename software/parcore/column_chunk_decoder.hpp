@@ -32,16 +32,9 @@ public:
   public:
     Handle(std::shared_ptr<ColumnChunkDecoder> column_chunk_decoder,
            std::unique_lock<std::mutex> lock,
-           std::shared_ptr<libstf::OutputHandle> output_handle,
-           uint64_t string_heap_address);
+           std::shared_ptr<libstf::OutputHandle> output_handle);
 
     void add_chunk(const std::shared_ptr<libstf::Buffer> &buffer);
-
-    /**
-     * The base the addresses inside the german_str_t records of this column
-     * chunk are relative to, as passed to decode_column_chunk.
-     */
-    [[nodiscard]] uint64_t string_heap_address() const;
 
     // The && qualifier means this can only be called on a moving handle
     std::shared_ptr<libstf::OutputHandle> done() &&;
@@ -51,17 +44,16 @@ public:
     std::unique_lock<std::mutex> lock_;
 
     std::shared_ptr<libstf::OutputHandle> output_handle_;
-    uint64_t string_heap_address_;
     bool chunk_written_;
   };
 
   /**
-   * Configures the decoder for the column chunk. The german_str_t records of
-   * strings longer than 12 bytes hold string_heap_address plus the offset of the
-   * string in the chunk's heap. The heap buffers are managed by the
-   * OutputBufferManager, whose addresses are not known up front, so this
-   * defaults to 0, i.e., the records hold offsets into the heap. Callers that
-   * provide the heap buffer themselves pass its address to get pointers.
+   * Configures the decoder for the column chunk. The OutputBufferManager places
+   * the output, so the heap of a string chunk can span several of its buffers.
+   * The german_str_t records of strings longer than 12 bytes therefore hold the
+   * offset of the string in the chunk's heap output instead of a pointer.
+   * Software that places the heap itself configures its address with
+   * ColumnChunkDecoderConfig::enqueue_column_chunk to get pointers.
    *
    * With defer_dict_decoding, the decoder emits the dictionary page's values
    * (german_str_t records for strings, whose long strings go to the heap)
@@ -71,7 +63,6 @@ public:
    */
   [[nodiscard]] std::unique_ptr<Handle>
   decode_column_chunk(const metadata::ColumnChunk &column_chunk,
-                      uint64_t string_heap_address = 0,
                       bool defer_dict_decoding = false);
 
   void
@@ -87,9 +78,9 @@ private:
   std::mutex mtx;
   size_t column_chunk_enqueued_configs_;
 
-  // The heap stream is only included for BYTE_ARRAY chunks; for anything else
-  // the hardware never writes there, so waiting on it would hang.
-  libstf::stream_mask_t decoder_mask(bool with_heap) const;
+  // The streams the chunk's output is written to. Only string chunks write to
+  // the heap stream, so waiting on it for other chunks would hang.
+  libstf::stream_mask_t output_streams(const metadata::ColumnChunk &column_chunk) const;
 
   void enqueue_stream_input(const std::shared_ptr<libstf::Buffer> &buffer);
 };

@@ -268,7 +268,7 @@ void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder
             auto &decoder = decoders[next % decoders.size()];
             auto &chunk   = meta.groups[next].chunks[j];
 
-            auto handle = decoder->decode_column_chunk(chunk, 0, defer[next]);
+            auto handle = decoder->decode_column_chunk(chunk, defer[next]);
             handle->add_chunk(data[next][j]);
             pending.push_back({decoder, chunk, std::move(*handle).done(), defer[next]});
             in_flight[next % decoders.size()] += 1;
@@ -337,8 +337,7 @@ std::vector<std::string> read_strings(parquet::ColumnReader &reader) {
 // laid out like DuckDB's string_t: the 4 byte length, then strings of up to 12 bytes inline and zero
 // padded, longer ones as their first 4 bytes and a pointer. The heap only holds the strings longer
 // than 12 bytes, back to back, of PLAIN pages per value and of a dictionary page once per entry. As
-// the OutputBufferManager decides where the heap lands, the chunk is configured with heap address 0,
-// which makes the pointers offsets into the heap.
+// the OutputBufferManager decides where the heap lands, the pointers are offsets into the heap.
 void verify_strings(size_t i, size_t j, const std::vector<std::string> &expected,
                     const std::vector<uint8_t> &records, const std::vector<uint8_t> &heap) {
     constexpr size_t RECORD_BYTES = 16, INLINE_BYTES = 12, PREFIX_BYTES = 4;

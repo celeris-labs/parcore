@@ -6,7 +6,7 @@ import libstf::*;
 
 /**
  * Packs the heap bytes of all pages of a string column chunk into full beats. Pages that produce no
- * heap pass no data; if the last page is one of them, a dummy beat carries the chunk's last.
+ * heap pass no data. If the last page is one of them, a dummy beat carries the chunk's last.
  */
 module HeapNormalizer #(
     parameter NUM_BYTES = AXI_DATA_BITS / 8,

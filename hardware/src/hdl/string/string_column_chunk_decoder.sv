@@ -5,6 +5,7 @@
 import lynxTypes::AXI_DATA_BITS;
 import libstf::data8_t;
 import parcore::*;
+import parcore_string::*;
 
 /**
  * A ColumnChunkDecoder that also decodes german strings. Every string column chunk takes the
@@ -88,7 +89,6 @@ ready_valid_i #(string_decoder_conf_t) _str_decoder_conf (clk, reset_synced);
 ready_valid_i #(string_decoder_conf_t) str_decoder_conf (clk, reset_synced);
 assign _str_decoder_conf.data = '{
     update_buffer_addr: needs_heap_addr,
-    num_values:         infos[1].data.num_values,
     buffer_addr:        needs_heap_addr ? heap_addr.data : '0
 };
 assign _str_decoder_conf.valid = decoder_page && (!needs_heap_addr || heap_addr.valid);
@@ -107,7 +107,7 @@ SkidBuffer #(logic[1:0]) inst_heap_normalize_conf_skid_buffer (.clk(clk), .rst_n
 // ------ PLAIN encoded values ---------------
 ndata_i #(data8_t, DATABEAT_SIZE) psd_in (clk, rst_n);
 ndata_i #(data8_t, DATABEAT_SIZE) psd_strings (clk, rst_n);
-PlainPagePath #(DATABEAT_SIZE) inst_plain_page_path (
+PlainPageRouter #(DATABEAT_SIZE) inst_plain_page_router (
     .clk(clk),
     .rst_n(rst_n),
 
