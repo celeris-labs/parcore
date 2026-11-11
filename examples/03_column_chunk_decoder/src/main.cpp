@@ -2,17 +2,22 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <fstream>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arrow/io/file.h>
+#include <parquet/column_page.h>
 #include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
@@ -40,6 +45,8 @@ struct Args {
     size_t                   reps     = 10;
     size_t                   depth    = 4;
     bool                     verify   = false;
+    bool                     defer_dict = false;
+    std::string              trace;
 };
 
 void print_usage(const char *prog) {
@@ -55,7 +62,13 @@ void print_usage(const char *prog) {
               << "  -c, --columns C   Comma-separated names of the columns to decode (default: all)\n"
               << "  -g, --row-groups F[:N]  Decode only N row groups starting at F (default: all)\n"
               << "  -v, --verify      Compare every column chunk against Arrow's decoding first\n"
-              << "  -h, --help        Show this help message\n";
+              << "  -e, --defer-dict  Emit the dictionary and the indices of chunks whose data\n"
+              << "                    pages are all dictionary encoded instead of their values\n"
+              << "  -t, --trace P     Write per-chunk timestamps of the timed runs to P.chunks.csv\n"
+              << "                    and the interrupts to P.irqs.csv. With --depth 1, also the\n"
+              << "                    profiling counters of every chunk and when its first and\n"
+              << "                    last input beat arrived, by polling the counters\n"
+              << "  -h, --help       Show this help message\n";
 }
 
 Args parse_args(int argc, char *argv[]) {
@@ -67,11 +80,13 @@ Args parse_args(int argc, char *argv[]) {
                                            {"columns", required_argument, 0, 'c'},
                                            {"row-groups", required_argument, 0, 'g'},
                                            {"verify", no_argument, 0, 'v'},
+                                           {"defer-dict", no_argument, 0, 'e'},
+                                           {"trace", required_argument, 0, 't'},
                                            {"help", no_argument, 0, 'h'},
                                            {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "D:r:d:c:g:vh", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "D:r:d:c:g:vet:h", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'D':
             args.decoders = std::stoul(optarg);
@@ -101,6 +116,12 @@ Args parse_args(int argc, char *argv[]) {
         }
         case 'v':
             args.verify = true;
+            break;
+        case 'e':
+            args.defer_dict = true;
+            break;
+        case 't':
+            args.trace = optarg;
             break;
         case 'h':
             print_usage(argv[0]);
@@ -207,10 +228,12 @@ std::shared_ptr<Buffer> load_chunk(std::shared_ptr<arrow::io::RandomAccessFile> 
 }
 
 // The output of one column chunk. String chunks write their german_str_t records to the values
-// stream and the strings that do not fit inline to the heap stream.
+// stream and the strings that do not fit inline to the heap stream. A deferred chunk emits the
+// values of its dictionary page followed by one index per value instead.
 struct Output {
     std::vector<std::shared_ptr<Buffer>> values;
     std::vector<std::shared_ptr<Buffer>> heap;
+    bool                                 deferred = false;
 
     size_t size() const {
         size_t bytes = 0;
@@ -232,15 +255,84 @@ std::vector<uint8_t> concatenate(const std::vector<std::shared_ptr<Buffer>> &buf
     return bytes;
 }
 
-// Passes the outputs to `on_output` in row group order.
+using Clock = std::chrono::steady_clock;
+
+// When the software got to each step of decoding a chunk: enqueueing its config, input and output
+// handle, the decoder having all of it, receiving all of its output and releasing its config slot.
+// in_first and in_last are when polling saw the chunk's first and last input beat arrive.
+struct ChunkTimes {
+    Clock::time_point enqueue, enqueued, in_first, in_last, output, finished;
+};
+
+// The interrupts the FPGA raised, timestamped when the callback starts and returns. The callback
+// runs on Coyote's interrupt thread and holds the mutex while it handles and records an interrupt,
+// so stop() waits for the entry of an interrupt whose handling woke the main thread.
+struct InterruptLog {
+    struct Entry {
+        Clock::time_point start, end;
+        int               value;
+    };
+
+    // Calls handle(value) and records it while recording
+    template <typename F> void record(int value, F &&handle) {
+        std::lock_guard lock(mtx_);
+        if (!enabled_) {
+            handle(value);
+            return;
+        }
+        auto start = Clock::now();
+        handle(value);
+        // The capacity is reserved up front, so recording never reallocates in the callback
+        if (entries_.size() < entries_.capacity()) {
+            entries_.push_back({start, Clock::now(), value});
+        } else {
+            ++dropped_;
+        }
+    }
+
+    // Starts recording up to capacity interrupts
+    void start(size_t capacity) {
+        std::lock_guard lock(mtx_);
+        entries_.clear();
+        entries_.reserve(capacity);
+        dropped_ = 0;
+        enabled_ = true;
+    }
+
+    // Stops recording and returns the entries and the number of interrupts that did not fit
+    std::pair<std::vector<Entry>, size_t> stop() {
+        std::lock_guard lock(mtx_);
+        enabled_ = false;
+        return {std::move(entries_), dropped_};
+    }
+
+private:
+    std::mutex         mtx_;
+    std::vector<Entry> entries_;
+    size_t             dropped_ = 0;
+    bool               enabled_ = false;
+};
+
+// Passes the outputs to `on_output` in row group order. defer[i] selects deferred dictionary
+// decoding for the chunk of row group i. If times is given, it gets the timestamps of each chunk.
+// before_enqueue(i, d) runs before chunk i is enqueued on decoder d.
 void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder>> &decoders,
                    const parcore::metadata::Metadata                               &meta,
                    const std::vector<std::vector<std::shared_ptr<Buffer>>>         &data, size_t j,
-                   size_t depth, const std::function<void(size_t, const Output &)> &on_output) {
+                   const std::vector<bool> &defer, size_t depth,
+                   const std::function<void(size_t, const Output &)> &on_output,
+                   std::vector<ChunkTimes> *times = nullptr,
+                   const std::function<void(size_t, libstf::stream_t)> &before_enqueue = nullptr) {
+    auto stamp = [&](size_t i, Clock::time_point ChunkTimes::*field) {
+        if (times) {
+            (*times)[i].*field = Clock::now();
+        }
+    };
     struct Pending {
         std::shared_ptr<parcore::ColumnChunkDecoder> decoder;
         parcore::metadata::ColumnChunk               chunk;
         std::shared_ptr<OutputHandle>                output;
+        bool                                         deferred;
     };
 
     size_t              num_chunks = meta.groups.size();
@@ -253,14 +345,20 @@ void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder
             auto &decoder = decoders[next % decoders.size()];
             auto &chunk   = meta.groups[next].chunks[j];
 
-            auto handle = decoder->decode_column_chunk(chunk);
+            if (before_enqueue) {
+                before_enqueue(next, decoder->decoder());
+            }
+            stamp(next, &ChunkTimes::enqueue);
+            auto handle = decoder->decode_column_chunk(chunk, 0, defer[next]);
             handle->add_chunk(data[next][j]);
-            pending.push_back({decoder, chunk, std::move(*handle).done()});
+            pending.push_back({decoder, chunk, std::move(*handle).done(), defer[next]});
             in_flight[next % decoders.size()] += 1;
+            stamp(next, &ChunkTimes::enqueued);
         }
 
         auto   p = std::move(pending.front());
         Output output;
+        output.deferred = p.deferred;
         pending.pop_front();
         while (p.output->stream_has_more_output(p.decoder->values_stream())) {
             output.values.push_back(p.output->get_next_stream_output(p.decoder->values_stream()));
@@ -270,8 +368,10 @@ void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder
                 output.heap.push_back(p.output->get_next_stream_output(p.decoder->heap_stream()));
             }
         }
+        stamp(done, &ChunkTimes::output);
         p.decoder->finished_decoding_column_chunk(p.chunk);
         in_flight[done % decoders.size()] -= 1;
+        stamp(done, &ChunkTimes::finished);
 
         on_output(done, output);
     }
@@ -324,15 +424,13 @@ std::vector<std::string> read_strings(parquet::ColumnReader &reader) {
 // the OutputBufferManager decides where the heap lands, the chunk is configured with heap address 0,
 // which makes the pointers offsets into the heap.
 void verify_strings(size_t i, size_t j, const std::vector<std::string> &expected,
-                    const Output &output) {
+                    const std::vector<uint8_t> &records, const std::vector<uint8_t> &heap) {
     constexpr size_t RECORD_BYTES = 16, INLINE_BYTES = 12, PREFIX_BYTES = 4;
     auto             fail = [&](const std::string &msg) {
         throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
                                  ": " + msg);
     };
 
-    auto records = concatenate(output.values);
-    auto heap    = concatenate(output.heap);
     if (records.size() != expected.size() * RECORD_BYTES) {
         fail("expected " + std::to_string(expected.size()) + " string records, got " +
              std::to_string(records.size()) + " bytes");
@@ -366,36 +464,143 @@ void verify_strings(size_t i, size_t j, const std::vector<std::string> &expected
     }
 }
 
+bool is_dictionary_encoding(parquet::Encoding::type encoding) {
+    return encoding == parquet::Encoding::RLE_DICTIONARY ||
+           encoding == parquet::Encoding::PLAIN_DICTIONARY;
+}
+
+// Whether all data pages of the chunk are dictionary encoded, which deferred dictionary decoding
+// requires. Writers fall back to PLAIN data pages once the dictionary gets too large. Without page
+// encoding stats in the metadata, the pages are read.
+bool is_dictionary_only(parquet::ParquetFileReader &reader, size_t i, size_t j) {
+    auto row_group = reader.RowGroup(i);
+    auto cc        = row_group->metadata()->ColumnChunk(j);
+    if (!cc->has_dictionary_page()) {
+        return false;
+    }
+
+    const auto &stats = cc->encoding_stats();
+    if (!stats.empty()) {
+        for (const auto &stat : stats) {
+            bool data_page = stat.page_type == parquet::PageType::DATA_PAGE ||
+                             stat.page_type == parquet::PageType::DATA_PAGE_V2;
+            if (data_page && stat.count > 0 && !is_dictionary_encoding(stat.encoding)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    auto pages = row_group->GetColumnPageReader(j);
+    while (auto page = pages->NextPage()) {
+        parquet::Encoding::type encoding;
+        switch (page->type()) {
+        case parquet::PageType::DATA_PAGE:
+            encoding = static_cast<const parquet::DataPageV1 &>(*page).encoding();
+            break;
+        case parquet::PageType::DATA_PAGE_V2:
+            encoding = static_cast<const parquet::DataPageV2 &>(*page).encoding();
+            break;
+        default:
+            continue;
+        }
+        if (!is_dictionary_encoding(encoding)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The number of entries of the chunk's dictionary page, its first page.
+size_t dictionary_size(parquet::ParquetFileReader &reader, size_t i, size_t j) {
+    auto page = reader.RowGroup(i)->GetColumnPageReader(j)->NextPage();
+    if (!page || page->type() != parquet::PageType::DICTIONARY_PAGE) {
+        throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
+                                 " does not start with a dictionary page");
+    }
+    return static_cast<const parquet::DictionaryPage &>(*page).num_values();
+}
+
+// Looks up the indices of a deferred chunk's output in its dictionary, the first num_entries values
+// of value_bytes each. The indices are 1, 2 or 4 bytes for up to 256, 65,536 or more entries.
+std::vector<uint8_t> materialize(size_t i, size_t j, const std::vector<uint8_t> &output,
+                                 size_t value_bytes, size_t num_entries, size_t num_values) {
+    size_t index_bytes      = num_entries <= 256 ? 1 : num_entries <= 65536 ? 2 : 4;
+    size_t dictionary_bytes = num_entries * value_bytes;
+    auto   fail             = [&](const std::string &msg) {
+        throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
+                                 ": " + msg);
+    };
+    if (output.size() != dictionary_bytes + num_values * index_bytes) {
+        fail("expected " + std::to_string(num_entries) + " dictionary entries and " +
+             std::to_string(num_values) + " indices of " + std::to_string(index_bytes) +
+             " bytes, got " + std::to_string(output.size()) + " bytes");
+    }
+
+    std::vector<uint8_t> values(num_values * value_bytes);
+    const uint8_t       *indices = output.data() + dictionary_bytes;
+    for (size_t k = 0; k < num_values; ++k) {
+        uint32_t index = 0;
+        std::memcpy(&index, indices + k * index_bytes, index_bytes);
+        if (index >= num_entries) {
+            fail("index " + std::to_string(index) + " of value " + std::to_string(k) +
+                 " is out of the dictionary of " + std::to_string(num_entries) + " entries");
+        }
+        std::memcpy(values.data() + k * value_bytes, output.data() + index * value_bytes,
+                    value_bytes);
+    }
+    return values;
+}
+
 // Returns false if the chunk can't be compared byte by byte.
 bool verify_chunk(parquet::ParquetFileReader &reader, size_t i, size_t j,
                   const parcore::metadata::ColumnChunk &chunk, const Output &output) {
-    auto column = reader.RowGroup(i)->Column(j);
+    auto column      = reader.RowGroup(i)->Column(j);
+    auto output_bytes = concatenate(output.values);
+    // The values of the chunk, looked up in its dictionary if it was deferred
+    std::vector<uint8_t> materialized;
+    auto values = [&](size_t value_bytes, size_t num_values) -> const std::vector<uint8_t> & {
+        if (!output.deferred) {
+            return output_bytes;
+        }
+        materialized = materialize(i, j, output_bytes, value_bytes, dictionary_size(reader, i, j),
+                                   num_values);
+        return materialized;
+    };
 
     if (parcore::metadata::is_string_type(chunk.type)) {
-        verify_strings(i, j, read_strings(*column), output);
+        constexpr size_t RECORD_BYTES = 16;
+        auto             expected     = read_strings(*column);
+        verify_strings(i, j, expected, values(RECORD_BYTES, expected.size()),
+                       concatenate(output.heap));
         return true;
     }
 
     std::vector<uint8_t> expected_bytes;
+    size_t               value_bytes;
     switch (chunk.type) {
     case parcore::metadata::Type::INT32_T:
         expected_bytes = read_values<parquet::Int32Type>(*column, chunk.num_values);
+        value_bytes    = 4;
         break;
     case parcore::metadata::Type::INT64_T:
         expected_bytes = read_values<parquet::Int64Type>(*column, chunk.num_values);
+        value_bytes    = 8;
         break;
     case parcore::metadata::Type::FLOAT_T:
         expected_bytes = read_values<parquet::FloatType>(*column, chunk.num_values);
+        value_bytes    = 4;
         break;
     case parcore::metadata::Type::DOUBLE_T:
         expected_bytes = read_values<parquet::DoubleType>(*column, chunk.num_values);
+        value_bytes    = 8;
         break;
     default:
         // Parquet bit-packs booleans, but ParCore outputs them as bytes.
         return false;
     }
 
-    auto actual_bytes = concatenate(output.values);
+    const auto &actual_bytes = values(value_bytes, expected_bytes.size() / value_bytes);
 
     if (actual_bytes.size() != expected_bytes.size()) {
         throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
@@ -417,35 +622,93 @@ double gibps(size_t bytes, double us) { return (bytes / 1073741824.0) / (us / 10
 // The input and output stream profiling counters of the decoders, summed over all used decoders.
 // Within a column chunk, every cycle of a stream is a handshake, starved (no valid data) or
 // stalled (valid data, but not ready). Stalled input cycles mean the decoder is the bottleneck,
-// starved ones that the input does not arrive fast enough. Reading the counters resets them, they
-// start counting again with the next data beat.
+// starved ones that the input does not arrive fast enough. Idle cycles are the ones between the
+// last beat of a chunk and the first beat of the next, lasts the number of chunks. The counters
+// start with the first data beat after they were read and stop with the last, so cycles before
+// the first and after the last chunk are not counted.
 struct Profile {
-    static constexpr const char *HEADER =
-        "in_beats,in_starved,in_stalled,out_beats,out_starved,out_stalled";
+    static constexpr const char *HEADER = "in_beats,in_starved,in_stalled,in_idle,in_lasts,"
+                                          "out_beats,out_starved,out_stalled,out_idle,out_lasts";
 
     parcore::StreamProfile in = {}, out = {};
 
-    friend std::ostream &operator<<(std::ostream &os, const Profile &p) {
-        return os << p.in.handshakes_cycles << "," << p.in.starved_cycles << ","
-                  << p.in.stalled_cycles << "," << p.out.handshakes_cycles << ","
-                  << p.out.starved_cycles << "," << p.out.stalled_cycles;
-    }
-};
-
-Profile read_profiles(parcore::ColumnChunkDecoderConfig &config, size_t num_decoders) {
-    Profile sum;
-    for (size_t d = 0; d < num_decoders; ++d) {
-        auto p = config.read_profile(d);
-        for (auto [total, part] : {std::pair{&sum.in, &p.in}, std::pair{&sum.out, &p.out}}) {
+    Profile &operator+=(const Profile &other) {
+        for (auto [total, part] : {std::pair{&in, &other.in}, std::pair{&out, &other.out}}) {
             total->handshakes_cycles += part->handshakes_cycles;
             total->starved_cycles += part->starved_cycles;
             total->stalled_cycles += part->stalled_cycles;
             total->idle_cycles += part->idle_cycles;
             total->last_handshakes += part->last_handshakes;
         }
+        return *this;
+    }
+
+    friend std::ostream &operator<<(std::ostream &os, const Profile &p) {
+        for (const auto *s : {&p.in, &p.out}) {
+            os << (s == &p.in ? "" : ",") << s->handshakes_cycles << "," << s->starved_cycles
+               << "," << s->stalled_cycles << "," << s->idle_cycles << "," << s->last_handshakes;
+        }
+        return os;
+    }
+};
+
+Profile read_profile(parcore::ColumnChunkDecoderConfig &config, libstf::stream_t d) {
+    auto p = config.read_profile(d);
+    return {p.in, p.out};
+}
+
+Profile read_profiles(parcore::ColumnChunkDecoderConfig &config, size_t num_decoders) {
+    Profile sum;
+    for (size_t d = 0; d < num_decoders; ++d) {
+        sum += read_profile(config, d);
     }
     return sum;
 }
+
+// Polls the input profiling counters of one decoder on a thread of its own, from before a chunk is
+// enqueued until its output was received, and records when they show that the chunk's first and
+// then its last input beat arrived. The input lasts counter holds 1 from the previous chunk until
+// the first beat of the next zeroes it, and only reading the last output counter stops the
+// profiler. If it is 0 before the chunk is enqueued, the decoder has not finished a chunk since
+// the FPGA was programmed, so in_first stays unset.
+class InputPoller {
+public:
+    void start(parcore::ColumnChunkDecoderConfig &config, libstf::stream_t d, ChunkTimes &t) {
+        stop();
+        stopped_ = false;
+        thread_  = std::thread([this, &config, d, &t] {
+            uint32_t in_lasts = parcore::COLUMN_CHUNK_DECODER_INFO_REGS +
+                                d * parcore::COLUMN_CHUNK_DECODER_PROFILE_REGS + 4;
+            bool started = config.read_register(in_lasts).value() == 0;
+            while (!started && !stopped_) {
+                if (config.read_register(in_lasts).value() == 0) {
+                    t.in_first = Clock::now();
+                    started    = true;
+                }
+            }
+            while (!stopped_) {
+                if (config.read_register(in_lasts).value() != 0) {
+                    t.in_last = Clock::now();
+                    return;
+                }
+            }
+        });
+    }
+
+    // Stops polling, e.g., when the chunk's output was received
+    void stop() {
+        stopped_ = true;
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    ~InputPoller() { stop(); }
+
+private:
+    std::thread       thread_;
+    std::atomic<bool> stopped_ = true;
+};
 
 int main(int argc, char *argv[]) {
     Args args = parse_args(argc, argv);
@@ -457,9 +720,12 @@ int main(int argc, char *argv[]) {
 #endif
 
     OutputBufferManager *obm_ptr = nullptr;
-    auto cthread = std::make_shared<coyote::cThread>(0, getpid(), 0, [&obm_ptr](int value) {
-        if (obm_ptr)
-            obm_ptr->handle_fpga_interrupt(value);
+    InterruptLog         irqs;
+    auto cthread = std::make_shared<coyote::cThread>(0, getpid(), 0, [&obm_ptr, &irqs](int value) {
+        irqs.record(value, [&](int v) {
+            if (obm_ptr)
+                obm_ptr->handle_fpga_interrupt(v);
+        });
     });
     auto tlb = std::make_shared<TLBManager>(cthread, pool);
 
@@ -499,8 +765,24 @@ int main(int argc, char *argv[]) {
     }
 
     std::cout << "file,column,name,type,row_groups,num_values,in_bytes,out_bytes,us,in_gibps,"
-                 "out_gibps,verified,"
+                 "out_gibps,verified,deferred,"
               << Profile::HEADER << std::endl;
+
+    // Times are in ns since the start of the column's timed runs. The per-chunk counters need
+    // depth 1, as reading them stops the profilers until the next chunk's first beat.
+    std::ofstream trace_chunks, trace_irqs;
+    bool          trace_profiles = !args.trace.empty() && args.depth == 1;
+    if (!args.trace.empty()) {
+        trace_chunks.open(args.trace + ".chunks.csv");
+        trace_irqs.open(args.trace + ".irqs.csv");
+        if (!trace_chunks || !trace_irqs) {
+            throw std::runtime_error("could not open the trace files " + args.trace + ".*.csv");
+        }
+        trace_chunks << "file,name,rep,chunk,deferred,num_values,in_bytes,out_bytes,enqueue,"
+                        "enqueued,in_first,in_last,output,finished,"
+                     << Profile::HEADER << std::endl;
+        trace_irqs << "file,name,start,end,stream,bytes,last" << std::endl;
+    }
 
     for (const auto &path : args.files) {
         auto maybe_file = arrow::io::ReadableFile::Open(path);
@@ -519,7 +801,7 @@ int main(int argc, char *argv[]) {
         }
 
         std::unique_ptr<parquet::ParquetFileReader> reader;
-        if (args.verify) {
+        if (args.verify || args.defer_dict) {
             reader = parquet::ParquetFileReader::Open(file);
         }
 
@@ -541,9 +823,17 @@ int main(int argc, char *argv[]) {
                 data[i][j] = load_chunk(file, meta.groups[i].chunks[j], pool);
             }
 
+            // Chunks with PLAIN data pages are decoded as usual
+            std::vector<bool> defer(meta.groups.size());
+            size_t            deferred = 0;
+            for (size_t i = 0; i < meta.groups.size(); ++i) {
+                defer[i] = args.defer_dict && is_dictionary_only(*reader, first_group + i, j);
+                deferred += defer[i];
+            }
+
             size_t verified = 0;
             if (args.verify) {
-                decode_column(decoders, meta, data, j, 1, [&](size_t i, const Output &output) {
+                decode_column(decoders, meta, data, j, defer, 1, [&](size_t i, const Output &output) {
                     verified += verify_chunk(*reader, first_group + i, j, meta.groups[i].chunks[j],
                                              output);
                 });
@@ -555,17 +845,98 @@ int main(int argc, char *argv[]) {
                 num_values += group.chunks[j].num_values;
             }
 
+            bool tracing = !args.trace.empty();
+            std::vector<std::vector<ChunkTimes>> times(tracing ? args.reps : 0,
+                                                       std::vector<ChunkTimes>(meta.groups.size()));
+            std::vector<std::vector<size_t>>  chunk_bytes(times.size(),
+                                                          std::vector<size_t>(meta.groups.size()));
+            std::vector<std::vector<Profile>> chunk_profiles(
+                trace_profiles ? args.reps : 0, std::vector<Profile>(meta.groups.size()));
+            // With depth 1, every decoder has one chunk in flight, so chunk i is the only chunk
+            // on decoder i % num_decoders while it is polled and its counters are read
+            std::vector<InputPoller> pollers(trace_profiles ? num_decoders : 0);
+            if (tracing) {
+                irqs.start(1 << 20);
+            }
+
             read_profiles(*decoder_config, num_decoders);
-            auto start = std::chrono::high_resolution_clock::now();
+            auto start = Clock::now();
             for (size_t rep = 0; rep < args.reps; ++rep) {
                 out_bytes = 0;
-                decode_column(decoders, meta, data, j, args.depth,
-                              [&](size_t, const Output &output) { out_bytes += output.size(); });
+                decode_column(
+                    decoders, meta, data, j, defer, args.depth,
+                    [&](size_t i, const Output &output) {
+                        out_bytes += output.size();
+                        if (tracing) {
+                            chunk_bytes[rep][i] = output.size();
+                        }
+                        if (trace_profiles) {
+                            libstf::stream_t d = i % num_decoders;
+                            pollers[d].stop();
+                            chunk_profiles[rep][i] = read_profile(*decoder_config, d);
+                        }
+                    },
+                    tracing ? &times[rep] : nullptr,
+                    trace_profiles ? std::function<void(size_t, libstf::stream_t)>(
+                                         [&](size_t i, libstf::stream_t d) {
+                                             pollers[d].start(*decoder_config, d, times[rep][i]);
+                                         })
+                                   : nullptr);
             }
-            auto end = std::chrono::high_resolution_clock::now();
+            auto end = Clock::now();
+            auto [irq_entries, irqs_dropped] = irqs.stop();
             auto us  = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() /
                       (double)std::max<size_t>(args.reps, 1);
-            auto profile = read_profiles(*decoder_config, num_decoders);
+            // Reading the counters per chunk restarts them for every chunk, so the column's
+            // profile is the sum of the chunks' profiles
+            Profile profile;
+            if (trace_profiles) {
+                for (const auto &rep_profiles : chunk_profiles) {
+                    for (const auto &p : rep_profiles) {
+                        profile += p;
+                    }
+                }
+            } else {
+                profile = read_profiles(*decoder_config, num_decoders);
+            }
+
+            auto ns = [&](Clock::time_point t) {
+                return std::chrono::duration_cast<std::chrono::nanoseconds>(t - start).count();
+            };
+            for (size_t rep = 0; rep < times.size(); ++rep) {
+                for (size_t i = 0; i < meta.groups.size(); ++i) {
+                    const auto &t = times[rep][i];
+                    const auto &chunk = meta.groups[i].chunks[j];
+                    trace_chunks << path << "," << meta.column_names[j] << "," << rep << "," << i
+                                 << "," << int(defer[i]) << "," << chunk.num_values << ","
+                                 << chunk.total_compressed_size << "," << chunk_bytes[rep][i]
+                                 << "," << ns(t.enqueue) << "," << ns(t.enqueued) << ","
+                                 << (t.in_first == Clock::time_point{} ? -1 : ns(t.in_first)) << ","
+                                 << (t.in_last == Clock::time_point{} ? -1 : ns(t.in_last)) << ","
+                                 << ns(t.output) << "," << ns(t.finished);
+                    if (trace_profiles) {
+                        trace_chunks << "," << chunk_profiles[rep][i];
+                    } else {
+                        trace_chunks << ",,,,,,,,,,";
+                    }
+                    trace_chunks << "\n";
+                }
+            }
+            for (const auto &irq : irq_entries) {
+                uint32_t value       = irq.value;
+                uint32_t bytes_shift = FPGA_INTERRUPT_STREAM_ID_BITS;
+                uint32_t last_shift  = bytes_shift + FPGA_INTERRUPT_TRANSFER_SIZE_BITS;
+                trace_irqs << path << "," << meta.column_names[j] << "," << ns(irq.start) << ","
+                           << ns(irq.end) << ","
+                           << (value & ((1u << FPGA_INTERRUPT_STREAM_ID_BITS) - 1)) << ","
+                           << ((value >> bytes_shift) &
+                               ((1u << FPGA_INTERRUPT_TRANSFER_SIZE_BITS) - 1))
+                           << "," << ((value >> last_shift) & 1) << "\n";
+            }
+            if (irqs_dropped > 0) {
+                std::cerr << "warning: " << irqs_dropped << " interrupts of "
+                          << meta.column_names[j] << " were not traced" << std::endl;
+            }
 
             std::cout << path << "," << j << "," << meta.column_names[j] << ","
                       << meta.groups[0].chunks[j].type << "," << meta.groups.size() << ","
@@ -574,7 +945,7 @@ int main(int argc, char *argv[]) {
                       << (args.verify ? std::to_string(verified) + "/" +
                                             std::to_string(meta.groups.size())
                                       : "-")
-                      << "," << profile << std::endl;
+                      << "," << deferred << "," << profile << std::endl;
 
             for (auto &group : data) {
                 group[j] = nullptr;

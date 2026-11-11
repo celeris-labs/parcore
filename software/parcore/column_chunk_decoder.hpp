@@ -62,10 +62,17 @@ public:
    * OutputBufferManager, whose addresses are not known up front, so this
    * defaults to 0, i.e., the records hold offsets into the heap. Callers that
    * provide the heap buffer themselves pass its address to get pointers.
+   *
+   * With defer_dict_decoding, the decoder emits the dictionary page's values
+   * (german_str_t records for strings, whose long strings go to the heap)
+   * followed by one index per value: 1, 2 or 4 bytes for up to 256, 65,536 or
+   * more dictionary entries. Every data page of the chunk must then be
+   * dictionary encoded.
    */
   [[nodiscard]] std::unique_ptr<Handle>
   decode_column_chunk(const metadata::ColumnChunk &column_chunk,
-                      uint64_t string_heap_address = 0);
+                      uint64_t string_heap_address = 0,
+                      bool defer_dict_decoding = false);
 
   void
   finished_decoding_column_chunk(const metadata::ColumnChunk &column_chunk);

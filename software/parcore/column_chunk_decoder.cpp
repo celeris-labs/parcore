@@ -82,7 +82,8 @@ private:
 
 std::unique_ptr<ColumnChunkDecoder::Handle>
 ColumnChunkDecoder::decode_column_chunk(
-    const metadata::ColumnChunk &column_chunk, uint64_t string_heap_address) {
+    const metadata::ColumnChunk &column_chunk, uint64_t string_heap_address,
+    bool defer_dict_decoding) {
   std::unique_lock lock(mtx);
   ProfilerRegion region(prefix + "decode_column_chunk");
   assert(column_chunk_enqueued_configs_ + 1 <
@@ -96,7 +97,8 @@ ColumnChunkDecoder::decode_column_chunk(
   // returned Handle, so the output handle is acquired in time.
   column_chunk_config_->enqueue_column_chunk(
       decoder_, column_chunk.compression, column_chunk.num_values, type,
-      column_chunk.is_required, column_chunk.logical_type(), false, string_heap_address);
+      column_chunk.is_required, column_chunk.logical_type(), defer_dict_decoding,
+      string_heap_address);
 
   auto output_handle =
       output_buffer_manager_->acquire_output_handle(decoder_mask(is_string));
