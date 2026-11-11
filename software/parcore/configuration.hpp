@@ -7,7 +7,7 @@
 
 namespace parcore {
 
-constexpr const uint64_t COLUMN_CHUNK_DECODER_CONFIG_ID = 0x5c19f934407065bd;
+constexpr const uint64_t COLUMN_CHUNK_DECODER_CONFIG_ID = 0x8ac238fba070fc46;
 
 // Read-side register layout of the ColumnChunkDecoderConfig: a few info
 // registers followed by 10 profiling counters per decoder (5 input + 5 output).

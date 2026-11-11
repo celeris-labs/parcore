@@ -67,27 +67,42 @@ std::shared_ptr<libstf::OutputHandle> ColumnChunkDecoder::Handle::done() && {
 
 const std::string prefix = "parcore::ColumnChunkDecoder";
 
+// Keeps a Profiler region open while it is in scope, also when an exception leaves the scope
+struct ProfilerRegion {
+  explicit ProfilerRegion(std::string name) : name_(std::move(name)) {
+    Profiler::open_regions({name_});
+  }
+  ~ProfilerRegion() { Profiler::close_regions({name_}); }
+  ProfilerRegion(const ProfilerRegion &) = delete;
+  ProfilerRegion &operator=(const ProfilerRegion &) = delete;
+
+private:
+  std::string name_;
+};
+
 std::unique_ptr<ColumnChunkDecoder::Handle>
 ColumnChunkDecoder::decode_column_chunk(
     const metadata::ColumnChunk &column_chunk, uint64_t string_heap_address) {
   std::unique_lock lock(mtx);
-  Profiler::open_regions({prefix + "decode_column_chunk"});
+  ProfilerRegion region(prefix + "decode_column_chunk");
   assert(column_chunk_enqueued_configs_ + 1 <
          column_chunk_config_->maximum_num_enqueued_configs());
 
   auto type = metadata::to_libstf_type(column_chunk.type);
   const bool is_string = type == metadata::GERMAN_STR_T;
 
-  auto output_handle =
-      output_buffer_manager_->acquire_output_handle(decoder_mask(is_string));
-
+  // The config is enqueued first, as it checks that the decoder supports the chunk before it
+  // writes anything. The decoder does not produce output before its input is enqueued through the
+  // returned Handle, so the output handle is acquired in time.
   column_chunk_config_->enqueue_column_chunk(
       decoder_, column_chunk.compression, column_chunk.num_values, type,
       column_chunk.is_required, column_chunk.logical_type(), false, string_heap_address);
 
+  auto output_handle =
+      output_buffer_manager_->acquire_output_handle(decoder_mask(is_string));
+
   column_chunk_enqueued_configs_ += 1;
 
-  Profiler::close_regions({prefix + "decode_column_chunk"});
   return std::make_unique<Handle>(shared_from_this(), std::move(lock),
                                   output_handle, string_heap_address);
 }

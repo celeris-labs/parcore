@@ -137,7 +137,7 @@ typedef struct packed {
 
 parameter longint unsigned PARCORE_SYSTEM_ID = 64'hfd888c49aec6e141;
 
-parameter longint unsigned COLUMN_CHUNK_DECODER_CONFIG_ID = 64'h5c19f934407065bd;
+parameter longint unsigned COLUMN_CHUNK_DECODER_CONFIG_ID = 64'h8ac238fba070fc46;
 
 // Read address space of the ColumnChunkDecoderConfig: 4 info registers plus
 // 10 profiling counters (5 input + 5 output) per decoder.

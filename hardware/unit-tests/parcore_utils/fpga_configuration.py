@@ -48,7 +48,7 @@ class ColumnChunkDecoderConfig(Config):
     Configures the column chunks the ColumnChunkDecoders process.
     """
 
-    ID = 0x5c19f934407065bd # COLUMN_CHUNK_DECODER_CONFIG_ID
+    ID = 0x8ac238fba070fc46 # COLUMN_CHUNK_DECODER_CONFIG_ID
 
     # Read registers: info registers followed by the StreamProfiler counters of each decoder
     INFO_REGS    = 4
