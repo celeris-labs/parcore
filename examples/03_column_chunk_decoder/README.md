@@ -38,17 +38,6 @@ that the decoder is the bottleneck, starved ones that the input does not arrive 
 `*_lasts` the chunks. The counters run from the first to the last beat of the timed repetitions, so
 the wall-clock time minus their sum is spent before the first and after the last beat.
 
-`--trace P` writes `P.chunks.csv` with one row per chunk and repetition, holding the times in ns
-since the start of the column's timed repetitions at which the software started enqueueing the chunk
-(`enqueue`), had enqueued its config, input and output handle (`enqueued`), had received all of its
-output (`output`) and had released its config slot (`finished`). `P.irqs.csv` holds the interrupts of
-the output writer with the times the callback started and returned, the output stream, the bytes
-written and whether it was the stream's last buffer. With `--depth 1`, the chunk rows also hold the
-profiling counters of each chunk, which are read between the chunks, and the times at which polling
-the input counters saw the chunk's first (`in_first`) and last (`in_last`) input beat arrive, or -1
-if the polling missed it. A thread per decoder polls from before the chunk is enqueued until its
-output was received. The CSV row of the column then sums the counters of its chunks.
-
 ## Synthesizing the hardware
 
 ```bash
@@ -80,7 +69,6 @@ build/column_chunk_decoder [OPTIONS] FILE...
 | `-g, --row-groups F[:N]` | Decode only N row groups starting at row group F (default: all) |
 | `-v, --verify` | Compare every column chunk against Arrow's Parquet reader first |
 | `-e, --defer-dict` | Decode the column chunks whose data pages are all dictionary encoded with deferred dictionary decoding |
-| `-t, --trace P` | Write per-chunk timestamps to `P.chunks.csv` and the output interrupts to `P.irqs.csv`, with `--depth 1` also per-chunk profiling counters |
 
 For simulations, set up a simulation project of the full design. `hardware/build-sim` does not work,
 as the unit tests replace its vFPGA top:

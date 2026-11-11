@@ -2,18 +2,14 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <fstream>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <iostream>
-#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <arrow/io/file.h>
@@ -46,7 +42,6 @@ struct Args {
     size_t                   depth    = 4;
     bool                     verify   = false;
     bool                     defer_dict = false;
-    std::string              trace;
 };
 
 void print_usage(const char *prog) {
@@ -64,10 +59,6 @@ void print_usage(const char *prog) {
               << "  -v, --verify      Compare every column chunk against Arrow's decoding first\n"
               << "  -e, --defer-dict  Emit the dictionary and the indices of chunks whose data\n"
               << "                    pages are all dictionary encoded instead of their values\n"
-              << "  -t, --trace P     Write per-chunk timestamps of the timed runs to P.chunks.csv\n"
-              << "                    and the interrupts to P.irqs.csv. With --depth 1, also the\n"
-              << "                    profiling counters of every chunk and when its first and\n"
-              << "                    last input beat arrived, by polling the counters\n"
               << "  -h, --help       Show this help message\n";
 }
 
@@ -81,12 +72,11 @@ Args parse_args(int argc, char *argv[]) {
                                            {"row-groups", required_argument, 0, 'g'},
                                            {"verify", no_argument, 0, 'v'},
                                            {"defer-dict", no_argument, 0, 'e'},
-                                           {"trace", required_argument, 0, 't'},
                                            {"help", no_argument, 0, 'h'},
                                            {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "D:r:d:c:g:vet:h", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "D:r:d:c:g:veh", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'D':
             args.decoders = std::stoul(optarg);
@@ -119,9 +109,6 @@ Args parse_args(int argc, char *argv[]) {
             break;
         case 'e':
             args.defer_dict = true;
-            break;
-        case 't':
-            args.trace = optarg;
             break;
         case 'h':
             print_usage(argv[0]);
@@ -257,77 +244,13 @@ std::vector<uint8_t> concatenate(const std::vector<std::shared_ptr<Buffer>> &buf
 
 using Clock = std::chrono::steady_clock;
 
-// When the software got to each step of decoding a chunk: enqueueing its config, input and output
-// handle, the decoder having all of it, receiving all of its output and releasing its config slot.
-// in_first and in_last are when polling saw the chunk's first and last input beat arrive.
-struct ChunkTimes {
-    Clock::time_point enqueue, enqueued, in_first, in_last, output, finished;
-};
-
-// The interrupts the FPGA raised, timestamped when the callback starts and returns. The callback
-// runs on Coyote's interrupt thread and holds the mutex while it handles and records an interrupt,
-// so stop() waits for the entry of an interrupt whose handling woke the main thread.
-struct InterruptLog {
-    struct Entry {
-        Clock::time_point start, end;
-        int               value;
-    };
-
-    // Calls handle(value) and records it while recording
-    template <typename F> void record(int value, F &&handle) {
-        std::lock_guard lock(mtx_);
-        if (!enabled_) {
-            handle(value);
-            return;
-        }
-        auto start = Clock::now();
-        handle(value);
-        // The capacity is reserved up front, so recording never reallocates in the callback
-        if (entries_.size() < entries_.capacity()) {
-            entries_.push_back({start, Clock::now(), value});
-        } else {
-            ++dropped_;
-        }
-    }
-
-    // Starts recording up to capacity interrupts
-    void start(size_t capacity) {
-        std::lock_guard lock(mtx_);
-        entries_.clear();
-        entries_.reserve(capacity);
-        dropped_ = 0;
-        enabled_ = true;
-    }
-
-    // Stops recording and returns the entries and the number of interrupts that did not fit
-    std::pair<std::vector<Entry>, size_t> stop() {
-        std::lock_guard lock(mtx_);
-        enabled_ = false;
-        return {std::move(entries_), dropped_};
-    }
-
-private:
-    std::mutex         mtx_;
-    std::vector<Entry> entries_;
-    size_t             dropped_ = 0;
-    bool               enabled_ = false;
-};
-
 // Passes the outputs to `on_output` in row group order. defer[i] selects deferred dictionary
-// decoding for the chunk of row group i. If times is given, it gets the timestamps of each chunk.
-// before_enqueue(i, d) runs before chunk i is enqueued on decoder d.
+// decoding for the chunk of row group i.
 void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder>> &decoders,
                    const parcore::metadata::Metadata                               &meta,
                    const std::vector<std::vector<std::shared_ptr<Buffer>>>         &data, size_t j,
                    const std::vector<bool> &defer, size_t depth,
-                   const std::function<void(size_t, const Output &)> &on_output,
-                   std::vector<ChunkTimes> *times = nullptr,
-                   const std::function<void(size_t, libstf::stream_t)> &before_enqueue = nullptr) {
-    auto stamp = [&](size_t i, Clock::time_point ChunkTimes::*field) {
-        if (times) {
-            (*times)[i].*field = Clock::now();
-        }
-    };
+                   const std::function<void(size_t, const Output &)> &on_output) {
     struct Pending {
         std::shared_ptr<parcore::ColumnChunkDecoder> decoder;
         parcore::metadata::ColumnChunk               chunk;
@@ -345,15 +268,10 @@ void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder
             auto &decoder = decoders[next % decoders.size()];
             auto &chunk   = meta.groups[next].chunks[j];
 
-            if (before_enqueue) {
-                before_enqueue(next, decoder->decoder());
-            }
-            stamp(next, &ChunkTimes::enqueue);
             auto handle = decoder->decode_column_chunk(chunk, 0, defer[next]);
             handle->add_chunk(data[next][j]);
             pending.push_back({decoder, chunk, std::move(*handle).done(), defer[next]});
             in_flight[next % decoders.size()] += 1;
-            stamp(next, &ChunkTimes::enqueued);
         }
 
         auto   p = std::move(pending.front());
@@ -368,10 +286,8 @@ void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder
                 output.heap.push_back(p.output->get_next_stream_output(p.decoder->heap_stream()));
             }
         }
-        stamp(done, &ChunkTimes::output);
         p.decoder->finished_decoding_column_chunk(p.chunk);
         in_flight[done % decoders.size()] -= 1;
-        stamp(done, &ChunkTimes::finished);
 
         on_output(done, output);
     }
@@ -652,63 +568,14 @@ struct Profile {
     }
 };
 
-Profile read_profile(parcore::ColumnChunkDecoderConfig &config, libstf::stream_t d) {
-    auto p = config.read_profile(d);
-    return {p.in, p.out};
-}
-
 Profile read_profiles(parcore::ColumnChunkDecoderConfig &config, size_t num_decoders) {
     Profile sum;
     for (size_t d = 0; d < num_decoders; ++d) {
-        sum += read_profile(config, d);
+        auto p = config.read_profile(d);
+        sum += Profile{p.in, p.out};
     }
     return sum;
 }
-
-// Polls the input profiling counters of one decoder on a thread of its own, from before a chunk is
-// enqueued until its output was received, and records when they show that the chunk's first and
-// then its last input beat arrived. The input lasts counter holds 1 from the previous chunk until
-// the first beat of the next zeroes it, and only reading the last output counter stops the
-// profiler. If it is 0 before the chunk is enqueued, the decoder has not finished a chunk since
-// the FPGA was programmed, so in_first stays unset.
-class InputPoller {
-public:
-    void start(parcore::ColumnChunkDecoderConfig &config, libstf::stream_t d, ChunkTimes &t) {
-        stop();
-        stopped_ = false;
-        thread_  = std::thread([this, &config, d, &t] {
-            uint32_t in_lasts = parcore::COLUMN_CHUNK_DECODER_INFO_REGS +
-                                d * parcore::COLUMN_CHUNK_DECODER_PROFILE_REGS + 4;
-            bool started = config.read_register(in_lasts).value() == 0;
-            while (!started && !stopped_) {
-                if (config.read_register(in_lasts).value() == 0) {
-                    t.in_first = Clock::now();
-                    started    = true;
-                }
-            }
-            while (!stopped_) {
-                if (config.read_register(in_lasts).value() != 0) {
-                    t.in_last = Clock::now();
-                    return;
-                }
-            }
-        });
-    }
-
-    // Stops polling, e.g., when the chunk's output was received
-    void stop() {
-        stopped_ = true;
-        if (thread_.joinable()) {
-            thread_.join();
-        }
-    }
-
-    ~InputPoller() { stop(); }
-
-private:
-    std::thread       thread_;
-    std::atomic<bool> stopped_ = true;
-};
 
 int main(int argc, char *argv[]) {
     Args args = parse_args(argc, argv);
@@ -720,12 +587,9 @@ int main(int argc, char *argv[]) {
 #endif
 
     OutputBufferManager *obm_ptr = nullptr;
-    InterruptLog         irqs;
-    auto cthread = std::make_shared<coyote::cThread>(0, getpid(), 0, [&obm_ptr, &irqs](int value) {
-        irqs.record(value, [&](int v) {
-            if (obm_ptr)
-                obm_ptr->handle_fpga_interrupt(v);
-        });
+    auto cthread = std::make_shared<coyote::cThread>(0, getpid(), 0, [&obm_ptr](int value) {
+        if (obm_ptr)
+            obm_ptr->handle_fpga_interrupt(value);
     });
     auto tlb = std::make_shared<TLBManager>(cthread, pool);
 
@@ -767,22 +631,6 @@ int main(int argc, char *argv[]) {
     std::cout << "file,column,name,type,row_groups,num_values,in_bytes,out_bytes,us,in_gibps,"
                  "out_gibps,verified,deferred,"
               << Profile::HEADER << std::endl;
-
-    // Times are in ns since the start of the column's timed runs. The per-chunk counters need
-    // depth 1, as reading them stops the profilers until the next chunk's first beat.
-    std::ofstream trace_chunks, trace_irqs;
-    bool          trace_profiles = !args.trace.empty() && args.depth == 1;
-    if (!args.trace.empty()) {
-        trace_chunks.open(args.trace + ".chunks.csv");
-        trace_irqs.open(args.trace + ".irqs.csv");
-        if (!trace_chunks || !trace_irqs) {
-            throw std::runtime_error("could not open the trace files " + args.trace + ".*.csv");
-        }
-        trace_chunks << "file,name,rep,chunk,deferred,num_values,in_bytes,out_bytes,enqueue,"
-                        "enqueued,in_first,in_last,output,finished,"
-                     << Profile::HEADER << std::endl;
-        trace_irqs << "file,name,start,end,stream,bytes,last" << std::endl;
-    }
 
     for (const auto &path : args.files) {
         auto maybe_file = arrow::io::ReadableFile::Open(path);
@@ -845,98 +693,17 @@ int main(int argc, char *argv[]) {
                 num_values += group.chunks[j].num_values;
             }
 
-            bool tracing = !args.trace.empty();
-            std::vector<std::vector<ChunkTimes>> times(tracing ? args.reps : 0,
-                                                       std::vector<ChunkTimes>(meta.groups.size()));
-            std::vector<std::vector<size_t>>  chunk_bytes(times.size(),
-                                                          std::vector<size_t>(meta.groups.size()));
-            std::vector<std::vector<Profile>> chunk_profiles(
-                trace_profiles ? args.reps : 0, std::vector<Profile>(meta.groups.size()));
-            // With depth 1, every decoder has one chunk in flight, so chunk i is the only chunk
-            // on decoder i % num_decoders while it is polled and its counters are read
-            std::vector<InputPoller> pollers(trace_profiles ? num_decoders : 0);
-            if (tracing) {
-                irqs.start(1 << 20);
-            }
-
             read_profiles(*decoder_config, num_decoders);
             auto start = Clock::now();
             for (size_t rep = 0; rep < args.reps; ++rep) {
                 out_bytes = 0;
-                decode_column(
-                    decoders, meta, data, j, defer, args.depth,
-                    [&](size_t i, const Output &output) {
-                        out_bytes += output.size();
-                        if (tracing) {
-                            chunk_bytes[rep][i] = output.size();
-                        }
-                        if (trace_profiles) {
-                            libstf::stream_t d = i % num_decoders;
-                            pollers[d].stop();
-                            chunk_profiles[rep][i] = read_profile(*decoder_config, d);
-                        }
-                    },
-                    tracing ? &times[rep] : nullptr,
-                    trace_profiles ? std::function<void(size_t, libstf::stream_t)>(
-                                         [&](size_t i, libstf::stream_t d) {
-                                             pollers[d].start(*decoder_config, d, times[rep][i]);
-                                         })
-                                   : nullptr);
+                decode_column(decoders, meta, data, j, defer, args.depth,
+                              [&](size_t, const Output &output) { out_bytes += output.size(); });
             }
             auto end = Clock::now();
-            auto [irq_entries, irqs_dropped] = irqs.stop();
             auto us  = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() /
                       (double)std::max<size_t>(args.reps, 1);
-            // Reading the counters per chunk restarts them for every chunk, so the column's
-            // profile is the sum of the chunks' profiles
-            Profile profile;
-            if (trace_profiles) {
-                for (const auto &rep_profiles : chunk_profiles) {
-                    for (const auto &p : rep_profiles) {
-                        profile += p;
-                    }
-                }
-            } else {
-                profile = read_profiles(*decoder_config, num_decoders);
-            }
-
-            auto ns = [&](Clock::time_point t) {
-                return std::chrono::duration_cast<std::chrono::nanoseconds>(t - start).count();
-            };
-            for (size_t rep = 0; rep < times.size(); ++rep) {
-                for (size_t i = 0; i < meta.groups.size(); ++i) {
-                    const auto &t = times[rep][i];
-                    const auto &chunk = meta.groups[i].chunks[j];
-                    trace_chunks << path << "," << meta.column_names[j] << "," << rep << "," << i
-                                 << "," << int(defer[i]) << "," << chunk.num_values << ","
-                                 << chunk.total_compressed_size << "," << chunk_bytes[rep][i]
-                                 << "," << ns(t.enqueue) << "," << ns(t.enqueued) << ","
-                                 << (t.in_first == Clock::time_point{} ? -1 : ns(t.in_first)) << ","
-                                 << (t.in_last == Clock::time_point{} ? -1 : ns(t.in_last)) << ","
-                                 << ns(t.output) << "," << ns(t.finished);
-                    if (trace_profiles) {
-                        trace_chunks << "," << chunk_profiles[rep][i];
-                    } else {
-                        trace_chunks << ",,,,,,,,,,";
-                    }
-                    trace_chunks << "\n";
-                }
-            }
-            for (const auto &irq : irq_entries) {
-                uint32_t value       = irq.value;
-                uint32_t bytes_shift = FPGA_INTERRUPT_STREAM_ID_BITS;
-                uint32_t last_shift  = bytes_shift + FPGA_INTERRUPT_TRANSFER_SIZE_BITS;
-                trace_irqs << path << "," << meta.column_names[j] << "," << ns(irq.start) << ","
-                           << ns(irq.end) << ","
-                           << (value & ((1u << FPGA_INTERRUPT_STREAM_ID_BITS) - 1)) << ","
-                           << ((value >> bytes_shift) &
-                               ((1u << FPGA_INTERRUPT_TRANSFER_SIZE_BITS) - 1))
-                           << "," << ((value >> last_shift) & 1) << "\n";
-            }
-            if (irqs_dropped > 0) {
-                std::cerr << "warning: " << irqs_dropped << " interrupts of "
-                          << meta.column_names[j] << " were not traced" << std::endl;
-            }
+            auto profile = read_profiles(*decoder_config, num_decoders);
 
             std::cout << path << "," << j << "," << meta.column_names[j] << ","
                       << meta.groups[0].chunks[j].type << "," << meta.groups.size() << ","
