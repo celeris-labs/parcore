@@ -22,7 +22,8 @@ interface decoder_profile_i;
 endinterface
 
 module ColumnChunkDecoderConfig #(
-    parameter NUM_DECODERS
+    parameter NUM_DECODERS,
+    parameter HAS_STRING_DECODERS = 0 // Only reported to the host
 ) (
     input logic clk,
     input logic rst_n,
@@ -50,16 +51,19 @@ logic[AXIL_DATA_BITS - 1:0] values[NUM_READ_REGS];
 assign values[0] = COLUMN_CHUNK_DECODER_CONFIG_ID;
 assign values[1] = NUM_DECODERS;
 assign values[2] = MAX_NUM_ENQUEUED_BUFFERS;
+assign values[3] = HAS_STRING_DECODERS;
 
 decoder_profile_t registered_counters[NUM_DECODERS];
 
 for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_profile_regs
+    // No reset: the stages only follow counters that are reset at their source, and resetting
+    // thousands of flops from the single ASYNC_REG reset flop (not replicable) fails timing.
     ShiftRegister #(
         .WIDTH($bits(decoder_profile_t)),
         .LEVELS(2)
     ) inst_counters_sr (
         .clk(clk),
-        .rst_n(reset_synced),
+        .rst_n(1'b1),
 
         .i_data(profile[I].counters),
         .o_data(registered_counters[I])
@@ -100,7 +104,16 @@ end
 
 // -- Write ----------------------------------------------------------------------------------------
 for (genvar I = 0; I < NUM_DECODERS; I++) begin
-    ConfigWriteFIFO #(I, MAX_NUM_ENQUEUED_BUFFERS, column_chunk_conf_t) inst_conf (clk, reset_synced, write_config, out[I]);
+    ConfigWriteFIFO #(
+        I,
+        MAX_NUM_ENQUEUED_BUFFERS,
+        column_chunk_conf_t
+    ) inst_conf (
+        clk,
+        reset_synced,
+        write_config,
+        out[I]
+    );
 end
 
 endmodule

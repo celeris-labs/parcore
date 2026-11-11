@@ -85,8 +85,7 @@ NDataToAXI #(data8_t, 64) inst_ndata_to_axi (
     .out(axi_host_send_0)
 );
 
-// discard typed interface
-typed_ndata_i #(64) out(clk, rst_n);
+ndata_i #(data8_t, 64) out(clk, rst_n);
 `DATA_ASSIGN(out, out_u8);
 
 /* -- DESIGN WIRING ----------------------------------------------------- */
