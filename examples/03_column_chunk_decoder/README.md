@@ -4,7 +4,8 @@ Throughput benchmark and correctness check for the full ParCore design
 ([hardware/src/vfpga_top.svh](../../hardware/src/vfpga_top.svh)) on real Parquet files.
 
 Every flat column of the given files that is of a type ParCore supports
-(`parcore::metadata::is_libstf_type`) is decoded across all row groups. The column chunks of one
+(`parcore::metadata::is_libstf_type`) or a string column (`BYTE_ARRAY`,
+`parcore::metadata::is_string_type`) is decoded across all row groups. The column chunks of one
 column are loaded into memory before it is decoded and freed afterwards. The
 column chunks are distributed round-robin over the `ColumnChunkDecoder`s with several chunks in
 flight per decoder, and one CSV row is printed per column. With `--verify`, every column chunk is
@@ -13,10 +14,29 @@ decimals) that Arrow's Parquet reader decodes from the same chunk. Boolean colum
 in Parquet but output as bytes by ParCore, so they are skipped and not counted in the `verified`
 column.
 
+String columns are decoded into 16 byte records laid out like DuckDB's `string_t` on the decoder's
+values stream: the length, then strings of up to 12 bytes inline, longer ones as their first 4 bytes
+and a pointer. Only the strings longer than 12 bytes are written to the decoder's heap stream, back
+to back. `parcore::ColumnChunkDecoder` lets the `OutputBufferManager` place the heap, so the pointers
+are offsets into the heap. Software that places the heap itself passes its address to
+`ColumnChunkDecoderConfig::enqueue_column_chunk` and gets pointers it can hand on without copying.
+`--verify` checks every record and the heap against the strings Arrow decodes, and `out_bytes`
+includes the heap.
+
+With `--defer-dict`, the decoder emits a column chunk's dictionary page values (german_str_t records
+for strings, whose long strings go to the heap) followed by one index per value, 1, 2 or 4 bytes for up
+to 256, 65,536 or more dictionary entries, instead of the values themselves. This only applies to
+chunks without PLAIN data pages, e.g., without a PLAIN fallback after the dictionary got too large.
+The other chunks are decoded as usual, and the `deferred` column of the CSV counts the deferred ones.
+`--verify` looks the indices up in the dictionary and compares the result against Arrow.
+
 The last columns of the CSV are the decoders' input and output stream profiling counters, summed
 over the decoders and the timed repetitions: the cycles with a handshake (`*_beats`), without valid
 data (`*_starved`) and with valid data that was not taken (`*_stalled`). Stalled input cycles mean
 that the decoder is the bottleneck, starved ones that the input does not arrive fast enough.
+`*_idle` counts the cycles between the last beat of one chunk and the first beat of the next, and
+`*_lasts` the chunks. The counters run from the first to the last beat of the timed repetitions, so
+the wall-clock time minus their sum is spent before the first and after the last beat.
 
 ## Synthesizing the hardware
 
@@ -48,6 +68,7 @@ build/column_chunk_decoder [OPTIONS] FILE...
 | `-c, --columns C` | Comma-separated names of the columns to decode (default: all) |
 | `-g, --row-groups F[:N]` | Decode only N row groups starting at row group F (default: all) |
 | `-v, --verify` | Compare every column chunk against Arrow's Parquet reader first |
+| `-e, --defer-dict` | Decode the column chunks whose data pages are all dictionary encoded with deferred dictionary decoding |
 
 For simulations, set up a simulation project of the full design. `hardware/build-sim` does not work,
 as the unit tests replace its vFPGA top:

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <arrow/io/file.h>
+#include <parquet/column_page.h>
 #include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
@@ -40,6 +41,7 @@ struct Args {
     size_t                   reps     = 10;
     size_t                   depth    = 4;
     bool                     verify   = false;
+    bool                     defer_dict = false;
 };
 
 void print_usage(const char *prog) {
@@ -55,7 +57,9 @@ void print_usage(const char *prog) {
               << "  -c, --columns C   Comma-separated names of the columns to decode (default: all)\n"
               << "  -g, --row-groups F[:N]  Decode only N row groups starting at F (default: all)\n"
               << "  -v, --verify      Compare every column chunk against Arrow's decoding first\n"
-              << "  -h, --help        Show this help message\n";
+              << "  -e, --defer-dict  Emit the dictionary and the indices of chunks whose data\n"
+              << "                    pages are all dictionary encoded instead of their values\n"
+              << "  -h, --help       Show this help message\n";
 }
 
 Args parse_args(int argc, char *argv[]) {
@@ -67,11 +71,12 @@ Args parse_args(int argc, char *argv[]) {
                                            {"columns", required_argument, 0, 'c'},
                                            {"row-groups", required_argument, 0, 'g'},
                                            {"verify", no_argument, 0, 'v'},
+                                           {"defer-dict", no_argument, 0, 'e'},
                                            {"help", no_argument, 0, 'h'},
                                            {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "D:r:d:c:g:vh", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "D:r:d:c:g:veh", long_options, nullptr)) != -1) {
         switch (opt) {
         case 'D':
             args.decoders = std::stoul(optarg);
@@ -101,6 +106,9 @@ Args parse_args(int argc, char *argv[]) {
         }
         case 'v':
             args.verify = true;
+            break;
+        case 'e':
+            args.defer_dict = true;
             break;
         case 'h':
             print_usage(argv[0]);
@@ -188,7 +196,8 @@ parcore::metadata::Metadata read_metadata(std::shared_ptr<arrow::io::RandomAcces
 
 // ParCore does not strip repetition levels, so columns that have them are not supported.
 bool is_supported(const parcore::metadata::ColumnChunk &chunk, bool has_rep_levels) {
-    return !has_rep_levels && parcore::metadata::is_libstf_type(chunk.type);
+    return !has_rep_levels && (parcore::metadata::is_libstf_type(chunk.type) ||
+                               parcore::metadata::is_string_type(chunk.type));
 }
 
 std::shared_ptr<Buffer> load_chunk(std::shared_ptr<arrow::io::RandomAccessFile> file,
@@ -205,17 +214,48 @@ std::shared_ptr<Buffer> load_chunk(std::shared_ptr<arrow::io::RandomAccessFile> 
     return buffer;
 }
 
-using Output = std::vector<std::shared_ptr<Buffer>>;
+// The output of one column chunk. String chunks write their german_str_t records to the values
+// stream and the strings that do not fit inline to the heap stream. A deferred chunk emits the
+// values of its dictionary page followed by one index per value instead.
+struct Output {
+    std::vector<std::shared_ptr<Buffer>> values;
+    std::vector<std::shared_ptr<Buffer>> heap;
+    bool                                 deferred = false;
 
-// Passes the outputs to `on_output` in row group order.
+    size_t size() const {
+        size_t bytes = 0;
+        for (const auto *buffers : {&values, &heap}) {
+            for (const auto &buffer : *buffers) {
+                bytes += buffer->size;
+            }
+        }
+        return bytes;
+    }
+};
+
+std::vector<uint8_t> concatenate(const std::vector<std::shared_ptr<Buffer>> &buffers) {
+    std::vector<uint8_t> bytes;
+    for (const auto &buffer : buffers) {
+        auto data = static_cast<const uint8_t *>(buffer->ptr);
+        bytes.insert(bytes.end(), data, data + buffer->size);
+    }
+    return bytes;
+}
+
+using Clock = std::chrono::steady_clock;
+
+// Passes the outputs to `on_output` in row group order. defer[i] selects deferred dictionary
+// decoding for the chunk of row group i.
 void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder>> &decoders,
                    const parcore::metadata::Metadata                               &meta,
                    const std::vector<std::vector<std::shared_ptr<Buffer>>>         &data, size_t j,
-                   size_t depth, const std::function<void(size_t, const Output &)> &on_output) {
+                   const std::vector<bool> &defer, size_t depth,
+                   const std::function<void(size_t, const Output &)> &on_output) {
     struct Pending {
         std::shared_ptr<parcore::ColumnChunkDecoder> decoder;
         parcore::metadata::ColumnChunk               chunk;
         std::shared_ptr<OutputHandle>                output;
+        bool                                         deferred;
     };
 
     size_t              num_chunks = meta.groups.size();
@@ -228,17 +268,23 @@ void decode_column(const std::vector<std::shared_ptr<parcore::ColumnChunkDecoder
             auto &decoder = decoders[next % decoders.size()];
             auto &chunk   = meta.groups[next].chunks[j];
 
-            auto handle = decoder->decode_column_chunk(chunk);
+            auto handle = decoder->decode_column_chunk(chunk, defer[next]);
             handle->add_chunk(data[next][j]);
-            pending.push_back({decoder, chunk, std::move(*handle).done()});
+            pending.push_back({decoder, chunk, std::move(*handle).done(), defer[next]});
             in_flight[next % decoders.size()] += 1;
         }
 
         auto   p = std::move(pending.front());
         Output output;
+        output.deferred = p.deferred;
         pending.pop_front();
-        while (p.output->stream_has_more_output(p.decoder->decoder())) {
-            output.push_back(p.output->get_next_stream_output(p.decoder->decoder()));
+        while (p.output->stream_has_more_output(p.decoder->values_stream())) {
+            output.values.push_back(p.output->get_next_stream_output(p.decoder->values_stream()));
+        }
+        if (parcore::metadata::is_string_type(p.chunk.type)) {
+            while (p.output->stream_has_more_output(p.decoder->heap_stream())) {
+                output.heap.push_back(p.output->get_next_stream_output(p.decoder->heap_stream()));
+            }
         }
         p.decoder->finished_decoding_column_chunk(p.chunk);
         in_flight[done % decoders.size()] -= 1;
@@ -269,35 +315,207 @@ std::vector<uint8_t> read_values(parquet::ColumnReader &reader, size_t num_value
     return std::vector<uint8_t>(bytes, bytes + total * sizeof(T));
 }
 
+std::vector<std::string> read_strings(parquet::ColumnReader &reader) {
+    auto &typed = static_cast<parquet::ByteArrayReader &>(reader);
+
+    constexpr int64_t               BATCH_SIZE = 1 << 16;
+    std::vector<int16_t>            def_levels(BATCH_SIZE);
+    std::vector<parquet::ByteArray> values(BATCH_SIZE);
+    std::vector<std::string>        strings;
+    while (typed.HasNext()) {
+        int64_t values_read = 0;
+        typed.ReadBatch(BATCH_SIZE, def_levels.data(), nullptr, values.data(), &values_read);
+        // The values point into the reader's page buffer, which the next batch overwrites
+        for (int64_t k = 0; k < values_read; ++k) {
+            strings.emplace_back(reinterpret_cast<const char *>(values[k].ptr), values[k].len);
+        }
+    }
+    return strings;
+}
+
+// Checks the german_str_t records of a string chunk against the strings Arrow decodes. A record is
+// laid out like DuckDB's string_t: the 4 byte length, then strings of up to 12 bytes inline and zero
+// padded, longer ones as their first 4 bytes and a pointer. The heap only holds the strings longer
+// than 12 bytes, back to back, of PLAIN pages per value and of a dictionary page once per entry. As
+// the OutputBufferManager decides where the heap lands, the pointers are offsets into the heap.
+void verify_strings(size_t i, size_t j, const std::vector<std::string> &expected,
+                    const std::vector<uint8_t> &records, const std::vector<uint8_t> &heap) {
+    constexpr size_t RECORD_BYTES = 16, INLINE_BYTES = 12, PREFIX_BYTES = 4;
+    auto             fail = [&](const std::string &msg) {
+        throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
+                                 ": " + msg);
+    };
+
+    if (records.size() != expected.size() * RECORD_BYTES) {
+        fail("expected " + std::to_string(expected.size()) + " string records, got " +
+             std::to_string(records.size()) + " bytes");
+    }
+
+    for (size_t k = 0; k < expected.size(); ++k) {
+        const auto    &str    = expected[k];
+        const uint8_t *record = records.data() + k * RECORD_BYTES;
+
+        uint32_t length;
+        std::memcpy(&length, record, sizeof(length));
+
+        uint8_t expected_record[RECORD_BYTES] = {};
+        std::memcpy(expected_record, &length, sizeof(length));
+        if (str.size() <= INLINE_BYTES) {
+            std::memcpy(expected_record + 4, str.data(), str.size());
+        } else {
+            uint64_t heap_offset;
+            std::memcpy(&heap_offset, record + 8, sizeof(heap_offset));
+            std::memcpy(expected_record + 4, str.data(), PREFIX_BYTES);
+            std::memcpy(expected_record + 8, &heap_offset, sizeof(heap_offset));
+            if (heap_offset > heap.size() || str.size() > heap.size() - heap_offset ||
+                std::memcmp(heap.data() + heap_offset, str.data(), str.size()) != 0) {
+                fail("string " + std::to_string(k) + " is not in the heap at offset " +
+                     std::to_string(heap_offset));
+            }
+        }
+        if (length != str.size() || std::memcmp(record, expected_record, RECORD_BYTES) != 0) {
+            fail("record of string " + std::to_string(k) + " does not match");
+        }
+    }
+}
+
+bool is_dictionary_encoding(parquet::Encoding::type encoding) {
+    return encoding == parquet::Encoding::RLE_DICTIONARY ||
+           encoding == parquet::Encoding::PLAIN_DICTIONARY;
+}
+
+// Whether all data pages of the chunk are dictionary encoded, which deferred dictionary decoding
+// requires. Writers fall back to PLAIN data pages once the dictionary gets too large. Without page
+// encoding stats in the metadata, the pages are read.
+bool is_dictionary_only(parquet::ParquetFileReader &reader, size_t i, size_t j) {
+    auto row_group = reader.RowGroup(i);
+    auto cc        = row_group->metadata()->ColumnChunk(j);
+    if (!cc->has_dictionary_page()) {
+        return false;
+    }
+
+    const auto &stats = cc->encoding_stats();
+    if (!stats.empty()) {
+        for (const auto &stat : stats) {
+            bool data_page = stat.page_type == parquet::PageType::DATA_PAGE ||
+                             stat.page_type == parquet::PageType::DATA_PAGE_V2;
+            if (data_page && stat.count > 0 && !is_dictionary_encoding(stat.encoding)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    auto pages = row_group->GetColumnPageReader(j);
+    while (auto page = pages->NextPage()) {
+        parquet::Encoding::type encoding;
+        switch (page->type()) {
+        case parquet::PageType::DATA_PAGE:
+            encoding = static_cast<const parquet::DataPageV1 &>(*page).encoding();
+            break;
+        case parquet::PageType::DATA_PAGE_V2:
+            encoding = static_cast<const parquet::DataPageV2 &>(*page).encoding();
+            break;
+        default:
+            continue;
+        }
+        if (!is_dictionary_encoding(encoding)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The number of entries of the chunk's dictionary page, its first page.
+size_t dictionary_size(parquet::ParquetFileReader &reader, size_t i, size_t j) {
+    auto page = reader.RowGroup(i)->GetColumnPageReader(j)->NextPage();
+    if (!page || page->type() != parquet::PageType::DICTIONARY_PAGE) {
+        throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
+                                 " does not start with a dictionary page");
+    }
+    return static_cast<const parquet::DictionaryPage &>(*page).num_values();
+}
+
+// Looks up the indices of a deferred chunk's output in its dictionary, the first num_entries values
+// of value_bytes each. The indices are 1, 2 or 4 bytes for up to 256, 65,536 or more entries.
+std::vector<uint8_t> materialize(size_t i, size_t j, const std::vector<uint8_t> &output,
+                                 size_t value_bytes, size_t num_entries, size_t num_values) {
+    size_t index_bytes      = num_entries <= 256 ? 1 : num_entries <= 65536 ? 2 : 4;
+    size_t dictionary_bytes = num_entries * value_bytes;
+    auto   fail             = [&](const std::string &msg) {
+        throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
+                                 ": " + msg);
+    };
+    if (output.size() != dictionary_bytes + num_values * index_bytes) {
+        fail("expected " + std::to_string(num_entries) + " dictionary entries and " +
+             std::to_string(num_values) + " indices of " + std::to_string(index_bytes) +
+             " bytes, got " + std::to_string(output.size()) + " bytes");
+    }
+
+    std::vector<uint8_t> values(num_values * value_bytes);
+    const uint8_t       *indices = output.data() + dictionary_bytes;
+    for (size_t k = 0; k < num_values; ++k) {
+        uint32_t index = 0;
+        std::memcpy(&index, indices + k * index_bytes, index_bytes);
+        if (index >= num_entries) {
+            fail("index " + std::to_string(index) + " of value " + std::to_string(k) +
+                 " is out of the dictionary of " + std::to_string(num_entries) + " entries");
+        }
+        std::memcpy(values.data() + k * value_bytes, output.data() + index * value_bytes,
+                    value_bytes);
+    }
+    return values;
+}
+
 // Returns false if the chunk can't be compared byte by byte.
 bool verify_chunk(parquet::ParquetFileReader &reader, size_t i, size_t j,
                   const parcore::metadata::ColumnChunk &chunk, const Output &output) {
-    auto column = reader.RowGroup(i)->Column(j);
+    auto column      = reader.RowGroup(i)->Column(j);
+    auto output_bytes = concatenate(output.values);
+    // The values of the chunk, looked up in its dictionary if it was deferred
+    std::vector<uint8_t> materialized;
+    auto values = [&](size_t value_bytes, size_t num_values) -> const std::vector<uint8_t> & {
+        if (!output.deferred) {
+            return output_bytes;
+        }
+        materialized = materialize(i, j, output_bytes, value_bytes, dictionary_size(reader, i, j),
+                                   num_values);
+        return materialized;
+    };
+
+    if (parcore::metadata::is_string_type(chunk.type)) {
+        constexpr size_t RECORD_BYTES = 16;
+        auto             expected     = read_strings(*column);
+        verify_strings(i, j, expected, values(RECORD_BYTES, expected.size()),
+                       concatenate(output.heap));
+        return true;
+    }
 
     std::vector<uint8_t> expected_bytes;
+    size_t               value_bytes;
     switch (chunk.type) {
     case parcore::metadata::Type::INT32_T:
         expected_bytes = read_values<parquet::Int32Type>(*column, chunk.num_values);
+        value_bytes    = 4;
         break;
     case parcore::metadata::Type::INT64_T:
         expected_bytes = read_values<parquet::Int64Type>(*column, chunk.num_values);
+        value_bytes    = 8;
         break;
     case parcore::metadata::Type::FLOAT_T:
         expected_bytes = read_values<parquet::FloatType>(*column, chunk.num_values);
+        value_bytes    = 4;
         break;
     case parcore::metadata::Type::DOUBLE_T:
         expected_bytes = read_values<parquet::DoubleType>(*column, chunk.num_values);
+        value_bytes    = 8;
         break;
     default:
         // Parquet bit-packs booleans, but ParCore outputs them as bytes.
         return false;
     }
 
-    std::vector<uint8_t> actual_bytes;
-    for (const auto &buffer : output) {
-        auto bytes = static_cast<const uint8_t *>(buffer->ptr);
-        actual_bytes.insert(actual_bytes.end(), bytes, bytes + buffer->size);
-    }
+    const auto &actual_bytes = values(value_bytes, expected_bytes.size() / value_bytes);
 
     if (actual_bytes.size() != expected_bytes.size()) {
         throw std::runtime_error("column chunk " + std::to_string(i) + ":" + std::to_string(j) +
@@ -319,18 +537,33 @@ double gibps(size_t bytes, double us) { return (bytes / 1073741824.0) / (us / 10
 // The input and output stream profiling counters of the decoders, summed over all used decoders.
 // Within a column chunk, every cycle of a stream is a handshake, starved (no valid data) or
 // stalled (valid data, but not ready). Stalled input cycles mean the decoder is the bottleneck,
-// starved ones that the input does not arrive fast enough. Reading the counters resets them, they
-// start counting again with the next data beat.
+// starved ones that the input does not arrive fast enough. Idle cycles are the ones between the
+// last beat of a chunk and the first beat of the next, lasts the number of chunks. The counters
+// start with the first data beat after they were read and stop with the last, so cycles before
+// the first and after the last chunk are not counted.
 struct Profile {
-    static constexpr const char *HEADER =
-        "in_beats,in_starved,in_stalled,out_beats,out_starved,out_stalled";
+    static constexpr const char *HEADER = "in_beats,in_starved,in_stalled,in_idle,in_lasts,"
+                                          "out_beats,out_starved,out_stalled,out_idle,out_lasts";
 
     parcore::StreamProfile in = {}, out = {};
 
+    Profile &operator+=(const Profile &other) {
+        for (auto [total, part] : {std::pair{&in, &other.in}, std::pair{&out, &other.out}}) {
+            total->handshakes_cycles += part->handshakes_cycles;
+            total->starved_cycles += part->starved_cycles;
+            total->stalled_cycles += part->stalled_cycles;
+            total->idle_cycles += part->idle_cycles;
+            total->last_handshakes += part->last_handshakes;
+        }
+        return *this;
+    }
+
     friend std::ostream &operator<<(std::ostream &os, const Profile &p) {
-        return os << p.in.handshakes_cycles << "," << p.in.starved_cycles << ","
-                  << p.in.stalled_cycles << "," << p.out.handshakes_cycles << ","
-                  << p.out.starved_cycles << "," << p.out.stalled_cycles;
+        for (const auto *s : {&p.in, &p.out}) {
+            os << (s == &p.in ? "" : ",") << s->handshakes_cycles << "," << s->starved_cycles
+               << "," << s->stalled_cycles << "," << s->idle_cycles << "," << s->last_handshakes;
+        }
+        return os;
     }
 };
 
@@ -338,13 +571,7 @@ Profile read_profiles(parcore::ColumnChunkDecoderConfig &config, size_t num_deco
     Profile sum;
     for (size_t d = 0; d < num_decoders; ++d) {
         auto p = config.read_profile(d);
-        for (auto [total, part] : {std::pair{&sum.in, &p.in}, std::pair{&sum.out, &p.out}}) {
-            total->handshakes_cycles += part->handshakes_cycles;
-            total->starved_cycles += part->starved_cycles;
-            total->stalled_cycles += part->stalled_cycles;
-            total->idle_cycles += part->idle_cycles;
-            total->last_handshakes += part->last_handshakes;
-        }
+        sum += Profile{p.in, p.out};
     }
     return sum;
 }
@@ -401,7 +628,7 @@ int main(int argc, char *argv[]) {
     }
 
     std::cout << "file,column,name,type,row_groups,num_values,in_bytes,out_bytes,us,in_gibps,"
-                 "out_gibps,verified,"
+                 "out_gibps,verified,deferred,"
               << Profile::HEADER << std::endl;
 
     for (const auto &path : args.files) {
@@ -421,7 +648,7 @@ int main(int argc, char *argv[]) {
         }
 
         std::unique_ptr<parquet::ParquetFileReader> reader;
-        if (args.verify) {
+        if (args.verify || args.defer_dict) {
             reader = parquet::ParquetFileReader::Open(file);
         }
 
@@ -443,9 +670,17 @@ int main(int argc, char *argv[]) {
                 data[i][j] = load_chunk(file, meta.groups[i].chunks[j], pool);
             }
 
+            // Chunks with PLAIN data pages are decoded as usual
+            std::vector<bool> defer(meta.groups.size());
+            size_t            deferred = 0;
+            for (size_t i = 0; i < meta.groups.size(); ++i) {
+                defer[i] = args.defer_dict && is_dictionary_only(*reader, first_group + i, j);
+                deferred += defer[i];
+            }
+
             size_t verified = 0;
             if (args.verify) {
-                decode_column(decoders, meta, data, j, 1, [&](size_t i, const Output &output) {
+                decode_column(decoders, meta, data, j, defer, 1, [&](size_t i, const Output &output) {
                     verified += verify_chunk(*reader, first_group + i, j, meta.groups[i].chunks[j],
                                              output);
                 });
@@ -458,17 +693,13 @@ int main(int argc, char *argv[]) {
             }
 
             read_profiles(*decoder_config, num_decoders);
-            auto start = std::chrono::high_resolution_clock::now();
+            auto start = Clock::now();
             for (size_t rep = 0; rep < args.reps; ++rep) {
                 out_bytes = 0;
-                decode_column(decoders, meta, data, j, args.depth,
-                              [&](size_t, const Output &output) {
-                                  for (const auto &buffer : output) {
-                                      out_bytes += buffer->size;
-                                  }
-                              });
+                decode_column(decoders, meta, data, j, defer, args.depth,
+                              [&](size_t, const Output &output) { out_bytes += output.size(); });
             }
-            auto end = std::chrono::high_resolution_clock::now();
+            auto end = Clock::now();
             auto us  = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() /
                       (double)std::max<size_t>(args.reps, 1);
             auto profile = read_profiles(*decoder_config, num_decoders);
@@ -480,7 +711,7 @@ int main(int argc, char *argv[]) {
                       << (args.verify ? std::to_string(verified) + "/" +
                                             std::to_string(meta.groups.size())
                                       : "-")
-                      << "," << profile << std::endl;
+                      << "," << deferred << "," << profile << std::endl;
 
             for (auto &group : data) {
                 group[j] = nullptr;

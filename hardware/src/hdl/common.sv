@@ -93,11 +93,31 @@ typedef struct packed {
     data32_t num_values;
 } hybrid_page_conf_t;
 
+// Umbra style string (german string). Strings of up to 12 bytes are stored inline, longer ones keep
+// their first 4 bytes in prefix and point to the full string in the heap. The layout in memory
+// matches DuckDB's string_t.
+typedef struct packed {
+    data8_t [7:0] short_str_or_addr;
+    data8_t [3:0] prefix;
+    data8_t [3:0] length;
+} german_str_t;
+
+// libstf has no string type, so german strings travel as its 128 bit type
+localparam type_t GERMAN_STR_T = INT128_T;
+
 typedef struct packed {
     page_type_t page_type;
-    data32_t    num_values;
     logic       last;
+    data32_t    num_values;
 } page_conf_t;
+
+// The page the ColumnChunkDecoderCore hands to the plain_pages path of the decoder variant around it
+typedef struct packed {
+    type_t      typ;
+    page_type_t page_type;
+    logic       first_page; // First page of the column chunk
+    logic       last;       // Last page of the column chunk
+} page_info_t;
 
 typedef struct packed {
     stream_profile_t in;
@@ -106,11 +126,11 @@ typedef struct packed {
 
 parameter longint unsigned PARCORE_SYSTEM_ID = 64'hfd888c49aec6e141;
 
-parameter longint unsigned COLUMN_CHUNK_DECODER_CONFIG_ID = 64'h5c19f934407065bd;
+parameter longint unsigned COLUMN_CHUNK_DECODER_CONFIG_ID = 64'h8ac238fba070fc46;
 
-// Read address space of the ColumnChunkDecoderConfig: 3 info registers plus
+// Read address space of the ColumnChunkDecoderConfig: 4 info registers plus
 // 10 profiling counters (5 input + 5 output) per decoder.
-parameter longint unsigned COLUMN_CHUNK_DECODER_INFO_REGS    = 3;
+parameter longint unsigned COLUMN_CHUNK_DECODER_INFO_REGS    = 4;
 parameter longint unsigned COLUMN_CHUNK_DECODER_PROFILE_REGS = 10;
 function automatic longint unsigned COLUMN_CHUNK_DECODER_READ_REGS(input int num_decoders);
     return COLUMN_CHUNK_DECODER_INFO_REGS + COLUMN_CHUNK_DECODER_PROFILE_REGS * num_decoders;

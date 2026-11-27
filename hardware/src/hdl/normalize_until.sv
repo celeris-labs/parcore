@@ -122,9 +122,11 @@ valid_i #(type_t) in_typ(clk, reset_synced), out_typ(clk, reset_synced);
 logic unconfigured;
 assign unconfigured = remaining == 0;
 
-assign size.ready = unconfigured && in.valid;
+// The type is taken from the buffered beat, as the input can already hold the next transfer
+typed_ndata_i #(DATABEAT_SIZE) in_inner(clk, reset_synced);
+assign size.ready = unconfigured && in_inner.valid;
 
-ndata_i #(data8_t, DATABEAT_SIZE) untyped_in(clk, reset_synced), in_inner(clk, reset_synced), normalizer_in(clk, reset_synced), out_inner(clk, reset_synced), untyped_out(clk, reset_synced);
+ndata_i #(data8_t, DATABEAT_SIZE) normalizer_in(clk, reset_synced), out_inner(clk, reset_synced), untyped_out(clk, reset_synced);
 
 // This is on purpose 1 bit wider to account for the case where keep is 0xf..f
 logic [$clog2(DATABEAT_SIZE):0] in_num_bytes;
@@ -154,6 +156,9 @@ always_comb begin
             INT64_T, DOUBLE_T: begin
                 in_num_values = in_num_bytes / 8;
             end
+            INT128_T: begin
+                in_num_values = in_num_bytes / 16;
+            end
             default: begin
                 $fatal(1, "Unexpected type %d in TypedNormalizeUntil", in_typ.data);
             end
@@ -173,11 +178,11 @@ always_ff @(posedge clk) begin
         fifo_typ.valid <= 1'b0;
     end else begin
         if (unconfigured) begin
-            if (in.valid && size.valid) begin
+            if (in_inner.valid && size.valid) begin
                 remaining <= size.data;
-                in_typ.data  <= in.typ;
+                in_typ.data  <= in_inner.typ;
                 in_typ.valid <= 1'b1;
-                fifo_typ.data  <= in.typ;
+                fifo_typ.data  <= in_inner.typ;
                 fifo_typ.valid <= 1'b1;
             end
         end else begin
@@ -214,13 +219,11 @@ MehdiFIFO #(
     .o_filling_level()
 );
 
-`DATA_ASSIGN(in, untyped_in);
-
-NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_in_skid_buffer  (
+TypedNDataSkidBuffer #(DATABEAT_SIZE) inst_in_skid_buffer (
     .clk(clk),
     .rst_n(reset_synced),
 
-    .in(untyped_in),
+    .in(in),
     .out(in_inner)
 );
 

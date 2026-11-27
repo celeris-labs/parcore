@@ -1,6 +1,8 @@
 #include <libstf/profiling.hpp>
 #include <parcore/column_chunk_decoder.hpp>
 
+#include <stdexcept>
+
 using libstf::Profiler;
 
 namespace parcore {
@@ -17,6 +19,17 @@ ColumnChunkDecoder::ColumnChunkDecoder(
       decoder_(decoder), column_chunk_enqueued_configs_(0) {}
 
 const libstf::stream_t &ColumnChunkDecoder::decoder() const { return decoder_; }
+
+libstf::stream_t ColumnChunkDecoder::values_stream() const {
+  return column_chunk_config_->has_string_decoders() ? 2 * decoder_ : decoder_;
+}
+
+libstf::stream_t ColumnChunkDecoder::heap_stream() const {
+  if (!column_chunk_config_->has_string_decoders()) {
+    throw std::logic_error("Decoders without strings have no heap stream");
+  }
+  return 2 * decoder_ + 1;
+}
 
 ColumnChunkDecoder::Handle::Handle(
     std::shared_ptr<ColumnChunkDecoder> column_chunk_decoder,
@@ -49,25 +62,41 @@ std::shared_ptr<libstf::OutputHandle> ColumnChunkDecoder::Handle::done() && {
 
 const std::string prefix = "parcore::ColumnChunkDecoder";
 
+// Keeps a Profiler region open while it is in scope, also when an exception leaves the scope
+struct ProfilerRegion {
+  explicit ProfilerRegion(std::string name) : name_(std::move(name)) {
+    Profiler::open_regions({name_});
+  }
+  ~ProfilerRegion() { Profiler::close_regions({name_}); }
+  ProfilerRegion(const ProfilerRegion &) = delete;
+  ProfilerRegion &operator=(const ProfilerRegion &) = delete;
+
+private:
+  std::string name_;
+};
+
 std::unique_ptr<ColumnChunkDecoder::Handle>
 ColumnChunkDecoder::decode_column_chunk(
-    const metadata::ColumnChunk &column_chunk) {
+    const metadata::ColumnChunk &column_chunk, bool defer_dict_decoding) {
   std::unique_lock lock(mtx);
-  Profiler::open_regions({prefix + "decode_column_chunk"});
+  ProfilerRegion region(prefix + "decode_column_chunk");
   assert(column_chunk_enqueued_configs_ + 1 <
          column_chunk_config_->maximum_num_enqueued_configs());
 
-  auto output_handle =
-      output_buffer_manager_->acquire_output_handle(decoder_mask());
-
+  // The config is enqueued first, as it checks that the decoder supports the chunk before it
+  // writes anything. The decoder does not produce output before its input is enqueued through the
+  // returned Handle, so the output handle is acquired in time. The heap address is 0, so the
+  // records hold offsets into the heap.
   column_chunk_config_->enqueue_column_chunk(
       decoder_, column_chunk.compression, column_chunk.num_values,
       metadata::to_libstf_type(column_chunk.type), column_chunk.is_required,
-      column_chunk.logical_type());
+      column_chunk.logical_type(), defer_dict_decoding, 0);
+
+  auto output_handle =
+      output_buffer_manager_->acquire_output_handle(output_streams(column_chunk));
 
   column_chunk_enqueued_configs_ += 1;
 
-  Profiler::close_regions({prefix + "decode_column_chunk"});
   return std::make_unique<Handle>(shared_from_this(), std::move(lock),
                                   output_handle);
 }
@@ -78,9 +107,12 @@ void ColumnChunkDecoder::finished_decoding_column_chunk(
   column_chunk_enqueued_configs_ -= 1;
 }
 
-libstf::stream_mask_t ColumnChunkDecoder::decoder_mask() const {
+libstf::stream_mask_t ColumnChunkDecoder::output_streams(
+    const metadata::ColumnChunk &column_chunk) const {
   libstf::stream_mask_t mask;
-  mask.set(decoder_);
+  mask.set(values_stream());
+  if (metadata::is_string_type(column_chunk.type))
+    mask.set(heap_stream());
   return mask;
 }
 
